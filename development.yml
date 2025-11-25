@@ -116,19 +116,22 @@ services:
         echo '📦 Starting frontend initialization...' &&
         npm install -g npm@latest &&
         
-        echo '🔄 Moving existing files out of frontend folder...' &&
+        echo '🔄 Backing up custom files...' &&
         mkdir -p /tmp/backup &&
-        if [ -f Dockerfile ]; then mv Dockerfile /tmp/backup/; fi &&
-        if [ -f next.config.ts ]; then mv next.config.ts /tmp/backup/; fi &&
-        if [ -f app/components/api.ts ]; then mkdir -p /tmp/backup/app/components && mv app/components/api.ts /tmp/backup/app/components/; fi &&
+        if [ -f Dockerfile ]; then cp Dockerfile /tmp/backup/; fi &&
+        if [ -f next.config.ts ]; then cp next.config.ts /tmp/backup/; fi &&
+        if [ -f app/components/api.ts ]; then mkdir -p /tmp/backup/app/components && cp app/components/api.ts /tmp/backup/app/components/; fi &&
         
-        echo '🚀 Running create-next-app...' &&
-        npx create-next-app@latest . &&
+        echo '🧹 Cleaning frontend directory completely...' &&
+        rm -rf /app/* /app/.* 2>/dev/null || true &&
         
-        echo '📥 Installing dependencies...' &&
+        echo '�  Running create-next-app...' &&
+        npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir=false --import-alias='@/*' --turbopack --no-git &&
+        
+        echo '�  Installing dependencies...' &&
         npm install &&
         
-        echo '🔙 Restoring original files...' &&
+        echo '🔙 Restoring custom files...' &&
         if [ -f /tmp/backup/Dockerfile ]; then mv /tmp/backup/Dockerfile ./; fi &&
         if [ -f /tmp/backup/next.config.ts ]; then mv /tmp/backup/next.config.ts ./; fi &&
         if [ -f /tmp/backup/app/components/api.ts ]; then mkdir -p app/components && mv /tmp/backup/app/components/api.ts app/components/; fi &&
