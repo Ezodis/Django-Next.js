@@ -104,7 +104,7 @@ services:
 
 
 
-# Initialization ------------------
+# Initialization Section ------------------
   frontend-init:
     profiles: ["init"]
     image: node:20
@@ -113,11 +113,27 @@ services:
     working_dir: /app
     command: >
       sh -c "
+        echo '📦 Starting frontend initialization...' &&
         npm install -g npm@latest &&
-        if [ -f Dockerfile ]; then mv Dockerfile ../Dockerfile.backup; fi &&
+        
+        echo '🔄 Moving existing files out of frontend folder...' &&
+        mkdir -p /tmp/backup &&
+        if [ -f Dockerfile ]; then mv Dockerfile /tmp/backup/; fi &&
+        if [ -f next.config.ts ]; then mv next.config.ts /tmp/backup/; fi &&
+        if [ -f app/components/api.ts ]; then mkdir -p /tmp/backup/app/components && mv app/components/api.ts /tmp/backup/app/components/; fi &&
+        
+        echo '🚀 Running create-next-app...' &&
         npx create-next-app@latest . &&
-        if [ -f ../Dockerfile.backup ]; then mv ../Dockerfile.backup ./Dockerfile; fi &&
-        npm install
+        
+        echo '📥 Installing dependencies...' &&
+        npm install &&
+        
+        echo '🔙 Restoring original files...' &&
+        if [ -f /tmp/backup/Dockerfile ]; then mv /tmp/backup/Dockerfile ./; fi &&
+        if [ -f /tmp/backup/next.config.ts ]; then mv /tmp/backup/next.config.ts ./; fi &&
+        if [ -f /tmp/backup/app/components/api.ts ]; then mkdir -p app/components && mv /tmp/backup/app/components/api.ts app/components/; fi &&
+        
+        echo '✅ Frontend initialization complete!'
       "
 
   npm-init:
@@ -134,20 +150,20 @@ services:
 
         wanted_deps=$(grep -v "^\s*#" /deps/npm.txt | sed "/^\s*$/d")
 
-        for dep in $$wanted_deps; do
-          if ! grep -q "\"$$dep\"" package.json; then
-            echo "Installing $$dep..."
-            npm install "$$dep" --save --legacy-peer-deps
+        for dep in $wanted_deps; do
+          if ! grep -q "\"$dep\"" package.json; then
+            echo "Installing $dep..."
+            npm install "$dep" --save --legacy-peer-deps
           else
-            echo "$$dep already present, skipping."
+            echo "$dep already present, skipping."
           fi
         done
 
         current_deps=$(jq -r ".dependencies | keys[]" package.json)
-        for dep in $$current_deps; do
-          if ! echo "$$wanted_deps" | grep -qx "$$dep"; then
-            echo "Removing extra dependency $$dep..."
-            npm uninstall "$$dep" --save
+        for dep in $current_deps; do
+          if ! echo "$wanted_deps" | grep -qx "$dep"; then
+            echo "Removing extra dependency $dep..."
+            npm uninstall "$dep" --save
           fi
         done
 
@@ -162,60 +178,57 @@ services:
     working_dir: /app
     command: >
       sh -c '
-        apt-get update &&
-        apt-get install -y sed &&
-        pip install --upgrade pip &&
-        pip install --upgrade django &&
+        echo "🐍 Starting backend initialization..." &&
+        pip install --upgrade pip --root-user-action=ignore &&
+        pip install --upgrade django --root-user-action=ignore &&
+        
+        echo "📦 Creating Django project..." &&
         django-admin startproject _config . &&
-        sed -i "s/from pathlib import Path/import os\\nfrom pathlib import Path/" _config/settings.py &&
-        sed -i "s/^SECRET_KEY = .*/SECRET_KEY = os.getenv('\''DJANGO_SECRET_KEY'\'', '\''dev-secret-key-for-testing-only-not-for-production'\'')/" _config/settings.py &&
-        sed -i "s/^DEBUG = .*/DEBUG = os.getenv('\''DEBUG'\'', '\''False'\'').lower() in ('\''true'\'', '\''1'\'', '\''yes'\'')/" _config/settings.py &&
-        sed -i "/ALLOWED_HOSTS = \[\]/c\\hosts = os.getenv('\''HOSTS'\'', '\''localhost,127.0.0.1,0.0.0.0'\'')\\nALLOWED_HOSTS = [host.strip() for host in hosts.split('\'', '\'') if host.strip()]" _config/settings.py &&
-        sed -i "/INSTALLED_APPS = \[/a\\    '\''corsheaders'\'',\\n    '\''rest_framework'\'',\\n    '\''rest_framework.authtoken'\'',\\n    '\''authentication'\'',\\n    '\''donations'\'',\\n    '\''medicine'\'',\\n    '\''beneficiary'\''," _config/settings.py &&
-        sed -i "/MIDDLEWARE = \[/a\\    '\''whitenoise.middleware.WhiteNoiseMiddleware'\'',\\n    '\''corsheaders.middleware.CorsMiddleware'\'',\\n    '\''django.middleware.locale.LocaleMiddleware'\''," _config/settings.py &&
+        
+        echo "📝 Modifying settings.py..." &&
+        
+        sed -i "s/from pathlib import Path/import os\\nfrom pathlib import Path\\nimport dj_database_url/" _config/settings.py &&
+        
+        sed -i "s/^SECRET_KEY = .*/SECRET_KEY = os.getenv('\''DJANGO_SECRET_KEY'\'')/" _config/settings.py &&
+        
+        sed -i "s/^DEBUG = .*/DEBUG = os.getenv('\''DJANGO_DEBUG'\'', '\''False'\'').lower() == '\''true'\''/" _config/settings.py &&
+        
+        sed -i "/^DEBUG = /a\\\\nDOMAIN = os.getenv('\''DOMAIN'\'')\\nif not DOMAIN and not DEBUG:\\n    raise Exception('\''DOMAIN environment variable is required in production'\'')" _config/settings.py &&
+        
+        sed -i "s/^ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = []\\nif DEBUG:\\n    ALLOWED_HOSTS.extend(['\''localhost'\'', '\''127.0.0.1'\'', '\''0.0.0.0'\''])\\nelse:\\n    if DOMAIN:\\n        ALLOWED_HOSTS.extend([\\n            DOMAIN,\\n            f'\''api.{DOMAIN}'\'',\\n            f'\''www.{DOMAIN}'\'',\\n        ])/" _config/settings.py &&
+        
+        sed -i "/^# Application definition/a\\\\n# Dynamically find all apps in the backend folder\\ndef find_apps(base_dir, exclude_dirs=None):\\n    exclude_dirs = exclude_dirs or []\\n    exclude_dirs = list(exclude_dirs) + ['\''_config'\'']\\n    apps = []\\n    for item in os.listdir(base_dir):\\n        item_path = os.path.join(base_dir, item)\\n        if (\\n            os.path.isdir(item_path) and\\n            item not in exclude_dirs and\\n            os.path.isfile(os.path.join(item_path, '\''__init__.py'\''))\\n        ):\\n            apps.append(item)\\n    return apps" _config/settings.py &&
+        
+        sed -i "s/^INSTALLED_APPS = \[/INSTALLED_APPS = [\\n    '\''corsheaders'\'',\\n    '\''rest_framework'\'',\\n    '\''rest_framework.authtoken'\'',\\n    '\''import_export'\'',/" _config/settings.py &&
+        
+        sed -i "/^INSTALLED_APPS = /,/^\]/s/\]/] + find_apps(BASE_DIR)\\nif DEBUG:\\n    INSTALLED_APPS += ['\''django_extensions'\'']/" _config/settings.py &&
+        
+        sed -i "s/^MIDDLEWARE = \[/MIDDLEWARE = [\\n    '\''corsheaders.middleware.CorsMiddleware'\'',\\n    '\''whitenoise.middleware.WhiteNoiseMiddleware'\'',\\n    '\''django.middleware.locale.LocaleMiddleware'\'',/" _config/settings.py &&
+        
+        sed -i "/^# Database/,/^}/c\\# Database\\n# https://docs.djangoproject.com/en/5.2/ref/settings/#databases\\n\\n\\nif DEBUG:\\n    # Development: use PostgreSQL !\\n    DATABASES = {\\n        '\''default'\'': {\\n            '\''ENGINE'\'': '\''django.db.backends.postgresql'\'',\\n            '\''NAME'\'': os.getenv('\''DB_NAME'\''),\\n            '\''USER'\'': os.getenv('\''DB_USER'\''),\\n            '\''PASSWORD'\'': os.getenv('\''DB_PASSWORD'\''),\\n            '\''HOST'\'': os.getenv('\''DB_HOST'\''),\\n            '\''PORT'\'': os.getenv('\''DB_PORT'\''),\\n        }\\n    }\\nelse:\\n    # Production: Railway DATABASE_URL\\n    DATABASES = {\\n        '\''default'\'': dj_database_url.config(\\n            default='\''postgres://user:password@host:5432/dbname'\'',\\n            conn_max_age=600,\\n            ssl_require=True,\\n        )\\n    }" _config/settings.py &&
+        
         sed -i "s/^LANGUAGE_CODE = .*/LANGUAGE_CODE = '\''es-mx'\''/" _config/settings.py &&
-        sed -i "/LANGUAGE_CODE = '\''es-mx'\''/a\\LANGUAGES = [\\n    ('\''en'\'', '\''English'\''),\\n    ('\''es'\'', '\''Spanish'\''),\\n]" _config/settings.py &&
-        sed -i "/# Database/,+10d" _config/settings.py &&
-        printf "\\n# Database\\nDATABASES = {\\n    'default': {\\n        'ENGINE': 'django.db.backends.postgresql',\\n        'NAME': os.getenv('"'"'DB_NAME'"'"'),\\n        'USER': os.getenv('"'"'DB_USER'"'"'),\\n        'PASSWORD': os.getenv('"'"'DB_PASSWORD'"'"'),\\n        'HOST': os.getenv('"'"'DB_HOST'"'"'),\\n        'PORT': os.getenv('"'"'DB_PORT'"'"'),\\n    }\\n}\\n" >> _config/settings.py &&
-        echo "\\nSTATIC_URL = '/static/'" >> _config/settings.py &&
-        echo "STATIC_ROOT = os.path.join(BASE_DIR, '_config/staticfiles')" >> _config/settings.py &&
-        echo "MEDIA_URL = '/media/'" >> _config/settings.py &&
-        echo "MEDIA_ROOT = os.path.join(BASE_DIR, 'media')" >> _config/settings.py &&
-        echo "STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'" >> _config/settings.py &&
-        echo "CORS_ALLOW_CREDENTIALS = True" >> _config/settings.py &&
-        echo "REST_FRAMEWORK = {\\n    'DEFAULT_AUTHENTICATION_CLASSES': [\\n        'rest_framework.authentication.TokenAuthentication',\\n        'rest_framework.authentication.SessionAuthentication',\\n    ],\\n}" >> _config/settings.py &&
-        sed -i "$ a \
-        if DEBUG:\
-        \n    CORS_ALLOW_ALL_ORIGINS = True\
-        \n    CORS_ALLOWED_ORIGINS = [\
-        \n        'http://localhost:3000',\
-        \n        'https://localhost:3000',\
-        \n        'http://127.0.0.1:3000',\
-        \n        'https://127.0.0.1:3000',\
-        \n        'http://frontend:3000',\
-        \n        'https://frontend:3000',\
-        \n    ]\
-        \n    CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS + [\
-        \n        'http://localhost:8000',\
-        \n        'https://localhost:8000',\
-        \n        'http://localhost:80',\
-        \n        'https://localhost:443',\
-        \n        'http://backend:8000',\
-        \n        'https://backend:8000',\
-        \n        'http://localhost',\
-        \n        'https://localhost',\
-        \n    ]\
-        \n    REST_FRAMEWORK['DEFAULT_PERMISSION_CLASSES'] = [\
-        \n        'rest_framework.permissions.AllowAny',\
-        \n    ]\
-        else:\
-        \n    CORS_ALLOWED_ORIGINS = [\
-        \n        'https://yourproductiondomain.com',\
-        \n    ]\
-        \n    CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS\
-        \n    REST_FRAMEWORK['DEFAULT_PERMISSION_CLASSES'] = [\
-        \n        'rest_framework.permissions.IsAuthenticatedOrReadOnly',\
-        \n    ]" _config/settings.py
+        sed -i "/^LANGUAGE_CODE = /a\\LANGUAGES = [\\n    ('\''en'\'', '\''English'\''),\\n    ('\''es'\'', '\''Spanish'\''),\\n]" _config/settings.py &&
+        
+        sed -i "s|^STATIC_URL = .*|STATIC_URL = '\''/static/'\''|" _config/settings.py &&
+        
+        sed -i "/^STATIC_URL = /a\\STATIC_ROOT = os.path.join(BASE_DIR, '\''staticfiles'\'')\\n\\n# Media files\\nMEDIA_URL = '\''/media/'\''\\nMEDIA_ROOT = os.path.join(BASE_DIR, '\''media'\'')" _config/settings.py &&
+        
+        sed -i "/^DEFAULT_AUTO_FIELD = /a\\\\n# REST Framework\\nREST_FRAMEWORK = {\\n    '\''DEFAULT_PERMISSION_CLASSES'\'': ['\''rest_framework.permissions.AllowAny'\''],\\n    '\''DEFAULT_RENDERER_CLASSES'\'': ['\''rest_framework.renderers.JSONRenderer'\''],\\n    '\''DEFAULT_PARSER_CLASSES'\'': [\\n        '\''rest_framework.parsers.JSONParser'\'',\\n        '\''rest_framework.parsers.MultiPartParser'\'',\\n        '\''rest_framework.parsers.FormParser'\'',\\n    ],\\n}\\n\\n# CORS settings\\nCORS_ALLOW_CREDENTIALS = True\\n\\n# Base CORS allowed origins\\nCORS_ALLOWED_ORIGINS = []\\nCSRF_TRUSTED_ORIGINS = []\\nif DEBUG:\\n    CORS_ALLOW_ALL_ORIGINS = True\\n    CORS_ALLOWED_ORIGIN_REGEXES = [\\n        r'\''^http://localhost:\\\\d+$$'\'',\\n        r'\''^http://127.0.0.1:\\\\d+$$'\'',\\n    ]\\n    CSRF_TRUSTED_ORIGINS.extend([\\n        '\''http://localhost:3000'\'',\\n        '\''http://127.0.0.1:3000'\'',\\n        '\''http://localhost:8000'\'',\\n        '\''http://127.0.0.1:8000'\'',\\n    ])\\nelse:\\n    CORS_ALLOW_ALL_ORIGINS = False\\n    if DOMAIN:\\n        CORS_ALLOWED_ORIGINS.extend([\\n            f'\''https://{DOMAIN}'\'',\\n            f'\''https://www.{DOMAIN}'\'',\\n        ])\\n        CSRF_TRUSTED_ORIGINS.extend([\\n            f'\''https://{DOMAIN}'\'',\\n            f'\''https://www.{DOMAIN}'\'',\\n            f'\''https://api.{DOMAIN}'\'',\\n        ])\\n\\nCORS_EXPOSE_HEADERS = ['\''Content-Type'\'', '\''X-CSRFToken'\'']\\nCORS_ALLOW_HEADERS = [\\n    '\''accept'\'',\\n    '\''accept-encoding'\'',\\n    '\''authorization'\'',\\n    '\''content-type'\'',\\n    '\''dnt'\'',\\n    '\''origin'\'',\\n    '\''user-agent'\'',\\n    '\''x-csrftoken'\'',\\n    '\''x-requested-with'\'',\\n]\\n\\n# Cookie settings\\nif DEBUG:\\n    SESSION_COOKIE_SECURE = False\\n    CSRF_COOKIE_SECURE = False\\n    SESSION_COOKIE_SAMESITE = '\''Lax'\''\\n    CSRF_COOKIE_SAMESITE = '\''Lax'\''\\n    SESSION_COOKIE_DOMAIN = None\\n    CSRF_COOKIE_DOMAIN = None\\nelse:\\n    SESSION_COOKIE_SECURE = True\\n    CSRF_COOKIE_SECURE = True\\n    SESSION_COOKIE_SAMESITE = '\''None'\''\\n    CSRF_COOKIE_SAMESITE = '\''None'\''\\n    if DOMAIN:\\n        SESSION_COOKIE_DOMAIN = f'\''.{DOMAIN}'\''\\n        CSRF_COOKIE_DOMAIN = f'\''.{DOMAIN}'\''\\n\\n# Debug prints\\nif DEBUG:\\n    print(f'\''⊧ {DATABASES['\''default'\'']['\''ENGINE'\'']}'\'')\\ nprint(f'\''⊧ DEBUG: {DEBUG} {ALLOWED_HOSTS}'\'')" _config/settings.py &&
+        
+        echo "📝 Modifying urls.py..." &&
+        
+        sed -i "1i\\# backend/urls.py" _config/urls.py &&
+        sed -i "s/from django.contrib import admin/import os\\nimport importlib\\nfrom django.contrib import admin/" _config/urls.py &&
+        sed -i "s/from django.urls import path/from django.urls import path, include\\nfrom django.http import JsonResponse\\nfrom django.middleware.csrf import get_token/" _config/urls.py &&
+        
+        sed -i "/^from django.middleware.csrf import get_token/a\\\\n\\n# --- Dynamic app discovery ---\\ndef find_apps(base_dir, exclude_dirs=None):\\n    exclude_dirs = exclude_dirs or []\\n    exclude_dirs = list(exclude_dirs) + ['\''_config'\'', '\''__pycache'\'']\\n    apps = []\\n    for item in os.listdir(base_dir):\\n        item_path = os.path.join(base_dir, item)\\n        if (\\n            os.path.isdir(item_path)\\n            and item not in exclude_dirs\\n            and os.path.isfile(os.path.join(item_path, '\''__init__.py'\''))\\n        ):\\n            apps.append(item)\\n    return apps\\n\\n\\n# --- Health and CSRF endpoints ---\\ndef health_check(request):\\n    return JsonResponse({'\''status'\'': '\''healthy'\'', '\''service'\'': '\''backend'\''})\\n\\n\\ndef csrf_token(request):\\n    \\\"\\\"\\\"CSRF token endpoint for frontend API calls\\\"\\\"\\\"\\n    return JsonResponse({'\''csrfToken'\'': get_token(request)})\\n" _config/urls.py &&
+        
+        sed -i "s/^urlpatterns = \[/# --- Build urlpatterns dynamically ---\\nurlpatterns = [\\n    path('\''health\\/'\'', health_check, name='\''health-check'\''),\\n    path('\''csrf\\/'\'', csrf_token, name='\''csrf-token'\''),/" _config/urls.py &&
+        
+        sed -i "/^urlpatterns = /,/^\]/a\\\\nBASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\\napps = find_apps(BASE_DIR, exclude_dirs=['\''backend'\'', '\''migrations'\''])\\n\\nfor app in apps:\\n    try:\\n        importlib.import_module(f'\''{app}.urls'\'')  # check if app has urls\\n        urlpatterns.append(path(f'\''{app}\\/'\'', include(f'\''{app}.urls'\'')))\\n    except ModuleNotFoundError:\\n        # silently skip apps without urls.py\\n        pass" _config/urls.py &&
+        
+        echo "✅ Backend initialization complete!"
       '
 
   app-init:
@@ -228,9 +241,9 @@ services:
       sh -c "
       apt-get update &&
       apt-get install -y sed &&
-      pip install --upgrade pip &&
-      pip install django python-decouple djangorestframework django-cors-headers &&
-      django-admin startapp ${APP_NAME}
+      pip install --upgrade pip --root-user-action=ignore &&
+      pip install django python-decouple djangorestframework django-cors-headers --root-user-action=ignore &&
+      django-admin startapp ${APP_NAME:-app}
       "
     environment:
-      - APP_NAME=app
+      - APP_NAME=${APP_NAME:-app}

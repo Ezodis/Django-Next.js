@@ -1,30 +1,31 @@
 # backend/_config/requirements/base.txt
+# Core dependencies needed in all environments
 
-# Django core dependencies
+# Django core
 Django==4.2.7
-django-import-export==3.1.0
 djangorestframework==3.14.0
 django-cors-headers==4.3.1
 django-environ==0.11.2
+
+# Database
+dj-database-url==2.1.0
+psycopg2-binary==2.9.9  # Use psycopg2 in production (see deployment.txt)
+
+# Caching
 django-redis==5.2.0
-dj-database-url
-
-# Database - using pre-built binary
-psycopg2-binary==2.9.9
-
-# Static files and caching
-whitenoise==6.6.0
 redis==5.0.1
 hiredis==2.2.3
 
-# Payment processing
+# Static files
+whitenoise==6.6.0
+
+# Business logic
 stripe==7.8.2
-
-# Image processing
 Pillow==10.2.0
-
-# Filtering and pagination
 django-filter==23.5
+django-import-export==3.1.0
 
-# Other utilities
+# Utilities
 python-decouple==3.8
+pytz==2024.1  # Timezone support
+python-dateutil==2.8.2  # Date utilities
