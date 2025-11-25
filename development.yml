@@ -1,11 +1,7 @@
-# Run website:
-# docker compose -f development.yml build --parallel && docker compose -f development.yml up -d --remove-orphans
-
-# Run this the first time to create the dev files:
-# docker compose -f development.yml --profile init run --rm frontend-init ; docker compose -f development.yml --profile init run --rm backend-init
-
+# 1: docker compose -f development.yml --profile init run --rm frontend-init ; docker compose -f development.yml --profile init run --rm backend-init
+# 2: docker compose -f development.yml build --parallel && docker compose -f development.yml up -d --remove-orphans
 # To create a backend feature's app: APP_NAME=changename docker compose --profile init -f development.yml run --rm app-init
-# include/remove add-on on package.json: docker compose -f development.yml --profile init run --rm npm-init
+# Include/Remove add-on on package.json: docker compose -f development.yml --profile init run --rm npm-init
 
 volumes:
   db_data:
@@ -151,22 +147,22 @@ services:
         apt-get update && apt-get install -y jq && rm -rf /var/lib/apt/lists/* &&
         echo "📦 Syncing npm dependencies with /deps/npm.txt..." &&
 
-        wanted_deps=$(grep -v "^\s*#" /deps/npm.txt | sed "/^\s*$/d")
+        wanted_deps=$$(grep -v "^\s*#" /deps/npm.txt | sed "/^\s*$$/d")
 
-        for dep in $wanted_deps; do
-          if ! grep -q "\"$dep\"" package.json; then
-            echo "Installing $dep..."
-            npm install "$dep" --save --legacy-peer-deps
+        for dep in $$wanted_deps; do
+          if ! grep -q "\"$$dep\"" package.json; then
+            echo "Installing $$dep..."
+            npm install "$$dep" --save --legacy-peer-deps
           else
-            echo "$dep already present, skipping."
+            echo "$$dep already present, skipping."
           fi
         done
 
-        current_deps=$(jq -r ".dependencies | keys[]" package.json)
-        for dep in $current_deps; do
-          if ! echo "$wanted_deps" | grep -qx "$dep"; then
-            echo "Removing extra dependency $dep..."
-            npm uninstall "$dep" --save
+        current_deps=$$(jq -r ".dependencies | keys[]" package.json)
+        for dep in $$current_deps; do
+          if ! echo "$$wanted_deps" | grep -qx "$$dep"; then
+            echo "Removing extra dependency $$dep..."
+            npm uninstall "$$dep" --save
           fi
         done
 
@@ -215,9 +211,9 @@ services:
         
         sed -i "s|^STATIC_URL = .*|STATIC_URL = '\''/static/'\''|" _config/settings.py &&
         
-        sed -i "/^STATIC_URL = /a\\STATIC_ROOT = os.path.join(BASE_DIR, '\''staticfiles'\'')\\n\\n# Media files\\nMEDIA_URL = '\''/media/'\''\\nMEDIA_ROOT = os.path.join(BASE_DIR, '\''media'\'')" _config/settings.py &&
+        sed -i "/^STATIC_URL = /a\\STATIC_ROOT = os.path.join(BASE_DIR, '\''_config/staticfiles'\'')\\n\\n# Media files\\nMEDIA_URL = '\''/media/'\''\\nMEDIA_ROOT = os.path.join(BASE_DIR, '\''media'\'')" _config/settings.py &&
         
-        sed -i "/^DEFAULT_AUTO_FIELD = /a\\\\n# REST Framework\\nREST_FRAMEWORK = {\\n    '\''DEFAULT_PERMISSION_CLASSES'\'': ['\''rest_framework.permissions.AllowAny'\''],\\n    '\''DEFAULT_RENDERER_CLASSES'\'': ['\''rest_framework.renderers.JSONRenderer'\''],\\n    '\''DEFAULT_PARSER_CLASSES'\'': [\\n        '\''rest_framework.parsers.JSONParser'\'',\\n        '\''rest_framework.parsers.MultiPartParser'\'',\\n        '\''rest_framework.parsers.FormParser'\'',\\n    ],\\n}\\n\\n# CORS settings\\nCORS_ALLOW_CREDENTIALS = True\\n\\n# Base CORS allowed origins\\nCORS_ALLOWED_ORIGINS = []\\nCSRF_TRUSTED_ORIGINS = []\\nif DEBUG:\\n    CORS_ALLOW_ALL_ORIGINS = True\\n    CORS_ALLOWED_ORIGIN_REGEXES = [\\n        r'\''^http://localhost:\\\\d+$$'\'',\\n        r'\''^http://127.0.0.1:\\\\d+$$'\'',\\n    ]\\n    CSRF_TRUSTED_ORIGINS.extend([\\n        '\''http://localhost:3000'\'',\\n        '\''http://127.0.0.1:3000'\'',\\n        '\''http://localhost:8000'\'',\\n        '\''http://127.0.0.1:8000'\'',\\n    ])\\nelse:\\n    CORS_ALLOW_ALL_ORIGINS = False\\n    if DOMAIN:\\n        CORS_ALLOWED_ORIGINS.extend([\\n            f'\''https://{DOMAIN}'\'',\\n            f'\''https://www.{DOMAIN}'\'',\\n        ])\\n        CSRF_TRUSTED_ORIGINS.extend([\\n            f'\''https://{DOMAIN}'\'',\\n            f'\''https://www.{DOMAIN}'\'',\\n            f'\''https://api.{DOMAIN}'\'',\\n        ])\\n\\nCORS_EXPOSE_HEADERS = ['\''Content-Type'\'', '\''X-CSRFToken'\'']\\nCORS_ALLOW_HEADERS = [\\n    '\''accept'\'',\\n    '\''accept-encoding'\'',\\n    '\''authorization'\'',\\n    '\''content-type'\'',\\n    '\''dnt'\'',\\n    '\''origin'\'',\\n    '\''user-agent'\'',\\n    '\''x-csrftoken'\'',\\n    '\''x-requested-with'\'',\\n]\\n\\n# Cookie settings\\nif DEBUG:\\n    SESSION_COOKIE_SECURE = False\\n    CSRF_COOKIE_SECURE = False\\n    SESSION_COOKIE_SAMESITE = '\''Lax'\''\\n    CSRF_COOKIE_SAMESITE = '\''Lax'\''\\n    SESSION_COOKIE_DOMAIN = None\\n    CSRF_COOKIE_DOMAIN = None\\nelse:\\n    SESSION_COOKIE_SECURE = True\\n    CSRF_COOKIE_SECURE = True\\n    SESSION_COOKIE_SAMESITE = '\''None'\''\\n    CSRF_COOKIE_SAMESITE = '\''None'\''\\n    if DOMAIN:\\n        SESSION_COOKIE_DOMAIN = f'\''.{DOMAIN}'\''\\n        CSRF_COOKIE_DOMAIN = f'\''.{DOMAIN}'\''\\n\\n# Debug prints\\nif DEBUG:\\n    print(f'\''⊧ {DATABASES['\''default'\'']['\''ENGINE'\'']}'\'')\\ nprint(f'\''⊧ DEBUG: {DEBUG} {ALLOWED_HOSTS}'\'')" _config/settings.py &&
+        sed -i "/^DEFAULT_AUTO_FIELD = /a\\\\n# REST Framework\\nREST_FRAMEWORK = {\\n    '\''DEFAULT_PERMISSION_CLASSES'\'': ['\''rest_framework.permissions.AllowAny'\''],\\n    '\''DEFAULT_RENDERER_CLASSES'\'': ['\''rest_framework.renderers.JSONRenderer'\''],\\n    '\''DEFAULT_PARSER_CLASSES'\'': [\\n        '\''rest_framework.parsers.JSONParser'\'',\\n        '\''rest_framework.parsers.MultiPartParser'\'',\\n        '\''rest_framework.parsers.FormParser'\'',\\n    ],\\n}\\n\\n# CORS settings\\nCORS_ALLOW_CREDENTIALS = True\\n\\n# Base CORS allowed origins\\nCORS_ALLOWED_ORIGINS = []\\nCSRF_TRUSTED_ORIGINS = []\\nif DEBUG:\\n    CORS_ALLOW_ALL_ORIGINS = True\\n    CORS_ALLOWED_ORIGIN_REGEXES = [\\n        r'\''^http://localhost:\\\\d+$$'\'',\\n        r'\''^http://127.0.0.1:\\\\d+$$'\'',\\n    ]\\n    CSRF_TRUSTED_ORIGINS.extend([\\n        '\''http://localhost:3000'\'',\\n        '\''http://127.0.0.1:3000'\'',\\n        '\''http://localhost:8000'\'',\\n        '\''http://127.0.0.1:8000'\'',\\n    ])\\nelse:\\n    CORS_ALLOW_ALL_ORIGINS = False\\n    if DOMAIN:\\n        CORS_ALLOWED_ORIGINS.extend([\\n            f'\''https://{DOMAIN}'\'',\\n            f'\''https://www.{DOMAIN}'\'',\\n        ])\\n        CSRF_TRUSTED_ORIGINS.extend([\\n            f'\''https://{DOMAIN}'\'',\\n            f'\''https://www.{DOMAIN}'\'',\\n            f'\''https://api.{DOMAIN}'\'',\\n        ])\\n\\nCORS_EXPOSE_HEADERS = ['\''Content-Type'\'', '\''X-CSRFToken'\'']\\nCORS_ALLOW_HEADERS = [\\n    '\''accept'\'',\\n    '\''accept-encoding'\'',\\n    '\''authorization'\'',\\n    '\''content-type'\'',\\n    '\''dnt'\'',\\n    '\''origin'\'',\\n    '\''user-agent'\'',\\n    '\''x-csrftoken'\'',\\n    '\''x-requested-with'\'',\\n]\\n\\n# Cookie settings\\nif DEBUG:\\n    SESSION_COOKIE_SECURE = False\\n    CSRF_COOKIE_SECURE = False\\n    SESSION_COOKIE_SAMESITE = '\''Lax'\''\\n    CSRF_COOKIE_SAMESITE = '\''Lax'\''\\n    SESSION_COOKIE_DOMAIN = None\\n    CSRF_COOKIE_DOMAIN = None\\nelse:\\n    SESSION_COOKIE_SECURE = True\\n    CSRF_COOKIE_SECURE = True\\n    SESSION_COOKIE_SAMESITE = '\''None'\''\\n    CSRF_COOKIE_SAMESITE = '\''None'\''\\n    if DOMAIN:\\n        SESSION_COOKIE_DOMAIN = f'\''.{DOMAIN}'\''\\n        CSRF_COOKIE_DOMAIN = f'\''.{DOMAIN}'\''\\n\\n# Import/Export Configuration\\n# Optimize for large dataset imports (30k+ records)\\nIMPORT_EXPORT_USE_TRANSACTIONS = True  # Use transactions for data integrity\\nIMPORT_EXPORT_CHUNK_SIZE = 1000  # Process 1000 records per transaction\\nIMPORT_EXPORT_SKIP_ADMIN_LOG = True  # Skip admin log entries to save memory\\nIMPORT_EXPORT_TMP_STORAGE_CLASS = '\''import_export.tmp_storages.TempFolderStorage'\''  # Use temp files instead of memory\\n# File Upload Settings - Allow larger files for CSV imports\\nDATA_UPLOAD_MAX_MEMORY_SIZE = 52428800  # 50 MB (increased from default 2.5 MB)\\nFILE_UPLOAD_MAX_MEMORY_SIZE = 52428800  # 50 MB\\n\\n# Debug prints\\nif DEBUG:\\n    print(f\\\"⊧ {DATABASES['\''default'\'']['\''ENGINE'\'']}\\\"\\n    print(f\\\"⊧ DEBUG: {DEBUG} {ALLOWED_HOSTS}\\\")" _config/settings.py &&
         
         echo "📝 Modifying urls.py..." &&
         
@@ -229,7 +225,7 @@ services:
         
         sed -i "s/^urlpatterns = \[/# --- Build urlpatterns dynamically ---\\nurlpatterns = [\\n    path('\''health\\/'\'', health_check, name='\''health-check'\''),\\n    path('\''csrf\\/'\'', csrf_token, name='\''csrf-token'\''),/" _config/urls.py &&
         
-        sed -i "/^urlpatterns = /,/^\]/a\\\\nBASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\\napps = find_apps(BASE_DIR, exclude_dirs=['\''backend'\'', '\''migrations'\''])\\n\\nfor app in apps:\\n    try:\\n        importlib.import_module(f'\''{app}.urls'\'')  # check if app has urls\\n        urlpatterns.append(path(f'\''{app}\\/'\'', include(f'\''{app}.urls'\'')))\\n    except ModuleNotFoundError:\\n        # silently skip apps without urls.py\\n        pass" _config/urls.py &&
+        sed -i "/^\]/a\\\\n\\nBASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\\napps = find_apps(BASE_DIR, exclude_dirs=['\''backend'\'', '\''migrations'\''])\\n\\nfor app in apps:\\n    try:\\n        importlib.import_module(f'\''{app}.urls'\'')  # check if app has urls\\n        urlpatterns.append(path(f'\''{app}\\/'\'', include(f'\''{app}.urls'\'')))\\n    except ModuleNotFoundError:\\n        # silently skip apps without urls.py\\n        pass" _config/urls.py &&
         
         echo "✅ Backend initialization complete!"
       '
