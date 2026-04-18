@@ -1,8 +1,7 @@
 /**
- * Shared Metro configuration helpers for EliteCar mobile apps.
+ * Shared Metro configuration helpers for mobile apps.
  *
- * Centralised here so that all mobile apps (Elite Car, Elite Car Driver, etc.)
- * stay in sync without duplicating logic.
+ * Centralised here so that all mobile apps stay in sync without duplicating logic.
  */
 
 const fs = require('fs');
@@ -17,7 +16,7 @@ const fs = require('fs');
  *   On macOS, Docker uses virtiofs to share the host filesystem. virtiofs
  *   does not propagate inotify/kqueue events into the guest, so Watchman
  *   (which relies on those events) never fires and Hot Reload silently
- *   stops working.  Disabling Watchman and switching to polling fixes this,
+ *   stops working. Disabling Watchman and switching to polling fixes this,
  *   but **only inside Docker** — on a real macOS machine Watchman is the
  *   fastest and most reliable watcher and must stay enabled.
  */

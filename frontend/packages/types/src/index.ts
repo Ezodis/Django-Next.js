@@ -1,5 +1,4 @@
-// @elitecar/types
-// Shared TypeScript types across web and mobile apps
+// @app/types — shared TypeScript types
 
 export interface User {
   id: number;
@@ -10,37 +9,10 @@ export interface User {
   avatar?: string;
 }
 
-export interface Driver extends User {
-  vehicle: Vehicle;
-  rating: number;
-  is_available: boolean;
-}
-
-export interface Vehicle {
-  id: number;
-  make: string;
-  model: string;
-  year: number;
-  color: string;
-  plate: string;
-}
-
 export interface Location {
   latitude: number;
   longitude: number;
   address?: string;
-}
-
-export interface Ride {
-  id: number;
-  passenger: User;
-  driver?: Driver;
-  pickup: Location;
-  dropoff: Location;
-  status: string;
-  fare?: number;
-  created_at: string;
-  updated_at: string;
 }
 
 export interface ApiResponse<T> {

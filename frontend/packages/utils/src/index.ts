@@ -1,14 +1,10 @@
-// @elitecar/utils
-// Shared utility functions across web and mobile apps
+// @app/utils — shared utility functions
 
 /**
  * Format a price in cents to a display string (e.g. 1050 → "$10.50")
  */
 export function formatPrice(cents: number, currency = 'USD'): string {
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-  }).format(cents / 100);
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(cents / 100);
 }
 
 /**
