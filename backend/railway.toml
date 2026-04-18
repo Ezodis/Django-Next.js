@@ -1,7 +1,0 @@
-[build]
-builder = "DOCKERFILE"
-dockerfilePath = "./backend/config/Dockerfile.deployment"
-context = "./backend"
-
-[deploy]
-restartPolicyType = "ON_FAILURE"
