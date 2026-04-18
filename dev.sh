@@ -24,14 +24,21 @@
 #   ./dev.sh logs       — follow logs
 #   ./dev.sh status     — follow containers status
 
-set -euo pipefail
+set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$ROOT_DIR/dev.yml"
 MOBILE_DIR="$ROOT_DIR/frontend/mobile"
 
+# Always declare MOBILE_APPS so it exists as an array
+MOBILE_APPS=()
+
 export DOCKER_CONFIG="$ROOT_DIR/.docker"
 export DOCKER_BUILDKIT=1
+
+# Project name derived from the repo folder (lowercase, alphanumeric only)
+PROJECT_NAME="$(basename "$ROOT_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
+export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 
 # ── OS detection ──────────────────────────────────────────────────────────────
 _UNAME="$(uname -s)"
@@ -105,6 +112,14 @@ run_setup() {
         brew install podman-compose
       else
         echo "✅ podman-compose already installed"
+      fi
+
+      # docker-compose (more reliable than podman-compose for up -d on macOS)
+      if ! command -v docker-compose &>/dev/null; then
+        echo "📦 Installing docker-compose..."
+        brew install docker-compose
+      else
+        echo "✅ docker-compose already installed"
       fi
 
       # Podman machine
@@ -316,8 +331,6 @@ run_setup() {
   command -v tmux           &>/dev/null && echo "   tmux:           $(tmux -V)"
   echo ""
 
-  # Write stamp so future runs skip this check
-  touch "$ROOT_DIR/.dev-setup-done"
 }
 
 # ── Wire Podman socket ────────────────────────────────────────────────────────
@@ -345,10 +358,10 @@ _wire_podman_socket() {
 
 # ── Detect compose command ────────────────────────────────────────────────────
 detect_compose() {
-  if command -v podman-compose &>/dev/null; then
-    DC_CMD="podman-compose"
-  elif command -v docker-compose &>/dev/null; then
+  if command -v docker-compose &>/dev/null; then
     DC_CMD="docker-compose"
+  elif command -v podman-compose &>/dev/null; then
+    DC_CMD="podman-compose"
   elif docker compose version &>/dev/null 2>&1; then
     DC_CMD="docker compose"
   else
@@ -393,10 +406,16 @@ case "$CMD" in
   status|logs|down|stop|rebuild|_status_only|service-logs) _SKIP_SETUP=true ;;
 esac
 
-_SETUP_STAMP="$ROOT_DIR/.dev-setup-done"
+_deps_installed() {
+  command -v podman         &>/dev/null || return 1
+  command -v podman-compose &>/dev/null || command -v docker-compose &>/dev/null || return 1
+  command -v node           &>/dev/null || return 1
+  command -v git            &>/dev/null || return 1
+  return 0
+}
 
 if [[ "$_SKIP_SETUP" == "false" ]]; then
-  if [[ ! -f "$_SETUP_STAMP" ]]; then
+  if ! _deps_installed; then
     run_setup
   fi
   if [[ -d "$MOBILE_DIR" ]]; then
@@ -412,26 +431,25 @@ if [[ "$CMD" == "stop" || "$CMD" == "down" ]]; then
   echo "🛑 Stopping all services..."
   podman stop $(podman ps -q) 2>/dev/null || true
   podman rm   $(podman ps -aq) 2>/dev/null || true
-  podman network rm elitecar_default 2>/dev/null || true
+  podman network rm "${PROJECT_NAME}_default" 2>/dev/null || true
   echo "✅ All services stopped."
 
   if [[ "$CMD" == "down" ]]; then
     echo ""
     echo "🗑️  Removing project images..."
     podman images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-      | grep -E '^(localhost/)?(elitecar_|elitecar-)' \
+      | grep -E "^(localhost/)?(${PROJECT_NAME}_|${PROJECT_NAME}-)" \
       | xargs -r podman rmi -f 2>/dev/null || true
 
     echo "🗑️  Removing project volumes..."
     podman volume ls --format '{{.Name}}' 2>/dev/null \
-      | grep -E '^elitecar_' \
+      | grep -E "^${PROJECT_NAME}_" \
       | xargs -r podman volume rm 2>/dev/null || true
 
     echo "🗑️  Pruning build cache..."
     podman system prune -f --volumes 2>/dev/null || true
 
-    rm -f /tmp/elitecar-mobile-compose.yml /tmp/elitecar-compose.log /tmp/elitecar-mobile.log
-    rm -f "$ROOT_DIR/.dev-setup-done"
+    rm -f "/tmp/${PROJECT_NAME}-mobile-compose.yml" "/tmp/${PROJECT_NAME}-compose.log" "/tmp/${PROJECT_NAME}-mobile.log"
 
     echo ""
     echo "✅ Everything wiped. Run ./dev.sh to start fresh."
@@ -525,13 +543,13 @@ dc_up_detached() {
   # Redirect stdin to /dev/null so the process has no controlling terminal.
   # This is the portable macOS+Linux alternative to setsid.
   nohup $DC_CMD -f "$COMPOSE_FILE" up -d "$@" \
-    </dev/null >>/tmp/elitecar-compose.log 2>&1 &
+    </dev/null >>"/tmp/${PROJECT_NAME}-compose.log" 2>&1 &
   local pid=$!
   disown "$pid" 2>/dev/null || true
   # Wait up to 30s for at least one of the requested containers to appear
   local i=0
   while [[ $i -lt 30 ]]; do
-    if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -q "elitecar_"; then
+    if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${PROJECT_NAME}"; then
       break
     fi
     sleep 1; i=$((i+1))
@@ -575,7 +593,7 @@ _draw_status() {
   _STATUS_ROWS=()
 
   printf "\n"
-  printf "  \033[1;34m⬡ EliteCar\033[0m\n"
+  printf "  \033[1;34m⬡ edy.chat\033[0m\n"
   printf "\n"
 
   local _row_idx=1
@@ -620,16 +638,16 @@ _draw_status() {
     _row_idx=$(( _row_idx + 1 ))
   }
 
-  _srow "traefik"     "elitecar_traefik_1"              "http://localhost:8080"
-  _srow "database"    "elitecar_db_1"                   ""
-  _srow "backend"     "elitecar_backend_1"              "http://localhost:8000"
-  _srow "frontend"    "elitecar_frontend_1"             "http://localhost:3000"
+  _srow "traefik"     "${PROJECT_NAME}_traefik_1"              "http://localhost:8080"
+  _srow "database"    "${PROJECT_NAME}_db_1"                   ""
+  _srow "backend"     "${PROJECT_NAME}_backend_1"              "http://localhost:8000"
+  _srow "frontend"    "${PROJECT_NAME}_frontend_1"             "http://localhost:3000"
 
   local mport=8081
   for folder in "${MOBILE_APPS[@]}"; do
     local svc; svc=$(folder_to_service "$folder")
     local slug; slug=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-    _srow "$slug" "elitecar_${svc}_1" "http://localhost:${mport}"
+    _srow "$slug" "${PROJECT_NAME}_${svc}_1" "http://localhost:${mport}"
     mport=$((mport + 1))
   done
 
@@ -641,7 +659,7 @@ _draw_status() {
 
 # ── Log viewer server (port 19999) ────────────────────────────────────────────
 _start_log_server() {
-  pkill -f "elitecar-log-server" 2>/dev/null || true
+  pkill -f "${PROJECT_NAME}-log-server" 2>/dev/null || true
   # Also kill anything holding port 19999
   lsof -ti:19999 2>/dev/null | xargs kill -9 2>/dev/null || true
   sleep 0.3
@@ -716,7 +734,7 @@ class H(http.server.BaseHTTPRequestHandler):
         else:
             self.send_response(404);self.end_headers()
 
-sys.argv[0]='elitecar-log-server'
+sys.argv[0]='${PROJECT_NAME}-log-server'
 os.setpgrp()
 class ReuseServer(http.server.HTTPServer):
     allow_reuse_address = True
@@ -734,9 +752,9 @@ _status_line_count() {
 }
 
 live_monitor() {
-  local session="elitecar-dev"
-  local logfile="/tmp/elitecar-all.log"
-  local urlmap="/tmp/elitecar-urlmap-$$.tsv"
+  local session="${PROJECT_NAME}-dev"
+  local logfile="/tmp/${PROJECT_NAME}-all.log"
+  local urlmap="/tmp/${PROJECT_NAME}-urlmap-$$.tsv"
 
   # ── No-tmux fallback ──────────────────────────────────────────────────────
   if ! command -v tmux &>/dev/null; then
@@ -751,7 +769,7 @@ live_monitor() {
     return
   fi
   # ── Write self-contained left-pane script ─────────────────────────────────
-  local ms="/tmp/elitecar-mon-$$.sh"
+  local ms="/tmp/${PROJECT_NAME}-mon-$$.sh"
   {
     printf '#!/usr/bin/env bash\n'
     printf 'export DOCKER_HOST=%q\n' "${DOCKER_HOST:-}"
@@ -817,7 +835,7 @@ PANE_SCRIPT
     [[ -z "$cname" ]] && continue
     tmux send-keys -t "$session:0.1" \
       "podman logs -f --names '$cname' >> '$logfile' 2>&1 &" Enter
-  done < <(podman ps --format '{{.Names}}' 2>/dev/null | grep '^elitecar_' || true)
+  done < <(podman ps --format '{{.Names}}' 2>/dev/null | grep "^${PROJECT_NAME}_" || true)
   tmux send-keys -t "$session:0.1" "tail -f '$logfile'" Enter
 
   # ── Style ─────────────────────────────────────────────────────────────────
@@ -844,7 +862,7 @@ PANE_SCRIPT
 
   # ── Write a helper script that the key-bindings call ──────────────────────
   # Using a file avoids all inline quoting nightmares.
-  local _ks="/tmp/elitecar-keys-$$.sh"
+  local _ks="/tmp/${PROJECT_NAME}-keys-$$.sh"
   # Write the path variables (expand now), then the static body (quoted heredoc)
   printf '#!/usr/bin/env bash\nUM=%s\nLF=%s\nSESS=%s\n' \
     "$_um" "$_lf" "$_sess" > "$_ks"
@@ -921,19 +939,19 @@ KEYSCRIPT
   tmux attach-session -t "$session"
 
   tmux kill-session -t "$session" 2>/dev/null || true
-  pkill -f "elitecar-log-server" 2>/dev/null || true
-  rm -f "$logfile" "$ms" "$urlmap" "${ms}.bak" /tmp/elitecar-keys-*.sh
+  pkill -f "${PROJECT_NAME}-log-server" 2>/dev/null || true
+  rm -f "$logfile" "$ms" "$urlmap" "${ms}.bak" /tmp/${PROJECT_NAME}-keys-*.sh
 }
 
 
 # ── Single-service log view ────────────────────────────────────────────────────
 # Usage: ./dev.sh service-logs <container_name>
-# When inside the elitecar-dev tmux session: zooms to full window, any key restores
+# When inside the dev tmux session: zooms to full window, any key restores
 # When outside tmux: full-screen log view, Ctrl+C to exit
 _service_log_view() {
   local cname="$1"
   [[ -z "$cname" ]] && return 1
-  local session="elitecar-dev"
+  local session="${PROJECT_NAME}-dev"
 
   # ── Inside the tmux session: zoom to full window ───────────────────────────
   if [[ "${TMUX_PANE:-}" != "" ]] && [[ "$(tmux display-message -p '#S' 2>/dev/null)" == "$session" ]]; then
@@ -969,12 +987,12 @@ run_mobile() {
     services=$(mobile_service_names)
     echo "📱 Starting mobile services: $services"
     # Write a stable mobile compose file so the detached process can reference it
-    local yml_file="/tmp/elitecar-mobile-compose.yml"
+    local yml_file="/tmp/${PROJECT_NAME}-mobile-compose.yml"
     gen_mobile_yaml > "$yml_file"
     # Redirect stdin to /dev/null — portable macOS+Linux detachment (no setsid needed)
     # shellcheck disable=SC2086
     nohup $DC_CMD -f "$COMPOSE_FILE" -f "$yml_file" up -d $services \
-      </dev/null >>/tmp/elitecar-mobile.log 2>&1 &
+      </dev/null >>/tmp/${PROJECT_NAME}-mobile.log 2>&1 &
     disown
   else
     echo "⚠️  No mobile apps found in frontend/mobile/ — skipping."
@@ -1070,14 +1088,14 @@ _build_native_apks_locally() {
   fi
 }
 
-# ── Follow logs for all running elitecar containers in parallel ───────────────
+# ── Follow logs for all running project containers in parallel ───────────────
 _follow_logs() {
   local pids=() cname
   while IFS= read -r cname; do
     [[ -z "$cname" ]] && continue
     podman logs -f --names "$cname" 2>/dev/null &
     pids+=($!)
-  done < <(podman ps --format '{{.Names}}' 2>/dev/null | grep '^elitecar_')
+  done < <(podman ps --format '{{.Names}}' 2>/dev/null | grep "^${PROJECT_NAME}_")
 
   if [[ ${#pids[@]} -eq 0 ]]; then
     echo "⚠️  No running containers found."
@@ -1116,7 +1134,8 @@ ASEOF
     fi
   fi
 
-  # Android emulator — start if not already running
+  # Android emulator — start if not already running (only when mobile apps exist)
+  has_mobile_apps || return 0
   _setup_android_path
   command -v adb &>/dev/null || return 0
   command -v emulator &>/dev/null || return 0
@@ -1144,24 +1163,23 @@ _do_rebuild() {
   echo "🧨 Rebuild: stopping all services..."
   podman stop $(podman ps -q) 2>/dev/null || true
   podman rm   $(podman ps -aq) 2>/dev/null || true
-  podman network rm elitecar_default 2>/dev/null || true
+  podman network rm ${PROJECT_NAME}_default 2>/dev/null || true
 
   echo "🗑️  Removing project images..."
   podman images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-    | grep -E '^(localhost/)?(elitecar_|elitecar-)' \
+    | grep -E "^(localhost/)?(${PROJECT_NAME}_|${PROJECT_NAME}-)" \
     | xargs -r podman rmi -f 2>/dev/null || true
 
   echo "🗑️  Removing project volumes..."
   podman volume ls --format '{{.Name}}' 2>/dev/null \
-    | grep -E '^elitecar_' \
+    | grep -E "^${PROJECT_NAME}_" \
     | xargs -r podman volume rm 2>/dev/null || true
 
   echo "🗑️  Pruning build cache..."
   podman system prune -f --volumes 2>/dev/null || true
 
   echo "🗑️  Clearing temp compose files..."
-  rm -f /tmp/elitecar-mobile-compose.yml /tmp/elitecar-compose.log /tmp/elitecar-mobile.log
-  rm -f "$ROOT_DIR/.dev-setup-done"
+  rm -f /tmp/${PROJECT_NAME}-mobile-compose.yml /tmp/${PROJECT_NAME}-compose.log /tmp/${PROJECT_NAME}-mobile.log
 
   echo ""
   echo "✅ Clean slate. Rebuilding everything from scratch..."
@@ -1190,25 +1208,23 @@ _do_rebuild() {
   dc_up_detached traefik db backend frontend
   run_mobile
 
-  _setup_android_path
-  if command -v adb &>/dev/null && command -v emulator &>/dev/null; then
-    echo ""
-    echo "📱 Setting up Android emulator..."
-    local device
-    device=$(_ensure_emulator)
-    if [[ -n "$device" ]]; then
-      discover_apps
+  if has_mobile_apps; then
+    _setup_android_path
+    if command -v adb &>/dev/null && command -v emulator &>/dev/null; then
       echo ""
-      echo "📲 Installing all mobile apps on emulator..."
-      for folder in "${MOBILE_APPS[@]}"; do
-        local app_key; app_key=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-        _install_app_on_emulator "$app_key" "$device"
-      done
+      echo "📱 Setting up Android emulator..."
+      local device
+      device=$(_ensure_emulator)
+      if [[ -n "$device" ]]; then
+        discover_apps
+        echo ""
+        echo "📲 Installing all mobile apps on emulator..."
+        for folder in "${MOBILE_APPS[@]}"; do
+          local app_key; app_key=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+          _install_app_on_emulator "$app_key" "$device"
+        done
+      fi
     fi
-  else
-    echo ""
-    echo "ℹ️  Android SDK not found — skipping emulator launch."
-    echo "   To build and install an APK: ./dev.sh build <app> android --local"
   fi
 
   echo ""
@@ -1346,7 +1362,7 @@ _ensure_emulator() {
 
 # Install + launch one app on the emulator
 _install_app_on_emulator() {
-  local app_key="$1"   # e.g. "elite-car"
+  local app_key="$1"   # e.g. "my-app"
   local device="$2"    # e.g. "emulator-5554"
   local app_dir="$MOBILE_DIR"
   local metro_port=8081
@@ -1405,16 +1421,16 @@ _heal_service() {
   local svc="$1"
   echo "🔧 Healing service: $svc"
   if [[ "$svc" == mobile-* ]]; then
-    local yml_file="/tmp/elitecar-mobile-compose.yml"
+    local yml_file="/tmp/${PROJECT_NAME}-mobile-compose.yml"
     gen_mobile_yaml > "$yml_file"
     $DC_CMD -f "$COMPOSE_FILE" -f "$yml_file" build "$svc" 2>/dev/null || true
     nohup $DC_CMD -f "$COMPOSE_FILE" -f "$yml_file" up -d --force-recreate "$svc" \
-      </dev/null >>/tmp/elitecar-mobile.log 2>&1 &
+      </dev/null >>/tmp/${PROJECT_NAME}-mobile.log 2>&1 &
     disown
   else
     $DC build "$svc" 2>/dev/null || true
     nohup $DC_CMD -f "$COMPOSE_FILE" up -d --force-recreate "$svc" \
-      </dev/null >>/tmp/elitecar-compose.log 2>&1 &
+      </dev/null >>/tmp/${PROJECT_NAME}-compose.log 2>&1 &
     disown
   fi
 }
@@ -1427,7 +1443,7 @@ smart_launch() {
   discover_apps
 
   local core_svcs=("traefik" "db" "backend" "frontend")
-  local core_containers=("elitecar_traefik_1" "elitecar_db_1" "elitecar_backend_1" "elitecar_frontend_1")
+  local core_containers=("${PROJECT_NAME}_traefik_1" "${PROJECT_NAME}_db_1" "${PROJECT_NAME}_backend_1" "${PROJECT_NAME}_frontend_1")
 
   # Count running vs not-running containers (core only — mobile may lag behind)
   local running_count=0
@@ -1444,7 +1460,7 @@ smart_launch() {
 
   for folder in "${MOBILE_APPS[@]}"; do
     local svc; svc=$(folder_to_service "$folder")
-    local raw; raw=$(podman inspect --format '{{.State.Status}}' "elitecar_${svc}_1" 2>/dev/null || echo "missing")
+    local raw; raw=$(podman inspect --format '{{.State.Status}}' "${PROJECT_NAME}_${svc}_1" 2>/dev/null || echo "missing")
     [[ "$raw" == "missing" ]] && mobile_missing=$((mobile_missing + 1))
   done
 
@@ -1468,7 +1484,7 @@ smart_launch() {
       local still_missing=0
       for folder in "${MOBILE_APPS[@]}"; do
         local svc; svc=$(folder_to_service "$folder")
-        local raw; raw=$(podman inspect --format '{{.State.Status}}' "elitecar_${svc}_1" 2>/dev/null || echo "missing")
+        local raw; raw=$(podman inspect --format '{{.State.Status}}' "${PROJECT_NAME}_${svc}_1" 2>/dev/null || echo "missing")
         [[ "$raw" == "missing" ]] && still_missing=1 && break
       done
       [[ $still_missing -eq 0 ]] && break
@@ -1481,8 +1497,8 @@ smart_launch() {
   # ── First run: core images never built ───────────────────────────────────
   # Verify by checking if the backend image actually exists, not just container state
   local backend_image_exists=0
-  if podman image exists localhost/elitecar_backend 2>/dev/null || \
-     podman images --format '{{.Repository}}' 2>/dev/null | grep -q 'elitecar_backend'; then
+  if podman image exists localhost/${PROJECT_NAME}_backend 2>/dev/null || \
+     podman images --format '{{.Repository}}' 2>/dev/null | grep -q "${PROJECT_NAME}_backend"; then
     backend_image_exists=1
   fi
 
@@ -1502,18 +1518,19 @@ smart_launch() {
 
     run_mobile
 
-    _setup_android_path
-    if command -v adb &>/dev/null && command -v emulator &>/dev/null; then
-      echo ""
-      echo "📱 Setting up Android emulator..."
-      local device
-      device=$(_ensure_emulator)
+    if has_mobile_apps; then
+      _setup_android_path
+      if command -v adb &>/dev/null && command -v emulator &>/dev/null; then
+        echo ""
+        echo "📱 Setting up Android emulator..."
+        local device
+        device=$(_ensure_emulator)
 
-      if [[ -n "$device" ]]; then
-        local lat="" lon="" src=""
-        if [[ "$OS" == "mac" ]]; then
-          local _loc
-          _loc=$(python3 - 2>/dev/null <<'PYEOF'
+        if [[ -n "$device" ]]; then
+          local lat="" lon="" src=""
+          if [[ "$OS" == "mac" ]]; then
+            local _loc
+            _loc=$(python3 - 2>/dev/null <<'PYEOF'
 import time
 try:
     import objc
@@ -1528,32 +1545,29 @@ try:
 except Exception:
     pass
 PYEOF
-          )
-          if [[ -n "$_loc" ]]; then
-            lat=$(echo "$_loc" | awk '{print $1}'); lon=$(echo "$_loc" | awk '{print $2}'); src="CoreLocation"
+            )
+            if [[ -n "$_loc" ]]; then
+              lat=$(echo "$_loc" | awk '{print $1}'); lon=$(echo "$_loc" | awk '{print $2}'); src="CoreLocation"
+            fi
           fi
-        fi
-        if [[ -z "$lat" ]]; then
-          local _geo
-          _geo=$(curl -sf --max-time 5 "https://ipapi.co/json/" 2>/dev/null \
-            | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['latitude'], d['longitude'])" 2>/dev/null || echo "")
-          if [[ -n "$_geo" ]]; then
-            lat=$(echo "$_geo" | awk '{print $1}'); lon=$(echo "$_geo" | awk '{print $2}'); src="IP geolocation"
+          if [[ -z "$lat" ]]; then
+            local _geo
+            _geo=$(curl -sf --max-time 5 "https://ipapi.co/json/" 2>/dev/null \
+              | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['latitude'], d['longitude'])" 2>/dev/null || echo "")
+            if [[ -n "$_geo" ]]; then
+              lat=$(echo "$_geo" | awk '{print $1}'); lon=$(echo "$_geo" | awk '{print $2}'); src="IP geolocation"
+            fi
           fi
-        fi
-        [[ -n "$lat" && -n "$lon" ]] && adb -s "$device" emu geo fix "$lon" "$lat" 2>/dev/null || true
+          [[ -n "$lat" && -n "$lon" ]] && adb -s "$device" emu geo fix "$lon" "$lat" 2>/dev/null || true
 
-        echo ""
-        echo "📲 Installing all mobile apps on emulator..."
-        for folder in "${MOBILE_APPS[@]}"; do
-          local app_key; app_key=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-          _install_app_on_emulator "$app_key" "$device"
-        done
+          echo ""
+          echo "📲 Installing all mobile apps on emulator..."
+          for folder in "${MOBILE_APPS[@]}"; do
+            local app_key; app_key=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+            _install_app_on_emulator "$app_key" "$device"
+          done
+        fi
       fi
-    else
-      echo ""
-      echo "ℹ️  Android SDK not found — skipping emulator launch."
-      echo "   To build and install an APK: ./dev.sh build <app> android --local"
     fi
 
     echo ""
@@ -1572,24 +1586,22 @@ PYEOF
   dc_up_detached traefik db backend frontend
   run_mobile
 
-  _setup_android_path
-  if command -v adb &>/dev/null && command -v emulator &>/dev/null; then
-    echo ""
-    echo "📱 Setting up Android emulator..."
-    local device
-    device=$(_ensure_emulator)
-    if [[ -n "$device" ]]; then
+  if has_mobile_apps; then
+    _setup_android_path
+    if command -v adb &>/dev/null && command -v emulator &>/dev/null; then
       echo ""
-      echo "📲 Installing all mobile apps on emulator..."
-      for folder in "${MOBILE_APPS[@]}"; do
-        local app_key; app_key=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-        _install_app_on_emulator "$app_key" "$device"
-      done
+      echo "📱 Setting up Android emulator..."
+      local device
+      device=$(_ensure_emulator)
+      if [[ -n "$device" ]]; then
+        echo ""
+        echo "📲 Installing all mobile apps on emulator..."
+        for folder in "${MOBILE_APPS[@]}"; do
+          local app_key; app_key=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+          _install_app_on_emulator "$app_key" "$device"
+        done
+      fi
     fi
-  else
-    echo ""
-    echo "ℹ️  Android SDK not found — skipping emulator launch."
-    echo "   To build and install an APK: ./dev.sh build <app> android --local"
   fi
 
   echo ""
@@ -1814,11 +1826,11 @@ case "$CMD" in
     if has_mobile_apps; then
       mobile_svcs=$(mobile_service_names)
       echo "📱 Starting mobile services: $mobile_svcs"
-      local yml_file="/tmp/elitecar-mobile-compose.yml"
+      local yml_file="/tmp/${PROJECT_NAME}-mobile-compose.yml"
       gen_mobile_yaml > "$yml_file"
       # shellcheck disable=SC2086
       nohup $DC_CMD -f "$COMPOSE_FILE" -f "$yml_file" up -d --force-recreate $mobile_svcs \
-        </dev/null >>/tmp/elitecar-mobile.log 2>&1 &
+        </dev/null >>/tmp/${PROJECT_NAME}-mobile.log 2>&1 &
       disown
       echo ""
       echo "✅ Mobile services started in the background."
@@ -1853,7 +1865,7 @@ case "$CMD" in
             -keystore "$keystore_path" \
             -alias "$slug" \
             -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=$folder, OU=Mobile, O=EliteCar, L=Unknown, S=Unknown, C=US"
+            -dname "CN=$folder, OU=Mobile, O=${PROJECT_NAME}, L=Unknown, S=Unknown, C=US"
           { echo ""; echo "# Release signing"
             echo "RELEASE_STORE_FILE=${slug}-release.keystore"
             echo "RELEASE_KEY_ALIAS=${slug}"
@@ -1917,7 +1929,7 @@ case "$CMD" in
     echo "   ./dev.sh build <app> [android|ios] --local"
     echo ""
     echo "   Example:"
-    echo "   ./dev.sh build elite-car-driver android --local"
+    echo "   ./dev.sh build <app-name> android --local"
     exit 1
     ;;
 
@@ -1927,7 +1939,7 @@ case "$CMD" in
     echo "   ./dev.sh build <app> android --local"
     echo ""
     echo "   Example:"
-    echo "   ./dev.sh build elite-car-driver android --local"
+    echo "   ./dev.sh build <app-name> android --local"
     exit 1
     ;;
 

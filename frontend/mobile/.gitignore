@@ -2,16 +2,13 @@
 
 # dependencies
 node_modules/
-Elite Car/node_modules/
-Elite Car Driver/node_modules/
+*/node_modules/
 
 # Expo
 .expo/
 .expo-shared/
-Elite Car/.expo/
-Elite Car/.expo-shared/
-Elite Car Driver/.expo/
-Elite Car Driver/.expo-shared/
+*/.expo/
+*/.expo-shared/
 dist/
 web-build/
 expo-env.d.ts
@@ -44,16 +41,10 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
-# generated native folders
+# generated native folders — ignored per-app; android/ kept for EAS builds
 /ios
 /android
-Elite Car/ios
-Elite Car/android
-Elite Car Driver/ios
-
-# package-lock.json is needed per-app for EAS builds
-# Elite Car Driver/android is needed for EAS builds
+*/ios
 
 # local.properties contains machine-specific SDK paths — never commit
-Elite Car/android/local.properties
-Elite Car Driver/android/local.properties
+*/android/local.properties

@@ -63,7 +63,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
     CMD curl -f http://localhost:8081 || exit 1
 
 # APP_TYPE is the exact folder name set per-container by docker-compose.
-# e.g. APP_TYPE="Elite Car Driver" → runs /app/Elite Car Driver
+# e.g. APP_TYPE="My App" → runs /app/My App
 COPY frontend/mobile/scripts/mobile.sh /mobile.sh
 RUN chmod +x /mobile.sh
 
