@@ -2,8 +2,8 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "App",
-  description: "App description",
+  title: process.env.NEXT_PUBLIC_APP_NAME ?? "App",
+  description: process.env.NEXT_PUBLIC_APP_DESCRIPTION ?? "App description",
 };
 
 export const viewport: Viewport = {

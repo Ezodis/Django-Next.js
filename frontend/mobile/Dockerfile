@@ -62,8 +62,9 @@ EXPOSE 8081
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
     CMD curl -f http://localhost:8081 || exit 1
 
-# APP_TYPE is the exact folder name set per-container by docker-compose.
-# e.g. APP_TYPE="My App" → runs /app/My App
+# APP_TYPE is the exact folder name set per-container by docker-compose,
+# derived dynamically from the app folder name (lowercased, spaces → hyphens).
+# e.g. a folder named "My App" → APP_TYPE="my-app" → runs /app/my-app
 COPY frontend/mobile/scripts/mobile.sh /mobile.sh
 RUN chmod +x /mobile.sh
 
