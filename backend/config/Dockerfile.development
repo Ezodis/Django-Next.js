@@ -1,0 +1,117 @@
+# backend/config/Dockerfile.development
+# Multi-stage build for optimized image size
+# Features: Auto-migrations, auto-restore, scheduled backups, non-root user
+# ---------- Build Stage ----------
+FROM python:3.12.5-slim-bookworm AS python-build-stage
+
+WORKDIR /backend
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=off
+
+# Copy system package requirements first
+COPY backend/requirements/packages.txt ./requirements/
+
+# Install build deps from packages.txt for easy customization
+# Edit requirements/packages.txt to add/remove system dependencies
+RUN set -e; \
+    apt-get update; \
+    # Extract package names: remove full-line comments, strip inline comments, filter empty lines
+    PACKAGES=$(grep -v '^#' requirements/packages.txt | \
+               sed 's/#.*//' | \
+               grep -v '^$' | \
+               tr '\n' ' ' | \
+               sed 's/  */ /g'); \
+    if [ -n "$PACKAGES" ]; then \
+        echo "Installing packages from packages.txt: $PACKAGES"; \
+        apt-get install -y --no-install-recommends $PACKAGES; \
+    else \
+        echo "Warning: No uncommented packages found in packages.txt"; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip first for better dependency resolution
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Copy only requirements first to leverage layer caching
+COPY backend/requirements/ ./requirements/
+# Build wheels (faster installs in runtime stage)
+# --prefer-binary avoids building from source when possible
+RUN pip wheel --wheel-dir /wheels --prefer-binary -r requirements/development.txt
+
+# ---------- Runtime Stage ----------
+FROM python:3.12.5-slim-bookworm AS python-run-stage
+
+WORKDIR /backend
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/backend \
+    PIP_NO_CACHE_DIR=1
+
+# Minimal runtime deps with PostgreSQL 17 client (latest)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    libpq-dev \
+    gettext \
+    curl \
+    netcat-openbsd \
+    cron \
+    gzip \
+    cpio \
+    ffmpeg \
+    imagemagick \
+    wget \
+    gnupg \
+ && wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - \
+ && echo "deb http://apt.postgresql.org/pub/repos/apt/ bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends postgresql-client-17 \
+ && rm -rf /var/lib/apt/lists/* \
+ && apt-get clean
+
+# Copy wheels and install (no network at runtime; faster)
+COPY --from=python-build-stage /wheels /wheels
+RUN pip install --no-cache-dir --no-index --find-links=/wheels /wheels/* \
+ && rm -rf /wheels
+
+# Create non-root user for safety
+RUN addgroup --system django && adduser --system --ingroup django django
+
+# Copy project source with ownership for the django user
+COPY --chown=django:django . /backend
+
+# Copy and setup backup scripts
+# Two scripts: backup.sh (basic) and backup_gcs.sh (with GCS support)
+COPY --chown=django:django backend/backup/backup.sh /backend/backup/backup.sh
+COPY --chown=django:django backend/backup/backup_gcs.sh /backend/backup/backup_gcs.sh
+RUN chmod +x /backend/backup/backup.sh /backend/backup/backup_gcs.sh && \
+    mkdir -p /backend/backup/start /backend/backup/db /backend/backup/snapshots && \
+    chown -R django:django /backend/backup
+
+# Setup cron for daily database backups at 2:00 AM
+RUN echo "0 2 * * * /backend/backup/backup.sh db >> /backend/backup/backup.log 2>&1" | crontab -u django -
+
+# Ensure django user has write permissions to the backend directory
+RUN chown -R django:django /backend && \
+    chmod -R 755 /backend && \
+    mkdir -p /backend/media && \
+    chown -R django:django /backend/media && \
+    chmod -R 755 /backend/media
+
+# Set environment variables with defaults
+ENV DB_HOST=db \
+    DB_PORT=5432 \
+    DB_NAME=postgres \
+    DB_USER=postgres \
+    DB_PASSWORD=postgres \
+    DJANGO_SETTINGS_MODULE=config.settings \
+    MAX_WAIT=60 \
+    SLEEP=2 \
+    WAITED=0
+
+COPY backend/config/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Keep container running as root so cron can start, but switch to django for app
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]

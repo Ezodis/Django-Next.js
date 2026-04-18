@@ -1,0 +1,71 @@
+# backend/config/Dockerfile.deployment
+# Lightweight production image with Gunicorn WSGI server
+# Uses non-root user, GCS backup support, no cron (use platform scheduler)
+# ---------- Build Stage ----------
+FROM python:3.12.5-slim-bookworm AS python-build-stage
+WORKDIR /backend
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=off
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential libpq-dev curl ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY config/requirements/ ./requirements/
+RUN pip install --upgrade pip && \
+    pip wheel --wheel-dir /wheels --prefer-binary -r requirements/deployment.txt
+
+# ---------- Runtime Stage ----------
+FROM python:3.12.5-slim-bookworm AS python-run-stage
+WORKDIR /backend
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/backend PIP_NO_CACHE_DIR=1
+
+# Install runtime dependencies with PostgreSQL 17 client (latest - updated 2026-01-09)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    -o Acquire::Retries=3 \
+    -o Acquire::http::Timeout=30 \
+    -o Acquire::https::Timeout=30 \
+    gzip \
+    cpio \
+    wget \
+    gnupg && \
+    wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - && \
+    echo "deb http://apt.postgresql.org/pub/repos/apt/ bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends postgresql-client-17 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=python-build-stage /wheels /wheels
+RUN pip install --no-cache-dir --no-index --find-links=/wheels --only-binary=:all: /wheels/* --root-user-action=ignore && rm -rf /wheels
+
+RUN addgroup --system django && adduser --system --ingroup django django
+
+# Copy entrypoint script first (small file, good for caching)
+COPY config/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Copy application code (excluding large data files via .dockerignore)
+COPY --chown=django:django . /backend
+
+# Ensure backup directories exist and set permissions (only for backup scripts and directories)
+RUN mkdir -p /backend/backup/start /backend/backup/db /backend/backup/snapshots && \
+    chmod +x /backend/backup/*.sh && \
+    chown -R django:django /backend/backup
+
+# Build args for superuser
+ARG DJANGO_SUPERUSER_USERNAME
+ARG DJANGO_SUPERUSER_PASSWORD
+ARG DOMAIN
+
+# Set environment variables for runtime
+ENV DJANGO_SUPERUSER_USERNAME=$DJANGO_SUPERUSER_USERNAME
+ENV DJANGO_SUPERUSER_PASSWORD=$DJANGO_SUPERUSER_PASSWORD
+ENV DOMAIN=$DOMAIN
+
+# Switch to non-root user for security (principle of least privilege)
+USER django
+
+# Run application as unprivileged user
+ENTRYPOINT ["/entrypoint.sh"]
+# Note: Using shell form for CMD to support ${PORT:-8000} environment variable expansion
+# Railway and other PaaS providers set PORT dynamically
+CMD ["sh", "-c", "gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 3"]

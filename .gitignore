@@ -52,6 +52,8 @@ coverage.xml
 
 # Django stuff:
 staticfiles/
+*.sqlite3
+*.db
 
 # Sphinx documentation
 docs/_build/
@@ -276,7 +278,59 @@ dump.rdb
 .pytest_cache/
 .ipython/
 .env
+.env.local
+.env*.local
 .envs/*
 !.envs/.local/
 
-*.pem
+*.pemfrontend/out/
+
+# Test files
+test_seed_data.py
+frontend/web/.next/
+frontend/web/.turbo/
+screenshots/
+
+# GCS credentials (keep secure, never commit)
+backend/config/gcs-credentials.json
+gcs-credentials.json
+
+# Monorepo build artifacts
+frontend/packages/*/dist/
+frontend/packages/*/node_modules/
+
+# Frontend node_modules
+frontend/node_modules/
+frontend/web/node_modules/
+frontend/mobile/node_modules/
+
+# Mobile (React Native / Expo)
+frontend/mobile/.expo/
+frontend/mobile/node_modules/
+frontend/mobile/dist/
+frontend/mobile/android/
+frontend/mobile/ios/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+web-build/
+
+# Expo
+.expo/
+.expo-shared/
+
+# Local native builds (APKs / IPAs produced by 'make build-android' or 'make build-ios')
+frontend/mobile/builds/
+
+
+# Release builds
+frontend/mobile/builds/
+*.keystore
+*.jks
+
+# Setup lockfile (per-machine, not committed)
+.setup-complete
+.dev-setup-done

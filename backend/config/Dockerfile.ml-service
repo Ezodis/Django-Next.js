@@ -1,0 +1,126 @@
+# ML Service Standalone Dockerfile
+# Lightweight Docker image that only serves ML endpoints Excludes database, admin, and other Django apps
+# Deploy this separately from the main backend for cost optimization
+
+# ---------- Build Stage ----------
+FROM python:3.12.5-slim-bookworm AS python-build-stage
+WORKDIR /backend
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=off
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY config/requirements/ ./requirements/
+RUN pip install --upgrade pip && \
+    pip wheel --wheel-dir /wheels --prefer-binary -r requirements/base.txt && \
+
+# ---------- Runtime Stage ----------
+FROM python:3.12.5-slim-bookworm AS python-run-stage
+WORKDIR /backend
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/backend PIP_NO_CACHE_DIR=1
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev \
+    ffmpeg \
+    imagemagick \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy wheels and install
+COPY --from=python-build-stage /wheels /wheels
+RUN pip install --no-cache-dir --no-index --find-links=/wheels --only-binary=:all: /wheels/* --root-user-action=ignore && \
+    # Install basic-pitch separately with --no-deps to avoid TensorFlow version conflicts
+    pip install --no-deps basic-pitch==0.4.0 && \
+    rm -rf /wheels
+
+# Create non-root user
+RUN addgroup --system django && adduser --system --ingroup django django
+
+# Copy only necessary application code
+COPY --chown=django:django config/ /backend/config/
+COPY --chown=django:django ml_service/ /backend/ml_service/
+COPY --chown=django:django manage.py /backend/
+
+# Create minimal settings for ML-only service
+RUN cat > /backend/config/settings_ml.py <<'EOF'
+# Minimal Django settings for ML service only
+import os
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'insecure-ml-service-key-change-in-production')
+DEBUG = os.getenv('DJANGO_DEBUG', 'False').lower() == 'true'
+
+# ALLOWED_HOSTS configuration
+# For production, set ML_SERVICE_ALLOWED_HOSTS env var (comma-separated)
+# Example: ML_SERVICE_ALLOWED_HOSTS=ml-service.example.com,10.0.0.0/8
+ALLOWED_HOSTS = os.getenv('ML_SERVICE_ALLOWED_HOSTS', '*').split(',')
+if DEBUG:
+    ALLOWED_HOSTS = ['*']  # Allow all in debug mode
+
+# Minimal installed apps (only what's needed for REST API)
+INSTALLED_APPS = [
+    'django.contrib.contenttypes',
+    'django.contrib.auth',
+    'rest_framework',
+    'ml_service',
+]
+
+MIDDLEWARE = [
+    'django.middleware.security.SecurityMiddleware',
+    'django.middleware.common.CommonMiddleware',
+]
+
+ROOT_URLCONF = 'config.urls_ml'
+WSGI_APPLICATION = 'config.wsgi.application'
+
+# Dummy database (required by Django, but not used)
+# Using in-memory SQLite since we don't store any data
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': ':memory:',
+    }
+}
+
+# REST Framework settings
+REST_FRAMEWORK = {
+    'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.AllowAny'],
+    'DEFAULT_RENDERER_CLASSES': ['rest_framework.renderers.JSONRenderer'],
+}
+
+# Logging
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'INFO',
+    },
+}
+EOF
+
+# Create minimal URL config for ML-only endpoints
+RUN cat > /backend/config/urls_ml.py <<'EOF'
+from django.urls import path, include
+
+urlpatterns = [
+    path('ml_service/', include('ml_service.urls')),
+]
+EOF
+
+# Switch to non-root user
+USER django
+
+# Run with Gunicorn (using ML-specific settings)
+CMD ["sh", "-c", "DJANGO_SETTINGS_MODULE=config.settings_ml gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 2 --timeout 300"]

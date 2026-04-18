@@ -1,0 +1,66 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #000000;
+
+  --color-primary-50: #eff6ff;
+  --color-primary-100: #dbeafe;
+  --color-primary-200: #bfdbfe;
+  --color-primary-300: #93c5fd;
+  --color-primary-400: #60a5fa;
+  --color-primary-500: #3b82f6;
+  --color-primary-600: #2563eb;
+  --color-primary-700: #1d4ed8;
+  --color-primary-800: #1e40af;
+  --color-primary-900: #1e3a8a;
+
+  --color-neutral-50: #fafafa;
+  --color-neutral-100: #f4f4f5;
+  --color-neutral-200: #e4e4e7;
+  --color-neutral-300: #d4d4d8;
+  --color-neutral-400: #a1a1aa;
+  --color-neutral-500: #71717a;
+  --color-neutral-600: #52525b;
+  --color-neutral-700: #3f3f46;
+  --color-neutral-800: #27272a;
+  --color-neutral-900: #18181b;
+
+  --header-height: 48px;
+  --dock-bottom: 2.5rem;
+}
+
+html,
+body {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+/* Custom z-index layers */
+.z-60 { z-index: 60; }
+.z-70 { z-index: 70; }
+.z-80 { z-index: 80; }
+.z-sidebar-backdrop { z-index: 1100; }
+.z-sidebar { z-index: 1200; }
+.z-header { z-index: 1050; }
+
+/* Modal animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideUp {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+
+.animate-fadeIn  { animation: fadeIn  0.3s ease-out; }
+.animate-slideUp { animation: slideUp 0.3s ease-out; }
+
+/* Scrollbar styling */
+.overflow-y-auto::-webkit-scrollbar       { width: 8px; }
+.overflow-y-auto::-webkit-scrollbar-track { background: rgba(31, 41, 55, 0.5); border-radius: 4px; }
+.overflow-y-auto::-webkit-scrollbar-thumb { background: rgba(75, 85, 99, 0.8);  border-radius: 4px; }
+.overflow-y-auto::-webkit-scrollbar-thumb:hover { background: rgba(107, 114, 128, 1); }

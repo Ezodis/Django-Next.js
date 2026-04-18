@@ -1,0 +1,416 @@
+# Manual run (no mobile services): DOCKER_BUILDKIT=1 docker compose -f dev.yml up -d --build traefik db backend frontend 
+# To build/start the docker dev environment (with mobile services it auto-detects mobile apps) run: ./dev.sh 
+#
+# Mobile services are NOT hardcoded here. dev.sh scans frontend/mobile/ and starts a mobile-<name> container for every app folder it finds.
+# Any folder with a package.json (except node_modules and shared) becomes a service.
+# 
+# ML Service Architecture:
+#   Development (Local): ML built into Django backend at /ml_service/ endpoints
+#     - Uses development.txt requirements - No separate service needed - ML_SERVICE_URL environment variable should be empty/unset
+#   Deployment (Cloud): Lightweight backend + External ML service (REQUIRED)
+#     - Backend uses deployment.txt - Deploy external ML service separately (serverless, auto-scaling) - MUST set ML_SERVICE_URL environment variable to external ML service
+
+volumes:
+  db_data:
+  frontend_node_modules:
+  frontend_next:
+
+services:
+  traefik:
+    image: traefik:v3.6.5
+    ports:
+      - "80:80"
+      - "8080:8080"   # Traefik dashboard
+    volumes: []
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mkdir -p /etc/traefik
+        cat > /etc/traefik/dynamic.yml << 'EOF'
+        http:
+          routers:
+            frontend:
+              rule: "Host(`localhost`)"
+              entryPoints: [web]
+              service: frontend
+              middlewares: [frontend-compress]
+            backend:
+              rule: "Host(`localhost`) && (PathPrefix(`/api`) || PathPrefix(`/admin`) || PathPrefix(`/static`) || PathPrefix(`/media`))"
+              entryPoints: [web]
+              priority: 100
+              service: backend
+              middlewares: [strip-api-prefix, backend-compress]
+          services:
+            frontend:
+              loadBalancer:
+                servers:
+                  - url: "http://frontend:3000"
+            backend:
+              loadBalancer:
+                servers:
+                  - url: "http://backend:8000"
+          middlewares:
+            strip-api-prefix:
+              stripPrefix:
+                prefixes: [/api]
+            backend-compress:
+              compress: {}
+            frontend-compress:
+              compress: {}
+        EOF
+        exec traefik \
+          --log.level=INFO \
+          --ping=true \
+          --ping.entrypoint=web \
+          --api=true \
+          --api.dashboard=true \
+          --api.insecure=true \
+          --entrypoints.web.address=:80 \
+          --entrypoints.traefik.address=:8080 \
+          --entrypoints.web.transport.respondingTimeouts.readTimeout=60s \
+          --entrypoints.web.transport.respondingTimeouts.writeTimeout=60s \
+          --entrypoints.web.transport.respondingTimeouts.idleTimeout=180s \
+          --providers.file.filename=/etc/traefik/dynamic.yml \
+          --providers.file.watch=true \
+          --global.checknewversion=false \
+          --global.sendanonymoususage=false
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/config/Dockerfile.development
+    env_file:
+      - .env
+    environment:
+      # Infrastructure defaults – hardcoded, same for every dev
+      DB_HOST: "db"
+      DB_PORT: "5432"
+      DB_NAME: "postgres"
+      DB_USER: "postgres"
+      DB_PASSWORD: "postgres"
+      EXPO_PUBLIC_API_URL: "http://host.docker.internal:8000/api"
+      NEXT_PUBLIC_API_URL: "http://localhost/api"
+      EXPO_PUBLIC_ENV: "development"
+      # ML Service: leave empty for dev (built-in endpoints), set URL for production
+      ML_SERVICE_URL: "${ML_SERVICE_URL:-}"
+    volumes:
+      - ./backend:/backend:delegated
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
+      interval: 1m
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    ports:
+      - "8000:8000"
+    labels:
+      - "traefik.enable=true"
+
+      # Backend routes handled by Traefik
+      - "traefik.http.routers.backend.rule=Host(`localhost`) && (PathPrefix(`/api`) || PathPrefix(`/admin`) || PathPrefix(`/static`) || PathPrefix(`/media`))"
+      - "traefik.http.routers.backend.entrypoints=web"
+      - "traefik.http.routers.backend.priority=100"
+
+      # Middlewares
+      # Remove /api prefix ONLY for local backend
+      - "traefik.http.middlewares.strip-api-prefix.stripprefix.prefixes=/api"
+
+      # Security headers
+      - "traefik.http.middlewares.backend-security-headers.headers.browserXssFilter=true"
+      - "traefik.http.middlewares.backend-security-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.backend-security-headers.headers.frameDeny=true"
+      - "traefik.http.middlewares.backend-security-headers.headers.sslRedirect=false"
+
+      # Compression
+      - "traefik.http.middlewares.backend-compress.compress=true"
+
+      # Rate limiting (100 requests per second average, burst of 200)
+      - "traefik.http.middlewares.backend-ratelimit.ratelimit.average=100"
+      - "traefik.http.middlewares.backend-ratelimit.ratelimit.burst=200"
+      - "traefik.http.middlewares.backend-ratelimit.ratelimit.period=1s"
+
+      # Retry
+      - "traefik.http.middlewares.backend-retry.retry.attempts=3"
+      - "traefik.http.middlewares.backend-retry.retry.initialinterval=100ms"
+
+      # Apply middleware chain
+      - "traefik.http.routers.backend.middlewares=strip-api-prefix,backend-compress,backend-security-headers,backend-retry,backend-ratelimit"
+
+      # Backend port
+      - "traefik.http.services.backend.loadbalancer.server.port=8000"
+
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/web/Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ./frontend/web:/app/web:delegated
+      - ./frontend/packages:/app/packages:delegated
+      - frontend_node_modules:/app/web/node_modules
+      - frontend_next:/app/web/.next
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(`localhost`)"
+      - "traefik.http.routers.frontend.entrypoints=web"
+
+      # Frontend middlewares
+      # Security headers for frontend
+      - "traefik.http.middlewares.frontend-security-headers.headers.browserXssFilter=true"
+      - "traefik.http.middlewares.frontend-security-headers.headers.contentTypeNosniff=true"
+
+      # Compression
+      - "traefik.http.middlewares.frontend-compress.compress=true"
+
+      # Rate limiting (200 requests per second average, burst of 300)
+      - "traefik.http.middlewares.frontend-ratelimit.ratelimit.average=200"
+      - "traefik.http.middlewares.frontend-ratelimit.ratelimit.burst=300"
+      - "traefik.http.middlewares.frontend-ratelimit.ratelimit.period=1s"
+
+      # Apply middleware chain
+      - "traefik.http.routers.frontend.middlewares=frontend-compress,frontend-security-headers,frontend-ratelimit"
+
+      # Service configuration with health check
+      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
+      - "traefik.http.services.frontend.loadbalancer.healthcheck.path=/"
+      - "traefik.http.services.frontend.loadbalancer.healthcheck.interval=30s"
+      - "traefik.http.services.frontend.loadbalancer.healthcheck.timeout=5s"
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+  # Mobile services are defined in mobile-services.yml (auto-generated).
+  # Run `make gen-mobile` or `make dev` to regenerate from frontend/mobile/ folders.
+
+  eas-build:
+    profiles: ["eas"]
+    image: node:24-alpine
+    working_dir: /app
+    env_file:
+      - .env
+    environment:
+      # APP: specific app type to build (e.g. "driver"), or "all"/unset for every app
+      APP: "${APP:-all}"
+      PLATFORM: "${PLATFORM:-ios}"  # ios | android | all
+      PROFILE: "${PROFILE:-development}"
+    volumes:
+      - ./frontend/mobile:/app
+      - ./frontend/mobile/scripts/mobile.sh:/usr/local/bin/mobile.sh:ro
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache curl git bash &&
+        npm install -g eas-cli --silent &&
+        eas whoami || (echo '❌ EXPO_TOKEN is not set in .env' && exit 1) &&
+        echo '📦 Running EAS build for $$APP on $$PLATFORM...' &&
+        bash /usr/local/bin/mobile.sh eas-build
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${DB_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: always
+
+
+# Initialization Section ------------------
+  frontend-init:
+    profiles: ["init"]
+    image: node:24
+    volumes:
+      - ./frontend:/app
+    working_dir: /app
+    command: >
+      sh -c "
+        echo '📦 Starting frontend initialization...' &&
+        npm install -g npm@latest &&
+
+        echo '🔄 Backing up custom files...' &&
+        mkdir -p /tmp/backup &&
+        if [ -f Dockerfile ]; then cp Dockerfile /tmp/backup/; fi &&
+        if [ -f next.config.ts ]; then cp next.config.ts /tmp/backup/; fi &&
+        if [ -f app/components/api.ts ]; then mkdir -p /tmp/backup/app/components && cp app/components/api.ts /tmp/backup/app/components/; fi &&
+
+        echo '🧹 Cleaning frontend directory completely...' &&
+        rm -rf /app/* /app/.* 2>/dev/null || true &&
+
+        echo '�  Running create-next-app...' &&
+        npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir=false --import-alias='@/*' --turbopack --no-git &&
+
+        echo '�  Installing dependencies...' &&
+        npm install &&
+
+        echo '🔙 Restoring custom files...' &&
+        if [ -f /tmp/backup/Dockerfile ]; then mv /tmp/backup/Dockerfile ./; fi &&
+        if [ -f /tmp/backup/next.config.ts ]; then mv /tmp/backup/next.config.ts ./; fi &&
+        if [ -f /tmp/backup/app/components/api.ts ]; then mkdir -p app/components && mv /tmp/backup/app/components/api.ts app/components/; fi &&
+
+        echo '✅ Frontend initialization complete!'
+      "
+
+  npm-init:
+    profiles: ["init"]
+    image: node:24-slim
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+      - ./backend/requirements/npm.txt:/deps/npm.txt:ro
+    command: >
+      sh -c '
+        apt-get update && apt-get install -y jq && rm -rf /var/lib/apt/lists/* &&
+        echo "📦 Syncing npm dependencies with /deps/npm.txt..." &&
+
+        wanted_deps=$$(grep -v "^\s*#" /deps/npm.txt | sed "/^\s*$$/d")
+
+        for dep in $$wanted_deps; do
+          if ! grep -q "\"$$dep\"" package.json; then
+            echo "Installing $$dep..."
+            npm install "$$dep" --save --legacy-peer-deps
+          else
+            echo "$$dep already present, skipping."
+          fi
+        done
+
+        current_deps=$$(jq -r ".dependencies | keys[]" package.json)
+        for dep in $$current_deps; do
+          if ! echo "$$wanted_deps" | grep -qx "$$dep"; then
+            echo "Removing extra dependency $$dep..."
+            npm uninstall "$$dep" --save
+          fi
+        done
+
+        echo "✅ package.json now strictly matches /deps/npm.txt"
+      '
+
+  backend-init:
+    profiles: ["init"]
+    image: python:3.11-slim
+    volumes:
+      - ./backend:/app
+    working_dir: /app
+    command: >
+      sh -c "echo '✅ Backend initialization complete!'"
+  app-init:
+    profiles: ["init"]
+    image: python:3.11-slim
+    volumes:
+      - ./backend:/app
+    working_dir: /app
+    command: >
+      sh -c "
+      apt-get update &&
+      apt-get install -y sed &&
+      pip install --upgrade pip --root-user-action=ignore &&
+      pip install django python-decouple djangorestframework django-cors-headers --root-user-action=ignore &&
+      django-admin startapp ${APP_NAME:-app}
+      "
+    environment:
+      - APP_NAME=${APP_NAME:-app}
+
+# Backup Section ------------------
+# Note: Daily DB backups are AUTOMATIC ONLY (via cron at 2:00 AM)
+# Manual operations available: Full snapshot, Restore, List
+
+# Full snapshot (requires FULL_BACKUP=true)
+  backup-snapshot:
+    profiles: ["backup"]
+    image: postgres:17
+    environment:
+      DB_HOST: "${DB_HOST:-db}"
+      DB_PORT: "${DB_PORT:-5432}"
+      DB_NAME: "${DB_NAME:-postgres}"
+      DB_USER: "${DB_USER:-postgres}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
+      DJANGO_DEBUG: "true"
+      FULL_BACKUP: "${FULL_BACKUP:-false}"
+    volumes:
+      - ./backend:/backend
+    working_dir: /backend/backup
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "
+        echo '📦 Installing required packages...' &&
+        apt-get update -qq &&
+        apt-get install -y -qq postgresql-client gzip tar cpio > /dev/null 2>&1 &&
+        echo '✅ Packages installed' &&
+        echo '' &&
+        FULL_BACKUP=true /backend/backup/backup.sh snapshot
+      "
+
+  backup-restore:
+    profiles: ["backup"]
+    image: postgres:17
+    environment:
+      DB_HOST: "${DB_HOST:-db}"
+      DB_PORT: "${DB_PORT:-5432}"
+      DB_NAME: "${DB_NAME:-postgres}"
+      DB_USER: "${DB_USER:-postgres}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
+      RESTORE_ARCHIVE: "${RESTORE_ARCHIVE:-}"
+      DJANGO_DEBUG: "true"
+    volumes:
+      - ./backend:/backend
+    working_dir: /backend/backup
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: >
+      sh -c '
+        if [ -z "$${RESTORE_ARCHIVE}" ]; then
+          echo "❌ Error: Backup archive path required";
+          echo "Usage: RESTORE_ARCHIVE=/backend/backup/snapshots/<file.tar.gz> docker compose -f dev.yml --profile backup run --rm backup-restore";
+          echo "";
+          echo "Available backups:";
+          /backend/backup/backup.sh list;
+          exit 1;
+        fi &&
+        echo "📦 Installing required packages..." &&
+        apt-get update -qq &&
+        apt-get install -y -qq postgresql-client gzip tar cpio > /dev/null 2>&1 &&
+        echo "✅ Packages installed" &&
+        echo "" &&
+        /backend/backup/backup.sh restore
+      '
+
+  backup-list:
+    profiles: ["backup"]
+    image: postgres:17
+    volumes:
+      - ./backend:/backend
+    working_dir: /backend/backup
+    environment:
+      DJANGO_DEBUG: "true"
+    command: /backend/backup/backup.sh list

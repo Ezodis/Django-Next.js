@@ -1,0 +1,63 @@
+# Python cache & compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+.pytest_cache/
+*.so
+.Python
+
+# Virtual environments
+.env
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+
+# Development files
+*.swp
+*.swo
+*.DS_Store
+.idea/
+.vscode/
+
+# Test files
+tests/
+test_*.py
+*_test.py
+
+# Documentation
+docs/
+*.md
+README*
+
+# Media and data files (large files that shouldn't be in the image)
+media/
+# Exclude WhatsApp messages directory (contains 43MB+ of video files for local testing)
+contacts/management/commands/messages/
+_config/staticfiles/
+_config/backup/db/
+_config/backup/snapshots/
+# Allow backup files in start directory for deployment restore
+_config/backup/start/*.log
+_config/backup/start/backup_*
+!_config/backup/start/*.sql.gz
+!_config/backup/start/*.sql
+!_config/backup/start/*.tar.gz
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+railway.toml
+
+# Docker files (already in use, no need to copy)
+Dockerfile*
+docker-compose*.yml
+.dockerignore

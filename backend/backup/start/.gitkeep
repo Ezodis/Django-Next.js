@@ -1,0 +1,2 @@
+# This directory is for SQL files to be restored on container startup
+# Place your .sql file here and restart the container to restore

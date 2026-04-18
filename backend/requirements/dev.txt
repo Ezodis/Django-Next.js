@@ -1,0 +1,35 @@
+# ── Dev Machine Requirements ──────────────────────────────────────────────────
+# Tools required on the host machine to run ./dev.sh
+# Installed automatically by run_setup() in dev.sh (macOS via Homebrew)
+#
+# Format:
+#   brew:<formula>          — installed via: brew install <formula>
+#   brew-cask:<cask>        — installed via: brew install --cask <cask>
+#   custom:<name>           — handled by a dedicated block in run_setup()
+#
+# "custom" entries are things that need special install logic already in
+# run_setup() (Xcode check, Podman machine init, Java detection, Node, etc.)
+# They are listed here for documentation — dev.sh handles them natively.
+
+# ── Container runtime ─────────────────────────────────────────────────────────
+brew:podman
+brew:podman-compose
+
+# ── Terminal multiplexer (pinned status + scrollable logs) ───────────────────
+brew:tmux
+brew:watch
+
+# ── Android / Mobile ─────────────────────────────────────────────────────────
+brew-cask:temurin          # Java JDK (required for Android SDK tools)
+
+# ── JavaScript runtime ────────────────────────────────────────────────────────
+brew:node
+
+# ── Version control ───────────────────────────────────────────────────────────
+brew:git
+
+# ── Handled natively by run_setup() — listed for reference only ──────────────
+# custom:xcode              — checked via xcode-select
+# custom:homebrew           — bootstrapped if missing (curl tarball install, no CLT popup)
+# custom:podman-machine     — init + start via podman machine
+# custom:java               — detected via /usr/libexec/java_home, falls back to temurin cask

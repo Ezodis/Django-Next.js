@@ -1,0 +1,24 @@
+# Django Backend - Production Deployment Requirements
+# Production-specific dependencies for LIGHTWEIGHT backend deployment
+# Deploy ML service separately using backend/_config/Dockerfile.ml-service - Set ML_SERVICE_URL environment variable to point to ML service - Backend will proxy ML requests to the external service
+-r base.txt
+
+# WSGI Server
+gunicorn==23.0.0
+
+# Monitoring & Error Tracking
+sentry-sdk==1.40.0  # Error tracking and performance monitoring
+
+# Security
+django-csp==3.8  # Content Security Policy headers
+django-permissions-policy==4.19.0  # Permissions-Policy header
+
+# Performance (optional)
+# django-cachalot==2.6.1  # Automatic caching for ORM queries
+
+# Health checks
+django-health-check==3.18.1  # Health check endpoints for load balancers
+
+# Cloud Storage for backups (optional - only if using GCS)
+google-cloud-storage==3.2.0  # Google Cloud Storage for production backups
+django-storages[google]==1.14.2  # Storage backends for Django (with GCS support)

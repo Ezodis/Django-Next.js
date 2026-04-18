@@ -1,0 +1,15 @@
+# System Packages for Docker Build Stage
+# CORE BUILD DEPENDENCIES (Required for most projects)
+build-essential
+libpq-dev
+curl
+ca-certificates
+
+# COMMON PYTHON DEPENDENCIES
+libffi-dev
+libssl-dev
+python3-dev
+
+# ML/SCIENTIFIC COMPUTING (scipy, numpy, scikit-learn, pandas)
+gfortran  # Fortran compiler required for NumPy/SciPy compilation
+

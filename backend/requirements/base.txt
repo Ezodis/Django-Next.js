@@ -1,0 +1,26 @@
+# Django Backend - Base Requirements
+# Core dependencies for Django web applications used by both development and production deployment
+
+# Django core dependencies
+Django==4.2.7
+django-import-export==3.1.0
+djangorestframework==3.14.0
+django-cors-headers==4.3.1
+django-environ==0.11.2
+dj-database-url==2.2.0
+
+# Database - using pre-built binary for faster installation
+psycopg2-binary==2.9.11
+
+# Static files and caching
+whitenoise==6.6.0
+
+# Utilities
+python-decouple==3.8
+requests==2.31.0
+
+# Payment processing
+stripe==7.8.2
+
+# Image/Video processing
+pillow>=10.3.0

@@ -1,0 +1,20 @@
+# Django media files (user uploads)
+media/
+
+# Django static files (collected)
+staticfiles/
+
+# Backup files
+backup/*.sql
+backup/*.sql.gz
+backup/*.log
+backup/restored_*
+backup/roles_*
+
+# Keep start directory for restore files but ignore its contents
+# Exception: Allow specific backup files for deployment
+backup/start/*
+!backup/start/.gitkeep
+!backup/start/*.sql.gz
+!backup/start/*.sql
+!backup/start/*.tar.gz

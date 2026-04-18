@@ -1,0 +1,35 @@
+# Django Backend - Development Requirements
+# Development and testing dependencies
+
+# Include base requirements
+-r base.txt
+
+# Interactive shell
+ipython==8.25.0
+
+# Django dev tools
+django-extensions==3.2.3  # shell_plus, runserver_plus, etc.
+django-debug-toolbar==4.2.0  # Debug toolbar for SQL queries, templates, etc.
+
+# Testing
+pytest==8.2.2
+pytest-django==4.8.0
+pytest-cov==4.1.0  # Downgraded for better compatibility
+coverage>=6.0,<8.0  # Explicit coverage version constraint
+pytest-xdist==3.5.0  # Parallel test execution
+factory-boy==3.3.0  # Test fixtures
+faker==22.6.0  # Generate fake data for tests
+
+# Code quality
+black==24.8.0  # Code formatter
+flake8==7.0.0  # Linter
+isort==5.13.2  # Import sorter
+pylint==3.0.3  # Additional linting
+mypy==1.8.0  # Type checking
+django-stubs==4.2.7  # Django type stubs for mypy
+
+# API testing
+httpie==3.2.2  # CLI HTTP client for API testing
+
+# Documentation (optional)
+# django-silk==5.0.4  # Live profiling and inspection (can be heavy)
