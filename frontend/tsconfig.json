@@ -13,26 +13,22 @@
     "isolatedModules": true,
     "jsx": "preserve",
     "incremental": true,
-    "plugins": [
-      {
-        "name": "next"
-      }
-    ],
+    "plugins": [{ "name": "next" }],
     "baseUrl": ".",
     "paths": {
       "@/*": ["./*"],
-      "@elitecar/api-client": ["../packages/api-client/src"],
-      "@elitecar/api-client/*": ["../packages/api-client/src/*"],
-      "@elitecar/constants": ["../packages/constants/src"],
-      "@elitecar/constants/*": ["../packages/constants/src/*"],
-      "@elitecar/storage": ["../packages/storage/src"],
-      "@elitecar/storage/*": ["../packages/storage/src/*"],
-      "@elitecar/theme": ["../packages/theme/src"],
-      "@elitecar/theme/*": ["../packages/theme/src/*"],
-      "@elitecar/types": ["../packages/types/src"],
-      "@elitecar/types/*": ["../packages/types/src/*"],
-      "@elitecar/utils": ["../packages/utils/src"],
-      "@elitecar/utils/*": ["../packages/utils/src/*"]
+      "@app/api-client":    ["./packages/api-client/src"],
+      "@app/api-client/*":  ["./packages/api-client/src/*"],
+      "@app/constants":     ["./packages/constants/src"],
+      "@app/constants/*":   ["./packages/constants/src/*"],
+      "@app/storage":       ["./packages/storage/src"],
+      "@app/storage/*":     ["./packages/storage/src/*"],
+      "@app/theme":         ["./packages/theme/src"],
+      "@app/theme/*":       ["./packages/theme/src/*"],
+      "@app/types":         ["./packages/types/src"],
+      "@app/types/*":       ["./packages/types/src/*"],
+      "@app/utils":         ["./packages/utils/src"],
+      "@app/utils/*":       ["./packages/utils/src/*"]
     }
   },
   "include": [
