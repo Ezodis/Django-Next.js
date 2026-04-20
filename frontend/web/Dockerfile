@@ -32,7 +32,9 @@ ENV NODE_ENV=development \
     PORT=3000 \
     NEXT_PUBLIC_API_URL=http://localhost/api \
     PRIVATE_ASSETS_PATH=/private_assets \
-    WATCHPACK_POLLING=true
+    WATCHPACK_POLLING=true \
+    CHOKIDAR_USEPOLLING=true \
+    TURBOPACK_WATCH_POLL=500
 
 EXPOSE 3000
 # Install deps at startup in case node_modules volume is empty (first run),
