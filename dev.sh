@@ -587,6 +587,107 @@ mobile_service_names() {
 # Format: "label|cname|svc_url|log_url"
 _STATUS_ROWS=()
 
+# ── Parse services from dev.yml dynamically ─────────────────────────────────
+# Outputs one line per always-on service (no profiles): "name port container_name"
+# Skips profile-gated services (backup, init, eas, etc.)
+# Respects container_name overrides and ${VAR:-default} port syntax.
+_parse_compose_services() {
+  [[ -f "$COMPOSE_FILE" ]] || return
+  python3 - "$COMPOSE_FILE" <<'PYEOF'
+import sys, re
+
+path = sys.argv[1]
+with open(path) as f:
+    lines = f.readlines()
+
+services = {}
+current_svc = None
+in_services = False
+in_ports = False
+in_profiles = False
+indent_services = 0
+
+for line in lines:
+    stripped = line.rstrip()
+    if not stripped or stripped.lstrip().startswith('#'):
+        in_ports = False; in_profiles = False; continue
+    indent = len(line) - len(line.lstrip())
+
+    if re.match(r'^services\s*:', stripped):
+        in_services = True; indent_services = indent
+        in_ports = False; in_profiles = False; continue
+    if not in_services:
+        continue
+
+    svc_match = re.match(r'^  (\w[\w-]*)\s*:', stripped)
+    if svc_match and indent == indent_services + 2:
+        current_svc = svc_match.group(1)
+        if current_svc not in ('volumes', 'networks', 'configs', 'secrets'):
+            services.setdefault(current_svc, {'ports': [], 'profiles': [], 'container_name': None})
+        else:
+            current_svc = None
+        in_ports = False; in_profiles = False; continue
+    if current_svc is None:
+        continue
+
+    # profiles: ["init"]  inline array
+    pm = re.match(r'\s+profiles\s*:\s*\[([^\]]*)\]', stripped)
+    if pm and indent == indent_services + 4:
+        vals = [v.strip().strip('"\'') for v in pm.group(1).split(',') if v.strip()]
+        services[current_svc]['profiles'].extend(vals)
+        in_ports = False; in_profiles = False; continue
+
+    # profiles: block list
+    if re.match(r'\s+profiles\s*:', stripped) and indent == indent_services + 4:
+        in_profiles = True; in_ports = False; continue
+
+    # ports:
+    if re.match(r'\s+ports\s*:', stripped) and indent == indent_services + 4:
+        in_ports = True; in_profiles = False; continue
+
+    # container_name:
+    cn = re.match(r'\s+container_name\s*:\s*["\']?([^\s"\']+)["\']?', stripped)
+    if cn and indent == indent_services + 4:
+        services[current_svc]['container_name'] = cn.group(1)
+        in_ports = False; in_profiles = False; continue
+
+    # list items
+    item = re.match(r'\s+-\s+"?([^"]+)"?', stripped)
+    if item and indent >= indent_services + 4:
+        val = item.group(1).strip()
+        if in_profiles:
+            services[current_svc]['profiles'].append(val)
+        elif in_ports:
+            port_part = val.split(':')[0].strip()
+            port_part = re.sub(r'\$\{[^}]*:-(\d+)\}', r'\1', port_part)
+            port_part = re.sub(r'\$\{[^}]+\}', '', port_part)
+            if re.match(r'^\d+$', port_part):
+                services[current_svc]['ports'].append(int(port_part))
+        continue
+
+    if indent <= indent_services + 4 and not item:
+        in_ports = False; in_profiles = False
+
+for svc, info in services.items():
+    if info['profiles']:
+        continue
+    port = info['ports'][0] if info['ports'] else 0
+    cname = info['container_name'] or ''
+    print(f"{svc} {port} {cname}")
+PYEOF
+}
+
+# Build the list of core services from dev.yml (excludes mobile, which are dynamic)
+# Populates: CORE_SVCS array of service names
+discover_core_svcs() {
+  CORE_SVCS=()
+  local line svc
+  while IFS= read -r line; do
+    svc=$(echo "$line" | awk '{print $1}')
+    [[ -n "$svc" ]] && CORE_SVCS+=("$svc")
+  done < <(_parse_compose_services)
+}
+
 _draw_status() {
   discover_apps
   local log_base="http://localhost:19999"
@@ -623,12 +724,10 @@ _draw_status() {
 
     # Compact row: dot  idx  label  badge — truncate label to fit narrow panes
     local _cols; _cols=$(tput cols 2>/dev/null || echo 80)
-    # Left pane is ~35% of terminal; clamp label width between 8 and 16 chars
     local _pane_w=$(( _cols * 35 / 100 ))
-    local _lw=$(( _pane_w - 14 ))   # subtract dot(1)+spaces(3)+idx(1)+spaces(2)+badge(8)
+    local _lw=$(( _pane_w - 14 ))
     [[ $_lw -lt 8  ]] && _lw=8
     [[ $_lw -gt 16 ]] && _lw=16
-    # Truncate label if needed
     local _lbl="$label"
     if [[ ${#_lbl} -gt $_lw ]]; then
       _lbl="${_lbl:0:$(( _lw - 1 ))}…"
@@ -638,16 +737,33 @@ _draw_status() {
     _row_idx=$(( _row_idx + 1 ))
   }
 
-  _srow "traefik"     "${PROJECT_NAME}_traefik_1"              "http://localhost:8080"
-  _srow "database"    "${PROJECT_NAME}_db_1"                   ""
-  _srow "backend"     "${PROJECT_NAME}_backend_1"              "http://localhost:8000"
-  _srow "frontend"    "${PROJECT_NAME}_frontend_1"             "http://localhost:3000"
+  # Detect container name separator (Compose v2/Podman = hyphen, v1 = underscore)
+  local _sep="_"
+  if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${PROJECT_NAME}-"; then
+    _sep="-"
+  fi
 
+  # Render one row per service defined in dev.yml (no profiles = always-on)
+  local _svc _port _cname_override _cname _url
+  while IFS=' ' read -r _svc _port _cname_override; do
+    [[ -z "$_svc" ]] && continue
+    # Use container_name override if set, otherwise derive from project+service
+    if [[ -n "$_cname_override" ]]; then
+      _cname="$_cname_override"
+    else
+      _cname="${PROJECT_NAME}${_sep}${_svc}${_sep}1"
+    fi
+    _url=""
+    [[ "$_port" -gt 0 ]] 2>/dev/null && _url="http://localhost:${_port}"
+    _srow "$_svc" "$_cname" "$_url"
+  done < <(_parse_compose_services)
+
+  # Mobile services (auto-discovered from frontend/mobile/)
   local mport=8081
   for folder in "${MOBILE_APPS[@]}"; do
     local svc; svc=$(folder_to_service "$folder")
     local slug; slug=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-    _srow "$slug" "${PROJECT_NAME}_${svc}_1" "http://localhost:${mport}"
+    _srow "$slug" "${PROJECT_NAME}${_sep}${svc}${_sep}1" "http://localhost:${mport}"
     mport=$((mport + 1))
   done
 
@@ -747,8 +863,10 @@ PYEOF
 # Count lines _draw_status produces
 _status_line_count() {
   discover_apps
-  # blank(1) + title(1) + blank(1) + 4 core + mobile + blank(1) + hint1(1) + hint2(1) + blank(1)
-  echo $(( 8 + 4 + ${#MOBILE_APPS[@]} ))
+  local compose_svc_count
+  compose_svc_count=$(_parse_compose_services | wc -l | tr -d ' ')
+  # blank(1) + title(1) + blank(1) + compose_svcs + mobile + blank(1) + hint1(1) + hint2(1) + blank(1)
+  echo $(( 8 + compose_svc_count + ${#MOBILE_APPS[@]} ))
 }
 
 live_monitor() {
@@ -773,11 +891,15 @@ live_monitor() {
   {
     printf '#!/usr/bin/env bash\n'
     printf 'export DOCKER_HOST=%q\n' "${DOCKER_HOST:-}"
+    printf 'PROJECT_NAME=%q\n'  "$PROJECT_NAME"
+    printf 'COMPOSE_FILE=%q\n' "$COMPOSE_FILE"
     printf 'ROOT_DIR=%q\n'   "$ROOT_DIR"
     printf 'MOBILE_DIR=%q\n' "$MOBILE_DIR"
     printf 'URLMAP=%q\n'     "$urlmap"
     declare -f folder_to_service
     declare -f discover_apps
+    declare -f _parse_compose_services
+    declare -f discover_core_svcs
     declare -f _draw_status
     # The rest is literal — single-quoted heredoc inside the { } block
     cat <<'PANE_SCRIPT'
@@ -835,7 +957,7 @@ PANE_SCRIPT
     [[ -z "$cname" ]] && continue
     tmux send-keys -t "$session:0.1" \
       "podman logs -f --names '$cname' >> '$logfile' 2>&1 &" Enter
-  done < <(podman ps --format '{{.Names}}' 2>/dev/null | grep "^${PROJECT_NAME}_" || true)
+  done < <(podman ps --format '{{.Names}}' 2>/dev/null | grep -E "^${PROJECT_NAME}[-_]" || true)
   tmux send-keys -t "$session:0.1" "tail -f '$logfile'" Enter
 
   # ── Style ─────────────────────────────────────────────────────────────────
@@ -1095,7 +1217,7 @@ _follow_logs() {
     [[ -z "$cname" ]] && continue
     podman logs -f --names "$cname" 2>/dev/null &
     pids+=($!)
-  done < <(podman ps --format '{{.Names}}' 2>/dev/null | grep "^${PROJECT_NAME}_")
+  done < <(podman ps --format '{{.Names}}' 2>/dev/null | grep -E "^${PROJECT_NAME}[-_]")
 
   if [[ ${#pids[@]} -eq 0 ]]; then
     echo "⚠️  No running containers found."
@@ -1205,7 +1327,7 @@ _do_rebuild() {
 
   echo ""
   echo "🚀 Starting all services..."
-  dc_up_detached traefik db backend frontend
+  dc_up_detached $(_parse_compose_services | awk '{print $1}' | tr '\n' ' ')
   run_mobile
 
   if has_mobile_apps; then
@@ -1441,16 +1563,32 @@ smart_launch() {
   ensure_podman_running
 
   discover_apps
+  discover_core_svcs   # populates CORE_SVCS from dev.yml
 
-  local core_svcs=("traefik" "db" "backend" "frontend")
-  local core_containers=("${PROJECT_NAME}_traefik_1" "${PROJECT_NAME}_db_1" "${PROJECT_NAME}_backend_1" "${PROJECT_NAME}_frontend_1")
+  # Detect separator: Compose v2/Podman uses hyphens, v1 used underscores
+  local _sep="_"
+  if podman ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${PROJECT_NAME}-"; then
+    _sep="-"
+  fi
+
+  # Build container name list from CORE_SVCS, respecting container_name overrides
+  local core_containers=()
+  local _line _svc _port _cname_override
+  while IFS=' ' read -r _svc _port _cname_override; do
+    [[ -z "$_svc" ]] && continue
+    if [[ -n "$_cname_override" ]]; then
+      core_containers+=("$_cname_override")
+    else
+      core_containers+=("${PROJECT_NAME}${_sep}${_svc}${_sep}1")
+    fi
+  done < <(_parse_compose_services)
 
   # Count running vs not-running containers (core only — mobile may lag behind)
   local running_count=0
   local needs_build=0   # truly missing (image never built)
   local mobile_missing=0
 
-  for i in "${!core_svcs[@]}"; do
+  for i in "${!core_containers[@]}"; do
     local raw; raw=$(podman inspect --format '{{.State.Status}}' "${core_containers[$i]}" 2>/dev/null || echo "missing")
     case "$raw" in
       running|created|paused) running_count=$((running_count + 1)) ;;
@@ -1460,19 +1598,19 @@ smart_launch() {
 
   for folder in "${MOBILE_APPS[@]}"; do
     local svc; svc=$(folder_to_service "$folder")
-    local raw; raw=$(podman inspect --format '{{.State.Status}}' "${PROJECT_NAME}_${svc}_1" 2>/dev/null || echo "missing")
+    local raw; raw=$(podman inspect --format '{{.State.Status}}' "${PROJECT_NAME}${_sep}${svc}${_sep}1" 2>/dev/null || echo "missing")
     [[ "$raw" == "missing" ]] && mobile_missing=$((mobile_missing + 1))
   done
 
   # ── Everything running (core + mobile) → live status monitor ─────────────
-  if [[ $running_count -ge ${#core_svcs[@]} && $mobile_missing -eq 0 ]]; then
+  if [[ $running_count -ge ${#core_containers[@]} && $mobile_missing -eq 0 ]]; then
     _open_devtools
     live_monitor
     return 0
   fi
 
   # ── Core running but mobile missing → just start mobile ──────────────────
-  if [[ $running_count -ge ${#core_svcs[@]} && $mobile_missing -gt 0 ]]; then
+  if [[ $running_count -ge ${#core_containers[@]} && $mobile_missing -gt 0 ]]; then
     echo ""
     echo "📱 Core services running — starting missing mobile services..."
     run_mobile
@@ -1484,7 +1622,7 @@ smart_launch() {
       local still_missing=0
       for folder in "${MOBILE_APPS[@]}"; do
         local svc; svc=$(folder_to_service "$folder")
-        local raw; raw=$(podman inspect --format '{{.State.Status}}' "${PROJECT_NAME}_${svc}_1" 2>/dev/null || echo "missing")
+        local raw; raw=$(podman inspect --format '{{.State.Status}}' "${PROJECT_NAME}${_sep}${svc}${_sep}1" 2>/dev/null || echo "missing")
         [[ "$raw" == "missing" ]] && still_missing=1 && break
       done
       [[ $still_missing -eq 0 ]] && break
@@ -1497,12 +1635,13 @@ smart_launch() {
   # ── First run: core images never built ───────────────────────────────────
   # Verify by checking if the backend image actually exists, not just container state
   local backend_image_exists=0
-  if podman image exists localhost/${PROJECT_NAME}_backend 2>/dev/null || \
-     podman images --format '{{.Repository}}' 2>/dev/null | grep -q "${PROJECT_NAME}_backend"; then
+  if podman image exists localhost/${PROJECT_NAME}-backend 2>/dev/null || \
+     podman image exists localhost/${PROJECT_NAME}_backend 2>/dev/null || \
+     podman images --format '{{.Repository}}' 2>/dev/null | grep -qE "${PROJECT_NAME}[-_]backend"; then
     backend_image_exists=1
   fi
 
-  if [[ $needs_build -ge ${#core_svcs[@]} && $backend_image_exists -eq 0 ]]; then
+  if [[ $needs_build -ge ${#core_containers[@]} && $backend_image_exists -eq 0 ]]; then
     echo ""
     echo "🏗️  First run detected — building everything..."
     echo ""
@@ -1514,7 +1653,7 @@ smart_launch() {
 
     echo ""
     echo "🚀 Starting core services..."
-    dc_up_detached traefik db backend frontend
+    dc_up_detached $(_parse_compose_services | awk '{print $1}' | tr '\n' ' ')
 
     run_mobile
 
@@ -1583,7 +1722,7 @@ PYEOF
   echo "🔄 Starting services..."
   echo ""
 
-  dc_up_detached traefik db backend frontend
+  dc_up_detached $(_parse_compose_services | awk '{print $1}' | tr '\n' ' ')
   run_mobile
 
   if has_mobile_apps; then
@@ -1781,7 +1920,7 @@ case "$CMD" in
 
   up)
     echo "🚀 Starting core services..."
-    dc_up_detached traefik db backend frontend
+    dc_up_detached $(_parse_compose_services | awk '{print $1}' | tr '\n' ' ')
     run_mobile
     echo ""
     echo "✅ Services started in the background."
@@ -1790,7 +1929,7 @@ case "$CMD" in
 
   core)
     echo "🚀 Starting core services (no mobile)..."
-    dc_up_detached traefik db backend frontend
+    dc_up_detached $(_parse_compose_services | awk '{print $1}' | tr '\n' ' ')
     echo ""
     echo "✅ Core services started in the background."
     _draw_status

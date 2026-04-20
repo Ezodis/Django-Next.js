@@ -1,4 +1,4 @@
-# frontend/web/Dockerfile
+# frontend/Dockerfile
 FROM node:24-alpine
 
 # Install dependencies for native modules
