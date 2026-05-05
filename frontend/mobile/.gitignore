@@ -2,13 +2,16 @@
 
 # dependencies
 node_modules/
-*/node_modules/
+EliteCar/node_modules/
+EliteCar Driver/node_modules/
 
 # Expo
 .expo/
 .expo-shared/
-*/.expo/
-*/.expo-shared/
+EliteCar/.expo/
+EliteCar/.expo-shared/
+EliteCar Driver/.expo/
+EliteCar Driver/.expo-shared/
 dist/
 web-build/
 expo-env.d.ts
@@ -17,6 +20,7 @@ expo-env.d.ts
 .kotlin/
 *.orig.*
 *.jks
+*.keystore
 *.p8
 *.p12
 *.key
@@ -41,10 +45,20 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
-# generated native folders — ignored per-app; android/ kept for EAS builds
+# generated native folders
 /ios
 /android
-*/ios
+EliteCar/ios
+EliteCar/android
+EliteCar Driver/ios
+
+# package-lock.json is needed per-app for EAS builds
+# EliteCar Driver/android is needed for EAS builds
 
 # local.properties contains machine-specific SDK paths — never commit
-*/android/local.properties
+EliteCar/android/local.properties
+EliteCar Driver/android/local.properties
+
+# Built APK/AAB artifacts — never upload to EAS or commit
+Builds/
+builds/

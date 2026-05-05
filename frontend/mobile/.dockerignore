@@ -1,0 +1,32 @@
+# ── Node modules (installed fresh in Docker) ──────────────────────────────────
+node_modules/
+**/node_modules/
+
+# ── Expo / React Native build artifacts ───────────────────────────────────────
+**/.expo/
+**/android/
+**/ios/
+**/.gradle/
+**/build/
+**/builds/
+**/.eas/
+
+# ── Test files ─────────────────────────────────────────────────────────────────
+**/__tests__/
+**/*.test.ts
+**/*.test.tsx
+**/*.spec.ts
+**/*.spec.tsx
+
+# ── Source maps ────────────────────────────────────────────────────────────────
+**/*.map
+
+# ── OS / editor junk ──────────────────────────────────────────────────────────
+**/.DS_Store
+**/.idea/
+**/.vscode/
+**/Thumbs.db
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+**/*.log
+**/npm-debug.log*

@@ -14,31 +14,49 @@ const nextConfig: NextConfig = {
 
   // Transpile shared packages
   transpilePackages: [
-    '@app/api-client',
-    '@app/constants',
-    '@app/storage',
-    '@app/theme',
-    '@app/types',
-    '@app/utils',
+    '@elitecar/api-client',
+    '@elitecar/constants',
+    '@elitecar/storage',
+    '@elitecar/theme',
+    '@elitecar/types',
+    '@elitecar/utils',
+    '@elitecar/assets',
   ],
 
-  // Webpack path aliases for shared packages
+  // Turbopack configuration (used in dev with --turbopack flag)
+  // Note: Turbopack resolveAlias requires relative paths from the project root,
+  // not absolute paths. Use './' prefix relative to the Next.js project root (frontend/web).
+  turbopack: {
+    resolveAlias: {
+      '@elitecar/api-client': '../packages/api-client/src',
+      '@elitecar/constants': '../packages/constants/src',
+      '@elitecar/storage': '../packages/storage/src',
+      '@elitecar/theme': '../packages/theme/src',
+      '@elitecar/types': '../packages/types/src',
+      '@elitecar/utils': '../packages/utils/src',
+      '@elitecar/assets': '../packages/assets',
+    },
+  },
+
+  // Webpack configuration for path aliases (used in production builds)
   webpack: (config) => {
     config.resolve.alias = {
       ...config.resolve.alias,
-      '@app/api-client': path.resolve(__dirname, '../packages/api-client/src'),
-      '@app/constants':  path.resolve(__dirname, '../packages/constants/src'),
-      '@app/storage':    path.resolve(__dirname, '../packages/storage/src'),
-      '@app/theme':      path.resolve(__dirname, '../packages/theme/src'),
-      '@app/types':      path.resolve(__dirname, '../packages/types/src'),
-      '@app/utils':      path.resolve(__dirname, '../packages/utils/src'),
+      '@elitecar/api-client': path.resolve(__dirname, '../packages/api-client/src'),
+      '@elitecar/constants': path.resolve(__dirname, '../packages/constants/src'),
+      '@elitecar/storage': path.resolve(__dirname, '../packages/storage/src'),
+      '@elitecar/theme': path.resolve(__dirname, '../packages/theme/src'),
+      '@elitecar/types': path.resolve(__dirname, '../packages/types/src'),
+      '@elitecar/utils': path.resolve(__dirname, '../packages/utils/src'),
+      '@elitecar/assets': path.resolve(__dirname, '../packages/assets'),
     };
     return config;
   },
 
   // Rewrites for API routing
   async rewrites() {
-    // In Docker with Traefik, don't rewrite — Traefik routes /api to the backend
+    // In Docker with Traefik, don't rewrite - let browser call /api directly
+    // Traefik will route /api requests to the backend service
     return [];
   },
 };

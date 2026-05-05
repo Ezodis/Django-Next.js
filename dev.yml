@@ -12,8 +12,8 @@
 
 volumes:
   db_data:
+  redis_data:
   frontend_node_modules:
-  frontend_next:
 
 services:
   traefik:
@@ -41,7 +41,6 @@ services:
               rule: "Host(`localhost`)"
               entryPoints: [web]
               service: frontend
-              middlewares: [frontend-compress]
             backend:
               rule: "Host(`localhost`) && (PathPrefix(`/api`) || PathPrefix(`/admin`) || PathPrefix(`/static`) || PathPrefix(`/media`))"
               entryPoints: [web]
@@ -63,8 +62,6 @@ services:
                 prefixes: [/api]
             backend-compress:
               compress: {}
-            frontend-compress:
-              compress: {}
         EOF
         exec traefik \
           --log.level=INFO \
@@ -75,8 +72,8 @@ services:
           --api.insecure=true \
           --entrypoints.web.address=:80 \
           --entrypoints.traefik.address=:8080 \
-          --entrypoints.web.transport.respondingTimeouts.readTimeout=60s \
-          --entrypoints.web.transport.respondingTimeouts.writeTimeout=60s \
+          --entrypoints.web.transport.respondingTimeouts.readTimeout=0 \
+          --entrypoints.web.transport.respondingTimeouts.writeTimeout=0 \
           --entrypoints.web.transport.respondingTimeouts.idleTimeout=180s \
           --providers.file.filename=/etc/traefik/dynamic.yml \
           --providers.file.watch=true \
@@ -96,6 +93,9 @@ services:
       DB_NAME: "postgres"
       DB_USER: "postgres"
       DB_PASSWORD: "postgres"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
       EXPO_PUBLIC_API_URL: "http://host.docker.internal:8000/api"
       NEXT_PUBLIC_API_URL: "http://localhost/api"
       EXPO_PUBLIC_ENV: "development"
@@ -106,50 +106,16 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
-      interval: 1m
+      interval: 10s
       timeout: 3s
       retries: 10
       start_period: 10s
     ports:
       - "8000:8000"
-    labels:
-      - "traefik.enable=true"
-
-      # Backend routes handled by Traefik
-      - "traefik.http.routers.backend.rule=Host(`localhost`) && (PathPrefix(`/api`) || PathPrefix(`/admin`) || PathPrefix(`/static`) || PathPrefix(`/media`))"
-      - "traefik.http.routers.backend.entrypoints=web"
-      - "traefik.http.routers.backend.priority=100"
-
-      # Middlewares
-      # Remove /api prefix ONLY for local backend
-      - "traefik.http.middlewares.strip-api-prefix.stripprefix.prefixes=/api"
-
-      # Security headers
-      - "traefik.http.middlewares.backend-security-headers.headers.browserXssFilter=true"
-      - "traefik.http.middlewares.backend-security-headers.headers.contentTypeNosniff=true"
-      - "traefik.http.middlewares.backend-security-headers.headers.frameDeny=true"
-      - "traefik.http.middlewares.backend-security-headers.headers.sslRedirect=false"
-
-      # Compression
-      - "traefik.http.middlewares.backend-compress.compress=true"
-
-      # Rate limiting (100 requests per second average, burst of 200)
-      - "traefik.http.middlewares.backend-ratelimit.ratelimit.average=100"
-      - "traefik.http.middlewares.backend-ratelimit.ratelimit.burst=200"
-      - "traefik.http.middlewares.backend-ratelimit.ratelimit.period=1s"
-
-      # Retry
-      - "traefik.http.middlewares.backend-retry.retry.attempts=3"
-      - "traefik.http.middlewares.backend-retry.retry.initialinterval=100ms"
-
-      # Apply middleware chain
-      - "traefik.http.routers.backend.middlewares=strip-api-prefix,backend-compress,backend-security-headers,backend-retry,backend-ratelimit"
-
-      # Backend port
-      - "traefik.http.services.backend.loadbalancer.server.port=8000"
-
     restart: unless-stopped
 
   frontend:
@@ -158,11 +124,19 @@ services:
       dockerfile: frontend/web/Dockerfile
     env_file:
       - .env
+    environment:
+      NODE_ENV: "development"
+      NEXT_TELEMETRY_DISABLED: "1"
+      NEXT_PUBLIC_API_URL: "http://localhost/api"
+      # Hot reload — polling required for Podman VM filesystem layer
+      WATCHPACK_POLLING: "true"
+      WATCHPACK_POLLING_INTERVAL: "500"
+      CHOKIDAR_USEPOLLING: "true"
+      CHOKIDAR_INTERVAL: "500"
     volumes:
-      - ./frontend/web:/app/web:delegated
-      - ./frontend/packages:/app/packages:delegated
+      - ./frontend/web:/app/web:z
+      - ./frontend/packages:/app/packages:z
       - frontend_node_modules:/app/web/node_modules
-      - frontend_next:/app/web/.next
     depends_on:
       backend:
         condition: service_healthy
@@ -172,32 +146,6 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.frontend.rule=Host(`localhost`)"
-      - "traefik.http.routers.frontend.entrypoints=web"
-
-      # Frontend middlewares
-      # Security headers for frontend
-      - "traefik.http.middlewares.frontend-security-headers.headers.browserXssFilter=true"
-      - "traefik.http.middlewares.frontend-security-headers.headers.contentTypeNosniff=true"
-
-      # Compression
-      - "traefik.http.middlewares.frontend-compress.compress=true"
-
-      # Rate limiting (200 requests per second average, burst of 300)
-      - "traefik.http.middlewares.frontend-ratelimit.ratelimit.average=200"
-      - "traefik.http.middlewares.frontend-ratelimit.ratelimit.burst=300"
-      - "traefik.http.middlewares.frontend-ratelimit.ratelimit.period=1s"
-
-      # Apply middleware chain
-      - "traefik.http.routers.frontend.middlewares=frontend-compress,frontend-security-headers,frontend-ratelimit"
-
-      # Service configuration with health check
-      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
-      - "traefik.http.services.frontend.loadbalancer.healthcheck.path=/"
-      - "traefik.http.services.frontend.loadbalancer.healthcheck.interval=30s"
-      - "traefik.http.services.frontend.loadbalancer.healthcheck.timeout=5s"
     ports:
       - "3000:3000"
     restart: unless-stopped
@@ -243,8 +191,31 @@ services:
       retries: 10
     restart: always
 
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: always
+    ports:
+      - "6379:6379"
+
 
 # Initialization Section ------------------
+  backend-init:
+    profiles: ["init"]
+    image: python:3.11-slim
+    volumes:
+      - ./backend:/app
+    working_dir: /app
+    command: >
+      sh -c "echo '✅ Backend initialization complete!'"
+
   frontend-init:
     profiles: ["init"]
     image: node:24
@@ -313,14 +284,6 @@ services:
         echo "✅ package.json now strictly matches /deps/npm.txt"
       '
 
-  backend-init:
-    profiles: ["init"]
-    image: python:3.11-slim
-    volumes:
-      - ./backend:/app
-    working_dir: /app
-    command: >
-      sh -c "echo '✅ Backend initialization complete!'"
   app-init:
     profiles: ["init"]
     image: python:3.11-slim

@@ -101,6 +101,25 @@ const toId   = (name) => name.toLowerCase().replace(/\s+/g, '');
 
 const dig = (obj, ...keys) => keys.reduce((o, k) => (o && o[k] !== undefined ? o[k] : null), obj);
 
+// Read package/bundleIdentifier from app.config.js if it exists
+const readAppConfigJs = (appDir) => {
+  const configPath = path.join(appDir, 'app.config.js');
+  if (!fs.existsSync(configPath)) return {};
+  try {
+    // Temporarily set module.exports capture
+    const mod = { exports: {} };
+    const src = fs.readFileSync(configPath, 'utf8');
+    // Use Function constructor to evaluate in isolated scope
+    const fn = new Function('module', 'exports', 'require', 'process', src);
+    fn(mod, mod.exports, require, process);
+    const cfg = mod.exports.expo || mod.exports;
+    return {
+      androidPackage: dig(cfg, 'android', 'package') || null,
+      iosBundleId:    dig(cfg, 'ios', 'bundleIdentifier') || null,
+    };
+  } catch (_) { return {}; }
+};
+
 const folders = fs.readdirSync(MOBILE_DIR).filter((name) => {
   if (SKIP.has(name)) return false;
   const dir = path.join(MOBILE_DIR, name);
@@ -116,7 +135,8 @@ for (const name of folders) {
   const appDir  = path.join(MOBILE_DIR, name);
   const appJson = path.join(appDir, 'app.json');
   const slug    = toSlug(name);
-  const bundleId = `com.${toId(name)}`;
+  const appConfig = readAppConfigJs(appDir);
+  const bundleId = appConfig.androidPackage || appConfig.iosBundleId || `com.${toId(name)}`;
 
   let existing = {};
   try { existing = JSON.parse(fs.readFileSync(appJson, 'utf8')); } catch (_) {}
@@ -129,15 +149,20 @@ for (const name of folders) {
 
   let config;
   if (isBare) {
+    // For bare workflow apps, preserve all existing fields and only fill in missing ones
     config = {
       expo: {
         name,
         slug,
         version: dig(existing, 'expo', 'version') || '1.0.0',
         runtimeVersion: dig(existing, 'expo', 'runtimeVersion') || '1.0.0',
+        ...(dig(existing, 'expo', 'icon') ? { icon: dig(existing, 'expo', 'icon') } : {}),
+        ...(dig(existing, 'expo', 'splash') ? { splash: dig(existing, 'expo', 'splash') } : {}),
         extra: { eas: projectId ? { projectId } : {} },
         ...(owner ? { owner } : {}),
         developmentClient: { silentLaunch: true },
+        ...(dig(existing, 'expo', 'android') ? { android: dig(existing, 'expo', 'android') } : {}),
+        ...(dig(existing, 'expo', 'ios') ? { ios: dig(existing, 'expo', 'ios') } : {}),
       },
     };
   } else {
@@ -203,6 +228,80 @@ NODEEOF
 }
 
 # ════════════════════════════════════════════════════════════════════════════════
+# HELPER: _ensure_maps_key
+# Writes GOOGLE_MAPS_API_KEY into gradle.properties and AndroidManifest.xml for
+# every bare-workflow app that has an android/ folder.
+# Called before every Gradle build and on container start so the key is always
+# present even if gradle.properties or the manifest was deleted / regenerated.
+# ════════════════════════════════════════════════════════════════════════════════
+_ensure_maps_key() {
+  local app_dir="${1:-}"   # optional: target a single app dir
+  local key="${GOOGLE_MAPS_API_KEY:-}"
+
+  # Also check EXPO_PUBLIC_GOOGLE_MAPS_API_KEY (the name used in .env)
+  if [ -z "$key" ]; then
+    key="${EXPO_PUBLIC_GOOGLE_MAPS_API_KEY:-}"
+  fi
+
+  # Load from .env if not already in the environment
+  if [ -z "$key" ] && [ -f "$ROOT_DIR/.env" ]; then
+    key=$(grep -E '^EXPO_PUBLIC_GOOGLE_MAPS_API_KEY=' "$ROOT_DIR/.env" | head -1 | cut -d'=' -f2- | tr -d '"'"'" | tr -d '[:space:]')
+  fi
+  if [ -z "$key" ] && [ -f "$ROOT_DIR/.env" ]; then
+    key=$(grep -E '^GOOGLE_MAPS_API_KEY=' "$ROOT_DIR/.env" | head -1 | cut -d'=' -f2- | tr -d '"'"'" | tr -d '[:space:]')
+  fi
+
+  if [ -z "$key" ]; then
+    echo "⚠️  GOOGLE_MAPS_API_KEY not found in environment or .env — skipping Maps key injection"
+    return 0
+  fi
+
+  # Determine which app dirs to patch
+  local dirs=()
+  if [ -n "$app_dir" ] && [ -d "$app_dir/android" ]; then
+    dirs=("$app_dir")
+  else
+    # Scan all app folders
+    local scan_root="${app_dir:-$MOBILE_DIR}"
+    while IFS= read -r -d '' dir; do
+      local name; name="$(basename "$dir")"
+      case "$name" in node_modules|shared|scripts|packages|builds) continue ;; esac
+      [ -f "$dir/package.json" ] || continue
+      [ -d "$dir/android" ] || continue
+      dirs+=("$dir")
+    done < <(find "$scan_root" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+  fi
+
+  for dir in "${dirs[@]}"; do
+    local gradle_props="$dir/android/gradle.properties"
+    local manifest="$dir/android/app/src/main/AndroidManifest.xml"
+
+    # ── gradle.properties ────────────────────────────────────────────────────
+    if [ -f "$gradle_props" ]; then
+      if grep -q '^GOOGLE_MAPS_API_KEY=' "$gradle_props"; then
+        # Update existing entry
+        sed -i.bak "s|^GOOGLE_MAPS_API_KEY=.*|GOOGLE_MAPS_API_KEY=${key}|" "$gradle_props" && rm -f "${gradle_props}.bak"
+      else
+        printf '\n# Google Maps API key (auto-injected by mobile.sh)\nGOOGLE_MAPS_API_KEY=%s\n' "$key" >> "$gradle_props"
+      fi
+      echo "✅ Maps key written to $(basename "$dir")/android/gradle.properties"
+    fi
+
+    # ── AndroidManifest.xml ──────────────────────────────────────────────────
+    if [ -f "$manifest" ]; then
+      if grep -q 'com.google.android.geo.API_KEY' "$manifest"; then
+        # Update existing entry with the actual key value (not a placeholder)
+        sed -i.bak "s|android:name=\"com.google.android.geo.API_KEY\"[^/]*/> *|android:name=\"com.google.android.geo.API_KEY\" android:value=\"${key}\"/>|g" "$manifest" && rm -f "${manifest}.bak"
+      else
+        # Inject after the opening <application tag
+        sed -i.bak "s|<application \([^>]*\)>|<application \1>\n    <meta-data android:name=\"com.google.android.geo.API_KEY\" android:value=\"${key}\"/>|" "$manifest" && rm -f "${manifest}.bak"
+      fi
+      echo "✅ Maps key meta-data ensured in $(basename "$dir")/AndroidManifest.xml"
+    fi
+  done
+}
+
+# ════════════════════════════════════════════════════════════════════════════════
 # SUBCOMMAND: start
 # Container entrypoint — syncs app.json then launches Expo dev client.
 # Used as Docker CMD.
@@ -210,13 +309,183 @@ NODEEOF
 cmd_start() {
   echo "🚀 Starting mobile app..."
 
+  # ── Ensure @assets symlinks exist in every app's node_modules ──────────────
+  # This makes require('@assets/Logo.png') work in Metro without any custom resolver.
+  # The packages/ dir is at /app/packages/ in Docker (copied by Dockerfile).
+  echo "🔗 Setting up @assets symlinks..."
+  PACKAGES_ASSETS="/app/packages/assets"
+  if [ -d "$PACKAGES_ASSETS" ]; then
+    for app_dir in /app/*/; do
+      app_name="$(basename "$app_dir")"
+      case "$app_name" in node_modules|shared|scripts|packages|builds) continue ;; esac
+      [ -f "$app_dir/package.json" ] || continue
+      assets_mod="$app_dir/node_modules/@assets"
+      mkdir -p "$assets_mod"
+      # Create package.json so Metro treats it as a proper module
+      if [ ! -f "$assets_mod/package.json" ]; then
+        echo '{"name":"@assets","version":"1.0.0","main":"index.js"}' > "$assets_mod/package.json"
+        echo 'module.exports = {};' > "$assets_mod/index.js"
+      fi
+      # Symlink every file from packages/assets into @assets
+      for asset_file in "$PACKAGES_ASSETS"/*; do
+        fname="$(basename "$asset_file")"
+        if [ ! -e "$assets_mod/$fname" ]; then
+          ln -sf "$asset_file" "$assets_mod/$fname"
+        fi
+      done
+      echo "  ✅ @assets linked for $app_name"
+    done
+  else
+    echo "  ⚠️  $PACKAGES_ASSETS not found — skipping @assets setup"
+  fi
+
   echo "🔄 Syncing app.json files..."
-  # When running inside Docker, MOBILE_DIR is /app/scripts/.. = /app
-  cmd_gen_app_json 2>/dev/null || true
+  # Explicitly pass /app so gen-app-json scans the right directory in Docker
+  node - /app << 'NODEEOF'
+const fs   = require('fs');
+const path = require('path');
 
-  APP_DIR="/app/${APP_TYPE}"
+const MOBILE_DIR = process.argv[2] || '/app';
+const SKIP = new Set(['node_modules', 'shared', 'scripts', 'packages']);
 
-  if [ ! -d "$APP_DIR" ]; then
+const toSlug = (name) => name.toLowerCase().replace(/\s+/g, '-');
+const toId   = (name) => name.toLowerCase().replace(/\s+/g, '');
+const dig = (obj, ...keys) => keys.reduce((o, k) => (o && o[k] !== undefined ? o[k] : null), obj);
+
+// Read package/bundleIdentifier from app.config.js if it exists
+const readAppConfigJs = (appDir) => {
+  const configPath = path.join(appDir, 'app.config.js');
+  if (!fs.existsSync(configPath)) return {};
+  try {
+    const mod = { exports: {} };
+    const src = fs.readFileSync(configPath, 'utf8');
+    const fn = new Function('module', 'exports', 'require', 'process', src);
+    fn(mod, mod.exports, require, process);
+    const cfg = mod.exports.expo || mod.exports;
+    return {
+      androidPackage: (cfg.android && cfg.android.package) || null,
+      iosBundleId:    (cfg.ios && cfg.ios.bundleIdentifier) || null,
+    };
+  } catch (_) { return {}; }
+};
+
+const folders = fs.readdirSync(MOBILE_DIR).filter((name) => {
+  if (SKIP.has(name)) return false;
+  const dir = path.join(MOBILE_DIR, name);
+  try { return fs.statSync(dir).isDirectory() && fs.existsSync(path.join(dir, 'package.json')); }
+  catch (_) { return false; }
+});
+
+if (folders.length === 0) { console.log('⚠️  No app folders found in ' + MOBILE_DIR); process.exit(0); }
+
+for (const name of folders) {
+  const appDir   = path.join(MOBILE_DIR, name);
+  const appJson  = path.join(appDir, 'app.json');
+  const slug     = toSlug(name);
+  const appConfig = readAppConfigJs(appDir);
+  const bundleId = appConfig.androidPackage || appConfig.iosBundleId || `com.${toId(name)}`;
+
+  let existing = {};
+  try { existing = JSON.parse(fs.readFileSync(appJson, 'utf8')); } catch (_) {}
+
+  const projectId = dig(existing, 'expo', 'extra', 'eas', 'projectId') || null;
+  const owner     = dig(existing, 'expo', 'owner') || null;
+  const isBare    = fs.existsSync(path.join(appDir, 'android')) || fs.existsSync(path.join(appDir, 'ios'));
+
+  let config;
+  if (isBare) {
+    // Preserve all existing fields, only fill in missing ones.
+    // Fix icon/splash paths: in Docker, packages are at /app/packages (one level up from app dir),
+    // so ../../packages/... (two levels up) is wrong — normalize to ../packages/...
+    const fixPath = (p) => {
+      if (!p) return p;
+      return p.replace(/^\.\.\/\.\.\/packages\//, '../packages/');
+    };
+    const existingIcon = fixPath(dig(existing, 'expo', 'icon'));
+    const existingSplash = dig(existing, 'expo', 'splash');
+    if (existingSplash && existingSplash.image) {
+      existingSplash.image = fixPath(existingSplash.image);
+    }
+    const existingAndroid = dig(existing, 'expo', 'android');
+    if (existingAndroid && existingAndroid.adaptiveIcon && existingAndroid.adaptiveIcon.foregroundImage) {
+      existingAndroid.adaptiveIcon.foregroundImage = fixPath(existingAndroid.adaptiveIcon.foregroundImage);
+    }
+    config = {
+      expo: {
+        name,
+        slug,
+        version: dig(existing, 'expo', 'version') || '1.0.0',
+        runtimeVersion: dig(existing, 'expo', 'runtimeVersion') || '1.0.0',
+        ...(existingIcon   ? { icon:   existingIcon   } : {}),
+        ...(existingSplash ? { splash: existingSplash } : {}),
+        extra: { eas: projectId ? { projectId } : {} },
+        ...(owner ? { owner } : {}),
+        developmentClient: { silentLaunch: true },
+        ...(existingAndroid ? { android: existingAndroid } : {}),
+        ...(dig(existing, 'expo', 'ios')     ? { ios:     dig(existing, 'expo', 'ios')     } : {}),
+      },
+    };
+  } else {
+    // For managed workflow apps, use shared packages/assets
+    const sharedIcon = fs.existsSync(path.join(MOBILE_DIR, 'packages', 'assets', `${slug}-icon.png`))
+      ? `../packages/assets/${slug}-icon.png`
+      : (fs.existsSync(path.join(appDir, 'assets', 'icon.png')) ? './assets/icon.png' : `../packages/assets/${slug}-icon.png`);
+    const splashImage = sharedIcon;
+    const existingPlugins = dig(existing, 'expo', 'plugins');
+    config = {
+      expo: {
+        name, slug, scheme: slug,
+        version: dig(existing, 'expo', 'version') || '1.0.0',
+        orientation: 'portrait', icon: sharedIcon, userInterfaceStyle: 'light',
+        splash: { image: splashImage, resizeMode: 'contain',
+          backgroundColor: dig(existing, 'expo', 'splash', 'backgroundColor') || '#000000' },
+        runtimeVersion: dig(existing, 'expo', 'runtimeVersion') || '1.0.0',
+        ios: {
+          supportsTablet: true,
+          bundleIdentifier: `com.${toId(name)}`,
+          infoPlist: {
+            NSLocationWhenInUseUsageDescription: `${name} needs your location.`,
+            NSLocationAlwaysAndWhenInUseUsageDescription: `${name} needs your location in the background.`,
+            ITSAppUsesNonExemptEncryption: false,
+          },
+        },
+        android: {
+          adaptiveIcon: { foregroundImage: sharedIcon, backgroundColor: dig(existing, 'expo', 'splash', 'backgroundColor') || '#000000' },
+          package: `com.${toId(name)}`,
+        },
+        plugins: existingPlugins || [['expo-location', {
+          locationAlwaysAndWhenInUsePermission: `Allow ${name} to use your location.`,
+          locationWhenInUsePermission: `Allow ${name} to use your location.`,
+        }]],
+        extra: { eas: projectId ? { projectId } : {} },
+        ...(owner ? { owner } : {}),
+        developmentClient: { silentLaunch: true },
+      },
+    };
+  }
+
+  fs.writeFileSync(appJson, JSON.stringify(config, null, 2) + '\n');
+  console.log(`✅ ${name}  →  ${bundleId}  (${slug})`);
+}
+NODEEOF
+
+  # APP_TYPE may be lowercase (e.g. "elitecar") but the actual folder may be
+  # mixed-case (e.g. "EliteCar"). Do a case-insensitive lookup.
+  APP_DIR=""
+  for dir in /app/*/; do
+    folder="$(basename "$dir")"
+    # Skip non-app folders
+    case "$folder" in node_modules|shared|scripts|packages) continue ;; esac
+    [ -f "$dir/package.json" ] || continue
+    folder_lower="$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
+    apptype_lower="$(echo "${APP_TYPE}" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
+    if [ "$folder_lower" = "$apptype_lower" ]; then
+      APP_DIR="$dir"
+      break
+    fi
+  done
+
+  if [ -z "$APP_DIR" ] || [ ! -d "$APP_DIR" ]; then
     echo "❌ No directory found for APP_TYPE='${APP_TYPE}'"
     echo "   Available apps:"
     ls /app | grep -v node_modules
@@ -229,8 +498,199 @@ cmd_start() {
 
   cd "$APP_DIR"
 
-  exec env REACT_NATIVE_PACKAGER_HOSTNAME="${REACT_NATIVE_PACKAGER_HOSTNAME:-10.0.2.2}" \
-    npx expo start --dev-client --port 8081 --non-interactive
+  # Ensure the Google Maps API key is always present in native Android files
+  _ensure_maps_key "$APP_DIR"
+
+  # ── Patch metro-file-map FallbackWatcher for virtiofs hot reload ────────────
+  # Problem: virtiofs (used by Podman/Docker on macOS) does NOT propagate
+  # inotify/kqueue events into the container. Metro's FallbackWatcher uses
+  # fs.watch() which relies on those events — so it never fires.
+  # Fix: replace FallbackWatcher with a stat()-polling implementation that
+  # works regardless of the filesystem event layer.
+  _patch_fallback_watcher() {
+    local watcher_path="$1/node_modules/metro-file-map/src/watchers/FallbackWatcher.js"
+    [ -f "$watcher_path" ] || return 0
+    # Only patch if not already patched
+    grep -q 'POLLING_PATCH' "$watcher_path" 2>/dev/null && return 0
+    echo "🔧 Patching FallbackWatcher for virtiofs polling ($1)..."
+    cat > "$watcher_path" << 'WATCHER_EOF'
+// POLLING_PATCH — replaced by mobile.sh for virtiofs/Podman/Docker compatibility.
+// Original FallbackWatcher uses fs.watch() (inotify) which doesn't work in virtiofs.
+// This version uses stat()-based polling so Fast Refresh works in containers.
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.default = void 0;
+var _AbstractWatcher = require("./AbstractWatcher");
+var common = _interopRequireWildcard(require("./common"));
+var _fs = _interopRequireDefault(require("fs"));
+var _path = _interopRequireDefault(require("path"));
+var _walker = _interopRequireDefault(require("walker"));
+function _interopRequireDefault(e) { return e && e.__esModule ? e : { default: e }; }
+function _interopRequireWildcard(e) {
+  if (e && e.__esModule) return e;
+  var f = { __proto__: null, default: e };
+  if (e != null) for (var k in e) if (k !== 'default' && Object.prototype.hasOwnProperty.call(e, k)) f[k] = e[k];
+  return f;
+}
+const POLL_INTERVAL_MS = 150;
+const DEBOUNCE_MS = 100;
+const TOUCH_EVENT = common.TOUCH_EVENT;
+const DELETE_EVENT = common.DELETE_EVENT;
+
+class FallbackWatcher extends _AbstractWatcher.AbstractWatcher {
+  #changeTimers = new Map();
+  #knownFiles = new Map(); // filepath -> mtime (ms)
+  #pollTimer = null;
+
+  async startWatching() {
+    // Initial crawl to build the known-files map
+    await new Promise((resolve) => {
+      recReaddir(
+        this.root,
+        (_dir) => {},
+        (filename, stats) => { this.#knownFiles.set(filename, stats.mtime.getTime()); },
+        (symlink, stats) => { this.#knownFiles.set(symlink, stats.mtime.getTime()); },
+        resolve,
+        (err) => { if (!isIgnorableFileError(err)) this.emitError(err); },
+        this.ignored,
+      );
+    });
+    // Start polling
+    this.#pollTimer = setInterval(() => this.#poll(), POLL_INTERVAL_MS);
+  }
+
+  async #poll() {
+    const seen = new Set();
+    // Check all known files for changes/deletions
+    for (const [filepath, oldMtime] of this.#knownFiles) {
+      seen.add(filepath);
+      try {
+        const stat = _fs.default.statSync(filepath);
+        const newMtime = stat.mtime.getTime();
+        if (newMtime !== oldMtime) {
+          this.#knownFiles.set(filepath, newMtime);
+          const relativePath = _path.default.relative(this.root, filepath);
+          const type = common.typeFromStat(stat);
+          if (type != null) {
+            this.#emitEvent({ event: TOUCH_EVENT, relativePath, metadata: { modifiedTime: newMtime, size: stat.size, type } });
+          }
+        }
+      } catch (err) {
+        if (isIgnorableFileError(err)) {
+          this.#knownFiles.delete(filepath);
+          const relativePath = _path.default.relative(this.root, filepath);
+          this.#emitEvent({ event: DELETE_EVENT, relativePath });
+        }
+      }
+    }
+    // Scan for new files by re-reading directories
+    try {
+      await this.#scanForNew(this.root, seen);
+    } catch (_) {}
+  }
+
+  async #scanForNew(dir, seen) {
+    let entries;
+    try { entries = _fs.default.readdirSync(dir, { withFileTypes: true }); }
+    catch (_) { return; }
+    for (const entry of entries) {
+      const fullPath = _path.default.join(dir, entry.name);
+      if (this.doIgnore(_path.default.relative(this.root, fullPath))) continue;
+      if (entry.isDirectory()) {
+        if (!entry.name.startsWith('.') && entry.name !== 'node_modules') {
+          await this.#scanForNew(fullPath, seen);
+        }
+      } else if (entry.isFile() || entry.isSymbolicLink()) {
+        if (!this.#knownFiles.has(fullPath)) {
+          try {
+            const stat = _fs.default.statSync(fullPath);
+            this.#knownFiles.set(fullPath, stat.mtime.getTime());
+            const relativePath = _path.default.relative(this.root, fullPath);
+            const type = common.typeFromStat(stat);
+            if (type != null) {
+              this.#emitEvent({ event: TOUCH_EVENT, relativePath, metadata: { modifiedTime: stat.mtime.getTime(), size: stat.size, type } });
+            }
+          } catch (_) {}
+        }
+      }
+    }
+  }
+
+  async stopWatching() {
+    await super.stopWatching();
+    if (this.#pollTimer) { clearInterval(this.#pollTimer); this.#pollTimer = null; }
+  }
+
+  #emitEvent(change) {
+    const key = change.event + '-' + change.relativePath;
+    const existing = this.#changeTimers.get(key);
+    if (existing) clearTimeout(existing);
+    this.#changeTimers.set(key, setTimeout(() => {
+      this.#changeTimers.delete(key);
+      this.emitFileEvent(change);
+    }, DEBOUNCE_MS));
+  }
+
+  getPauseReason() { return null; }
+}
+
+exports.default = FallbackWatcher;
+
+function isIgnorableFileError(error) {
+  return error.code === 'ENOENT' || error.code === 'EPERM';
+}
+
+function recReaddir(dir, dirCallback, fileCallback, symlinkCallback, endCallback, errorCallback, ignored) {
+  const walk = (0, _walker.default)(dir);
+  if (ignored) walk.filterDir((d) => !common.posixPathMatchesPattern(ignored, d));
+  walk
+    .on('dir', (p, s) => dirCallback(_path.default.normalize(p), s))
+    .on('file', (p, s) => fileCallback(_path.default.normalize(p), s))
+    .on('symlink', (p, s) => symlinkCallback(_path.default.normalize(p), s))
+    .on('error', errorCallback)
+    .on('end', endCallback);
+}
+WATCHER_EOF
+    echo "✅ FallbackWatcher patched for polling"
+  }
+
+  # Patch in the app's own node_modules and the workspace node_modules
+  _patch_fallback_watcher "$APP_DIR"
+  _patch_fallback_watcher "/app"
+
+  # Use the local expo binary from node_modules to avoid npx prompting to
+  # download/install expo interactively (which hangs in a container).
+  # @expo/cli is installed globally as `expo-internal` (not `expo`).
+  # We also check per-app and workspace node_modules as fallbacks.
+  EXPO_BIN=""
+  if [ -x "./node_modules/.bin/expo" ]; then
+    EXPO_BIN="./node_modules/.bin/expo"
+  elif [ -x "/app/node_modules/.bin/expo" ]; then
+    EXPO_BIN="/app/node_modules/.bin/expo"
+  elif command -v expo-internal >/dev/null 2>&1; then
+    # @expo/cli installs its binary as `expo-internal` globally
+    EXPO_BIN="expo-internal"
+  elif [ -x "/usr/local/lib/node_modules/@expo/cli/build/bin/cli" ]; then
+    EXPO_BIN="node /usr/local/lib/node_modules/@expo/cli/build/bin/cli"
+  else
+    # Last resort: npx with --yes to auto-confirm install prompt
+    EXPO_BIN="npx --yes expo"
+  fi
+
+  # Use 'localhost' as the packager hostname so Metro advertises
+  # http://localhost:<port> in the dev-client URL.  Combined with
+  # `adb reverse tcp:<port> tcp:<port>` (set up by dev.sh) this lets
+  # both emulators (via the adb reverse tunnel) and physical USB devices
+  # connect reliably.  Falls back to the env-var value if explicitly set
+  # (e.g. REACT_NATIVE_PACKAGER_HOSTNAME=10.0.2.2 for emulator-only mode).
+  #
+  # NOTE: CI=1 is intentionally NOT set here — it disables Fast Refresh in
+  # Expo/Metro. EXPO_USE_FAST_REFRESH=true ensures Hot Reload is always on.
+  exec env \
+    REACT_NATIVE_PACKAGER_HOSTNAME="${REACT_NATIVE_PACKAGER_HOSTNAME:-localhost}" \
+    EXPO_USE_FAST_REFRESH=true \
+    EXPO_NO_TELEMETRY=1 \
+    $EXPO_BIN start --dev-client --port "${METRO_PORT:-8081}" --clear
 }
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -318,7 +778,7 @@ rm -f "$_TMP_FIND"
 
 _app_dir()  { printf '%s' "$APP_RECORDS" | awk -F'|' -v k="$1" '$1==k{print $2; exit}'; }
 _app_slug() { printf '%s' "$APP_RECORDS" | awk -F'|' -v k="$1" '$1==k{print $3; exit}'; }
-_app_keys() { printf '%s' "$APP_RECORDS" | awk -F'|' 'NF>=3{print $1}' | sort; }
+_app_keys() { printf '%s' "$APP_RECORDS" | awk -F'|' 'NF>=3{print $1}' | sort -f; }
 
 # ── List command ──────────────────────────────────────────────────────────────
 if [ "${1:-}" = "list" ]; then
@@ -651,6 +1111,8 @@ if [ "$LOCAL_BUILD" = true ]; then
     fi
     echo "   Running Gradle assembleDebug..."
     echo "sdk.dir=$ANDROID_SDK" > "$APP_DIR/android/local.properties"
+    # Ensure Maps API key is present before every Gradle build
+    _ensure_maps_key "$APP_DIR"
     chmod +x "$GRADLEW"
     "$GRADLEW" -p "$APP_DIR/android" assembleDebug 2>&1
     local LOCAL_APK
@@ -767,6 +1229,8 @@ if [ "$CACHE_EXISTS" = false ] && [ -z "$ARTIFACT_URL" ]; then
     echo "🔧 Running expo prebuild --clean..."
     npx expo install expo-dev-client
     npx expo prebuild --clean
+    # Re-inject Maps key — prebuild regenerates AndroidManifest.xml
+    _ensure_maps_key "$APP_DIR"
     echo ""
   fi
 

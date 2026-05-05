@@ -1,7 +1,7 @@
 {
-  "name": "@elitecar/api-client",
+  "name": "@elitecar/hooks",
   "version": "1.0.0",
-  "description": "Platform-agnostic API client for EliteCar",
+  "description": "Shared React hooks for EliteCar apps",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
@@ -9,12 +9,17 @@
     "watch": "tsc --watch",
     "clean": "rm -rf dist"
   },
-  "keywords": ["api", "http", "client", "elitecar"],
+  "keywords": ["hooks", "react", "elitecar"],
   "author": "EliteCar Team",
   "license": "SEE LICENSE IN ../../LICENSE",
+  "peerDependencies": {
+    "react": ">=18.0.0"
+  },
   "dependencies": {
+    "@elitecar/api-client": "*",
+    "@elitecar/storage": "*",
     "@elitecar/types": "*",
-    "@elitecar/constants": "*"
+    "@elitecar/utils": "*"
   },
   "devDependencies": {}
 }

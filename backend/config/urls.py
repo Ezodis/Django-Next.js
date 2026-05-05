@@ -101,19 +101,32 @@ urlpatterns = [
     path("health/", health_check, name="health-check"),
     path("csrf/", csrf_token, name="csrf-token"),
     path("admin/login/", admin_login, name="admin-login"),
+    path("auth/", include("phone_auth.urls")),
+    path("call/", include("communications.api_urls")),
     path("admin/", admin.site.urls),
 ]
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-apps = find_apps(BASE_DIR, exclude_dirs=["backend", "migrations"])
+apps = find_apps(BASE_DIR, exclude_dirs=["backend", "migrations", "phone_auth"])
 
 for app in apps:
     try:
         importlib.import_module(f"{app}.urls")  # check if app has urls
+        # Register under both bare path (used by Traefik after stripping /api prefix)
+        # and under api/ prefix (used by mobile apps hitting port 8000 directly)
         urlpatterns.append(path(f"{app}/", include(f"{app}.urls")))
+        urlpatterns.append(path(f"api/{app}/", include(f"{app}.urls")))
     except ModuleNotFoundError:
         # silently skip apps without urls.py
         pass
+
+# Also register health/csrf/auth under api/ prefix for direct mobile access
+urlpatterns += [
+    path("api/health/", health_check, name="api-health-check"),
+    path("api/csrf/", csrf_token, name="api-csrf-token"),
+    path("api/auth/", include("phone_auth.urls")),
+    path("api/call/", include("communications.api_urls")),
+]
 
 # Serve media files in development
 if settings.DEBUG:

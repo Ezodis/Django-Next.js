@@ -1,10 +1,20 @@
 {
-  "name": "@app/storage",
+  "name": "@elitecar/storage",
   "version": "1.0.0",
-  "private": true,
+  "description": "Platform-agnostic storage abstraction for EliteCar",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "build": "tsc --noEmit"
-  }
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "clean": "rm -rf dist"
+  },
+  "keywords": ["storage", "localStorage", "AsyncStorage", "elitecar"],
+  "author": "EliteCar Team",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "dependencies": {
+    "@elitecar/types": "*",
+    "@elitecar/constants": "*"
+  },
+  "devDependencies": {}
 }

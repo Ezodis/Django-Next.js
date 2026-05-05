@@ -14,6 +14,7 @@ import os
 import json
 import logging
 from pathlib import Path
+from datetime import timedelta
 import dj_database_url
 
 # Configure logging
@@ -80,6 +81,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'rest_framework',
     'rest_framework.authtoken',
+    'rest_framework_simplejwt.token_blacklist',
     'import_export',
     'django.contrib.admin',
     'django.contrib.auth',
@@ -99,10 +101,14 @@ MIDDLEWARE = [
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.middleware.locale.LocaleMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'core.rate_limiting.SecurityHeadersMiddleware',  # Add security headers
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'core.middleware.RoleBasedAuthMiddleware',  # Add role-based authentication
+    'core.middleware.SessionSecurityMiddleware',  # Add session security
+    'core.rate_limiting.RateLimitMiddleware',  # Add rate limiting
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -153,6 +159,42 @@ else:
         )
     }
 
+# Redis Cache Configuration
+# Used for SMS verification codes and rate limiting
+REDIS_URL = os.getenv('REDIS_URL')
+
+if DEBUG:
+    # Development: Redis via Docker Compose service "redis"
+    REDIS_HOST = os.getenv('REDIS_HOST', 'redis')
+    REDIS_PORT = os.getenv('REDIS_PORT', '6379')
+    REDIS_DB = os.getenv('REDIS_DB', '0')
+    
+    if not REDIS_URL:
+        REDIS_URL = f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+
+# Configure caches
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': REDIS_URL or 'redis://127.0.0.1:6379/0',
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            'PARSER_CLASS': 'redis.connection.HiredisParser',
+            'CONNECTION_POOL_KWARGS': {
+                'max_connections': 50,
+                'retry_on_timeout': True,
+            },
+        },
+        'KEY_PREFIX': 'elitecar',
+        'TIMEOUT': 300,  # Default timeout: 5 minutes
+    }
+}
+
+# Use Redis for sessions in production
+if not DEBUG:
+    SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
+    SESSION_CACHE_ALIAS = 'default'
+
 # Password validation
 # https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
 
@@ -161,13 +203,28 @@ AUTH_PASSWORD_VALIDATORS = [
         'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
     },
     {
-        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+        'NAME': 'core.password_validators.EnhancedMinimumLengthValidator',
+        'OPTIONS': {
+            'min_length': 8,
+        }
     },
     {
         'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
     },
     {
         'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+    },
+    {
+        'NAME': 'core.password_validators.PasswordStrengthValidator',
+    },
+    {
+        'NAME': 'core.password_validators.PhoneNumberSimilarityValidator',
+    },
+    {
+        'NAME': 'core.password_validators.PasswordHistoryValidator',
+        'OPTIONS': {
+            'history_count': 5,
+        }
     },
 ]
 
@@ -379,8 +436,16 @@ REST_FRAMEWORK = {
         'rest_framework.parsers.FormParser',
     ],
     'DEFAULT_AUTHENTICATION_CLASSES': [
+        'phone_auth.authentication.CookieJWTAuthentication',
         'rest_framework.authentication.SessionAuthentication',
     ],
+}
+
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(hours=1),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
 }
 
 # CORS settings
@@ -454,21 +519,41 @@ else:
         SESSION_COOKIE_DOMAIN = f".{DOMAIN}"  # Note the leading dot for subdomains
         CSRF_COOKIE_DOMAIN = f".{DOMAIN}"
 
+# Additional security settings for sessions and cookies
+SESSION_COOKIE_HTTPONLY = True  # Prevent JavaScript access to session cookies
+SESSION_COOKIE_AGE = 86400  # 24 hours default session age
+SESSION_EXPIRE_AT_BROWSER_CLOSE = False  # Allow persistent sessions
+SESSION_SAVE_EVERY_REQUEST = True  # Update session on every request
+
+# Security headers configuration
+SECURE_BROWSER_XSS_FILTER = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = 'DENY'
+
+if not DEBUG:
+    # Production security settings
+    SECURE_SSL_REDIRECT = True
+    SECURE_HSTS_SECONDS = 31536000  # 1 year
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
 
 # Stripe Configuration
 STRIPE_PUBLISHABLE_KEY = os.getenv('STRIPE_PUBLISHABLE_KEY')
 STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY')
 STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
 
+# Twilio Configuration for SMS verification
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
+
 # Cleanup API Key - for scheduled task endpoint security
 # In production, set this environment variable to a secure random key
 CLEANUP_API_KEY = os.getenv('CLEANUP_API_KEY')
 
-# Stripe keys must be set via environment variables.
-# For local development, add them to your .env file:
-#   STRIPE_PUBLISHABLE_KEY=pk_test_...
-#   STRIPE_SECRET_KEY=sk_test_...
-# Never hardcode keys here.
+# Stripe keys must be supplied through environment variables only.
 
 # Debug prints
 print(f"⊧ {DATABASES['default']['ENGINE']}")

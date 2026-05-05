@@ -1,8 +1,5 @@
-../mobile
-../packages/*/node_modules
-../packages/*/.turbo
-node_modules
+mobile
+packages/*/node_modules
+packages/*/.turbo
+web/node_modules
 .git
-.gitignore
-README.md
-STRIPE_TESTING.md
