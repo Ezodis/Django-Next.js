@@ -134,7 +134,7 @@ RUN for project_req in /backend/requirements/*.txt; do \
 RUN addgroup --system django && adduser --system --ingroup django django
 
 # Copy project source with ownership for the django user
-COPY --chown=django:django . /backend
+COPY --chown=django:django backend/ /backend
 
 # Copy and setup backup scripts
 # Two scripts: backup.sh (basic) and backup_gcs.sh (with GCS support)

@@ -1,10 +1,7 @@
 # To start the dev environment, run: ./dev.sh
 # Manual run (no mobile services): podman-compose -f dev.yml up -d --build db backend frontend
 #
-# ML Service Architecture:
-#   Development (Local): ML built into Django backend at /ml_service/ endpoints
-#   Deployment (Cloud): Lightweight backend + External ML service (REQUIRED)
-#     - MUST set ML_SERVICE_URL environment variable to external ML service
+# Project integrations and extra services belong in backend/project.py.
 
 volumes:
   db_data:
@@ -30,16 +27,17 @@ services:
     environment:
       DJANGO_SECRET_KEY: "${DJANGO_SECRET_KEY:-django-insecure-dev-key-change-in-production}"
       DJANGO_DEBUG: "${DJANGO_DEBUG:-true}"
+      COMPOSE_PROJECT_NAME: "${COMPOSE_PROJECT_NAME}"
+      PROJECT_HOST: "${PROJECT_HOST}"
       DB_HOST: "db"
       DB_PORT: "5432"
-      DB_NAME: "postgres"
-      DB_USER: "postgres"
-      DB_PASSWORD: "postgres"
+      DB_NAME: "${DB_NAME:-postgres}"
+      DB_USER: "${DB_USER:-postgres}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       REDIS_HOST: "redis"
       REDIS_PORT: "6379"
       REDIS_DB: "0"
       EXPO_PUBLIC_ENV: "development"
-      ML_SERVICE_URL: "${ML_SERVICE_URL:-}"
     volumes:
       - ./backend:/backend:delegated
     depends_on:
@@ -101,9 +99,31 @@ services:
       # Backend service port
       - "traefik.http.services.${COMPOSE_PROJECT_NAME}-backend.loadbalancer.server.port=8000"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api.service=${COMPOSE_PROJECT_NAME}-backend"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.rule=Host(`${PROJECT_HOST}.localhost`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.entrypoints=websecure"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.priority=100"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.middlewares=${COMPOSE_PROJECT_NAME}-strip-api,${COMPOSE_PROJECT_NAME}-compress"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.service=${COMPOSE_PROJECT_NAME}-backend"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.tls=true"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin.service=${COMPOSE_PROJECT_NAME}-backend"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.rule=Host(`${PROJECT_HOST}.localhost`) && PathPrefix(`/admin`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.entrypoints=websecure"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.priority=100"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.middlewares=${COMPOSE_PROJECT_NAME}-compress"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.service=${COMPOSE_PROJECT_NAME}-backend"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.tls=true"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static.service=${COMPOSE_PROJECT_NAME}-backend"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static-https.rule=Host(`${PROJECT_HOST}.localhost`) && PathPrefix(`/static`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static-https.entrypoints=websecure"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static-https.priority=100"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static-https.service=${COMPOSE_PROJECT_NAME}-backend"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static-https.tls=true"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media.service=${COMPOSE_PROJECT_NAME}-backend"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media-https.rule=Host(`${PROJECT_HOST}.localhost`) && PathPrefix(`/media`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media-https.entrypoints=websecure"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media-https.priority=100"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media-https.service=${COMPOSE_PROJECT_NAME}-backend"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media-https.tls=true"
     restart: unless-stopped
 
   frontend:
@@ -122,7 +142,7 @@ services:
       WATCHPACK_POLLING_INTERVAL: "500"
       CHOKIDAR_USEPOLLING: "true"
       CHOKIDAR_INTERVAL: "500"
-      NEXT_PUBLIC_URL: "http://${PROJECT_HOST}.localhost"
+      NEXT_PUBLIC_URL: "https://${PROJECT_HOST}.localhost"
       NEXT_PUBLIC_API_URL: "/api"
     volumes:
       - ./frontend/web:/app:z
@@ -130,7 +150,7 @@ services:
       - frontend_node_modules:/app/node_modules
       - frontend_next:/app/.next
     # No host port binding — frontend is ONLY accessible via Traefik at
-    # http://${PROJECT_HOST}.localhost (port 80). Direct :3000 access is
+    # https://${PROJECT_HOST}.localhost (port 443). Direct :3000 access is
     # intentionally blocked so HMR WebSocket always goes through port 80.
     depends_on:
       backend:
@@ -140,7 +160,7 @@ services:
         soft: 65536
         hard: 65536
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -s --max-time 5 -o /dev/null http://localhost:3000 || exit 1"]
+      test: ["CMD", "node", "-e", "const r=require('http').get('http://127.0.0.1:3000/',res=>{res.resume();process.exit(res.statusCode<400?0:1)});r.setTimeout(5000,()=>{r.destroy();process.exit(1)});r.on('error',()=>process.exit(1))"]
       interval: 15s
       timeout: 8s
       retries: 20
@@ -170,6 +190,11 @@ services:
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend.entrypoints=web"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend.priority=10"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend.service=${COMPOSE_PROJECT_NAME}-frontend"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend-https.rule=Host(`${PROJECT_HOST}.localhost`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend-https.entrypoints=websecure"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend-https.priority=10"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend-https.service=${COMPOSE_PROJECT_NAME}-frontend"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend-https.tls=true"
       # Catch-all for tunnel and any other hostname
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend-tunnel.rule=PathPrefix(`/`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend-tunnel.entrypoints=web"
@@ -192,6 +217,7 @@ services:
       PROFILE: "${PROFILE:-development}"
     volumes:
       - ./frontend/mobile:/app
+      - ./frontend/mobile/mobile.sh:/mobile.sh:ro
     command:
       - sh
       - -c
@@ -205,9 +231,9 @@ services:
   db:
     image: postgres:17
     environment:
-      POSTGRES_DB: postgres
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: "${DB_NAME:-postgres}"
+      POSTGRES_USER: "${DB_USER:-postgres}"
+      POSTGRES_PASSWORD: "${DB_PASSWORD:-postgres}"
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
@@ -244,7 +270,7 @@ services:
     profiles: ["init"]
     image: node:24
     volumes:
-      - ./frontend:/app
+      - ./frontend/web:/app
     working_dir: /app
     command: >
       sh -c "

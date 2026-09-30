@@ -1,4 +1,6 @@
 -r base.txt
 
 # Production server
-gunicorn==22.0.0
+gunicorn==23.0.0
+
+# Project-specific integrations

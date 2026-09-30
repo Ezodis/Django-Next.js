@@ -45,6 +45,7 @@ function resolveSharedRoot(appDir) {
  */
 function resolveAssetsRoot(appDir) {
   const candidates = [
+    path.resolve(appDir, '../shared/assets'),
     path.resolve(appDir, '../../../web/public'),
     path.resolve(appDir, '../../web/public'),
   ];

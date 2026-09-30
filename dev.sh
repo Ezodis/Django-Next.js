@@ -12,8 +12,18 @@
 # ║                                    • Emulators/simulators always work       ║
 # ║    ./dev.sh android              Start Android emulator + install apps      ║
 # ║    ./dev.sh ios                  Install cached iOS builds/IPAs on simulator║
+# ║    ./dev.sh qr [app-name]        Show QR codes for mobile apps              ║
+# ║                                    • No app name = show all apps            ║
+# ║                                    • With app name = open in new terminal   ║
+# ║                                                                             ║
+# ║    ./dev.sh eas whoami           Show current EAS account                   ║
+# ║    ./dev.sh eas login            Log in to EAS interactively                ║
+# ║    ./dev.sh eas logout           Log out from EAS                           ║
 # ║                                                                             ║
 # ║    ./dev.sh build <app> [android|ios] [development/production] <local>      ║
+# ║    ./dev.sh build-all [android|ios] [development|production] [testflight]   ║
+# ║                                    Build all mobile apps in parallel        ║
+# ║                                    Add 'testflight' to auto-submit to TF    ║
 # ║    ./dev.sh release [android|ios] setup     Generate keystores/credentials  ║
 # ║    ./dev.sh release [android|ios] <local>   Build AABs/IPAs (EAS default)   ║
 # ║                                                                             ║
@@ -62,7 +72,7 @@
 #
 #   Sync on Windows: .\dev.ps1 sync [--dry-run] [--yes]
 #                    .\dev.ps1 sync push          (auto-detects sibling template repo/)
-#                    .\dev.ps1 sync push --dir <path>  (explicit path)
+#                    .\dev.ps1 sync [push] --dir <path>  (explicit template clone)
 #                    (skips full bootstrap — goes straight to WSL2, fast)
 #
 #   macOS / Linux:   ./dev.sh    (bash — runs directly, no wrapper needed)
@@ -72,6 +82,20 @@
 set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Sync is a file operation: skip bootstrap, .env edits, containers and tunnels.
+if [[ "${1:-}" == "sync" ]]; then
+  command -v python3 >/dev/null 2>&1 || { echo "Python 3 is required for template sync."; exit 1; }
+  exec python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" sync "${@:2}"
+fi
+
+
+# Keep the Compose project name available from the first line that may need a
+# project-scoped temporary file.  In particular, project.py compose extensions
+# are extracted below, before the environment bootstrap.
+PROJECT_NAME="$(basename "$ROOT_DIR" | tr -cd 'a-zA-Z0-9.' | tr '[:upper:]' '[:lower:]' | tr -d '.')"
+[[ -n "$PROJECT_NAME" ]] || PROJECT_NAME="project-$(printf '%s' "$ROOT_DIR" | cksum | awk '{print $1}')"
+PROJECT_DISPLAY_NAME="$(basename "$ROOT_DIR")"
 
 # ── Ensure Homebrew tools (gtimeout, etc.) are in PATH on macOS ──────────────
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -86,11 +110,13 @@ MOBILE_DIR="$ROOT_DIR/frontend/mobile"
 MOBILE_APPS=()
 
 # ── Extra compose services (project-specific overrides) ───────────────────────
-# COMPOSE_SERVICES string inside backend/config/project.py is extracted into a
+# COMPOSE_SERVICES string inside backend/project.py is extracted into a
 # temp file and merged with dev.yml — one file to edit instead of two.
 COMPOSE_F=(-f "$COMPOSE_FILE")
 _project_py="$ROOT_DIR/backend/project.py"
 _extra_yml="/tmp/${PROJECT_NAME}-project-services.yml"
+
+rm -f "$_extra_yml"  # Never reuse overrides removed from project.py.
 
 # Extract the COMPOSE_SERVICES string from project.py and write to a temp file.
 # Uses Python to parse the literal string safely (handles triple-quotes, escapes).
@@ -100,9 +126,9 @@ import ast, sys, os
 
 src_path, dest_path = sys.argv[1], sys.argv[2]
 try:
-    tree = ast.parse(open(src_path).read())
-except SyntaxError:
-    sys.exit(0)
+    tree = ast.parse(open(src_path, encoding="utf-8-sig").read())
+except SyntaxError as error:
+    raise SystemExit(f"Invalid project configuration: {error}")
 
 for node in ast.walk(tree):
     if isinstance(node, ast.Assign):
@@ -115,12 +141,18 @@ for node in ast.walk(tree):
                                   if l.strip() and not l.strip().startswith('#')]
                     if real_lines:
                         with open(dest_path, 'w') as f:
-                            f.write(content)
+                            # Project snippets contain service entries indented
+                            # beneath Compose's required top-level `services:`.
+                            # Also accept a complete Compose fragment.
+                            if any(l.strip() == 'services:' for l in content.splitlines()):
+                                f.write(content)
+                            else:
+                                f.write('services:\n' + content)
                     sys.exit(0)
 EXTRACT_COMPOSE_EOF
 
   # Include the extracted services file if it has real content
-  if [[ -f "$_extra_yml" ]] && grep -qE '^[^#[:space:]]' "$_extra_yml" 2>/dev/null; then
+  if [[ -f "$_extra_yml" ]] && grep -qE '^[[:space:]]*[^#[:space:]]' "$_extra_yml" 2>/dev/null; then
     COMPOSE_F+=(-f "$_extra_yml")
   fi
 fi
@@ -149,6 +181,14 @@ _get_lan_ip() {
         || echo "localhost"
       ;;
     wsl|linux)
+      # A WSL address (normally 172.x) is NAT-only and cannot be opened by a
+      # phone on Wi-Fi. Prefer the Windows host's physical LAN address so the
+      # LOCAL QR code works on real devices as well as emulators.
+      if [[ "$OS" == "wsl" ]] && [[ -x /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe ]]; then
+        local _win_lan_ip
+        _win_lan_ip=$(/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -Command '$ip = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" -and $_.InterfaceAlias -notmatch "WSL|vEthernet|Loopback" } | Select-Object -First 1 -ExpandProperty IPAddress; Write-Output $ip' 2>/dev/null | tr -d '\r' | tail -1)
+        [[ "$_win_lan_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && { echo "$_win_lan_ip"; return; }
+      fi
       hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost"
       ;;
     windows)
@@ -389,19 +429,19 @@ SCANNER_EOF
 # Run bootstrap immediately so .env is ready for all subsequent commands
 _bootstrap_env
 
-# Project name derived from the repo folder
-# Normalize to lowercase and remove dots (to match Podman Compose behavior)
-# Podman Compose strips dots from project names, so we do the same for consistency
-PROJECT_NAME="$(basename "$ROOT_DIR" | tr -cd 'a-zA-Z0-9.' | tr '[:upper:]' '[:lower:]' | tr -d '.')"
+# Project name derived from the repo folder (declared above because extraction
+# of project-specific Compose services also uses it).
+# Podman Compose strips dots from project names, so we do the same for consistency.
 export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 
 # Display name preserves original capitalization and dots for UI/status display
-PROJECT_DISPLAY_NAME="$(basename "$ROOT_DIR")"
+# PROJECT_DISPLAY_NAME was also declared above for early callers.
 
-# PROJECT_HOST is the subdomain used for Traefik routing: <name>.localhost
-# Preserves dots from the folder name (e.g. my.project → my.project.localhost)
-# dev.yml labels reference ${PROJECT_HOST}.localhost — must be exported.
-PROJECT_HOST="$(basename "$ROOT_DIR" | tr -cd 'a-zA-Z0-9.' | tr '[:upper:]' '[:lower:]')"
+# PROJECT_HOST is a single DNS label derived from the project folder.  A
+# single-label `name.localhost` resolves automatically on Windows, macOS, and
+# Linux; keeping dots would create `name.app.localhost`, which Windows does not
+# consistently resolve without an elevated hosts-file edit.
+PROJECT_HOST="$PROJECT_NAME"
 export PROJECT_HOST
 
 # ── OS detection ──────────────────────────────────────────────────────────────
@@ -465,7 +505,7 @@ _default_android_sdk() {
 # Also auto-generates optimized metro.config.js and .watchmanconfig if missing.
 gen_app_json() {
   [[ -d "$MOBILE_DIR" ]] || return 0
-  
+
   # First, ensure metro.config.base.js exists
   local base_config="$MOBILE_DIR/metro.config.base.js"
   local _skip_metro=0
@@ -1191,17 +1231,39 @@ _wire_podman_socket() {
 
       # WSL without systemd has no socket-activated Podman API. Traefik needs
       # this API to discover container labels; without it every route is a 404.
-      if [[ ! -S "$uid_sock" ]] && [[ ! -d /run/systemd/system ]]; then
+      # A socket file can remain behind after the API process exits, so test the
+      # API itself instead of treating the presence of the file as healthy.
+      local _socket_healthy=false
+      if [[ -S "$uid_sock" ]] && command -v curl &>/dev/null && \
+         curl --silent --fail --max-time 1 --unix-socket "$uid_sock" \
+           http://localhost/_ping >/dev/null 2>&1; then
+        _socket_healthy=true
+      fi
+      if [[ "$_socket_healthy" != "true" ]] && [[ ! -d /run/systemd/system ]]; then
         local _socket_pid_file="/tmp/podman-api-$(id -u).pid"
         local _socket_pid=""
         [[ -f "$_socket_pid_file" ]] && _socket_pid=$(cat "$_socket_pid_file" 2>/dev/null || true)
-        if [[ ! "$_socket_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$_socket_pid" 2>/dev/null; then
-          mkdir -p "$(dirname "$uid_sock")"
-          _run_detached "/tmp/podman-api-$(id -u).log" "$_socket_pid_file" \
-            podman system service --time=0 "unix://${uid_sock}"
+        # Only stop the recorded PID when it is actually our socket service;
+        # PID numbers can be reused after an old pid file is left behind.
+        if [[ "$_socket_pid" =~ ^[0-9]+$ ]] && kill -0 "$_socket_pid" 2>/dev/null; then
+          local _socket_cmdline=""
+          [[ -r "/proc/${_socket_pid}/cmdline" ]] && \
+            _socket_cmdline=$(tr '\0' ' ' < "/proc/${_socket_pid}/cmdline" 2>/dev/null || true)
+          [[ "$_socket_cmdline" == *"podman system service"* ]] && kill "$_socket_pid" 2>/dev/null || true
         fi
+        rm -f "$uid_sock" "$_socket_pid_file" 2>/dev/null || true
+        mkdir -p "$(dirname "$uid_sock")"
+        _run_detached "/tmp/podman-api-$(id -u).log" "$_socket_pid_file" \
+          podman system service --time=0 "unix://${uid_sock}"
+
         local _socket_wait=0
-        while [[ ! -S "$uid_sock" && $_socket_wait -lt 30 ]]; do
+        while [[ $_socket_wait -lt 50 ]]; do
+          if [[ -S "$uid_sock" ]] && \
+             curl --silent --fail --max-time 1 --unix-socket "$uid_sock" \
+               http://localhost/_ping >/dev/null 2>&1; then
+            _socket_healthy=true
+            break
+          fi
           sleep 0.1
           _socket_wait=$((_socket_wait + 1))
         done
@@ -1219,7 +1281,7 @@ _wire_podman_socket() {
 _setup_java_env() {
   # Only needed on macOS for now
   if [[ "$OS" != "mac" ]]; then return 0; fi
-  
+
   # Check if Java is already available and actually works (not just the macOS stub)
   if command -v java &>/dev/null && command -v keytool &>/dev/null; then
     # Verify Java actually works (not the macOS stub that shows "Unable to locate")
@@ -1227,7 +1289,7 @@ _setup_java_env() {
       return 0
     fi
   fi
-  
+
   # Try to find Java 21 from Homebrew
   local java_home=""
   for vm in /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
@@ -1239,12 +1301,12 @@ _setup_java_env() {
       break
     fi
   done
-  
+
   # Fallback to any available JVM
   if [[ -z "$java_home" ]]; then
     java_home="$(/usr/libexec/java_home 2>/dev/null || true)"
   fi
-  
+
   if [[ -n "$java_home" && -x "$java_home/bin/java" ]]; then
     export JAVA_HOME="$java_home"
     export PATH="$java_home/bin:$PATH"
@@ -1432,40 +1494,14 @@ update_mobile_ip() {
 # so it is available when _stop_cloudflare_tunnel calls it during `./dev.sh down`.
 discover_apps() {
   MOBILE_APPS=()
-  [[ -d "$MOBILE_DIR" ]] || return
-  # Collect names first, then sort with priority order for stable port assignment
-  local _names=()
-  while IFS= read -r -d '' dir; do
-    local name
-    name=$(basename "$dir")
-    [[ "$name" == "node_modules" || "$name" == "shared" || "$name" == "scripts" || "$name" == "builds" ]] && continue
-    [[ -f "$dir/package.json" ]] || continue
-    _names+=("$name")
-  done < <(find "$MOBILE_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
-  # Sort with priority: "EliteCar" (passenger) first, then "EliteCar Driver", then others alphabetically
-  # This ensures: EliteCar → 8081, EliteCar Driver → 8082
-  if [[ ${#_names[@]} -gt 0 ]]; then
-    local _sorted=()
-    # First: exact match "EliteCar"
-    for name in "${_names[@]}"; do
-      [[ "$name" == "EliteCar" ]] && _sorted+=("$name")
-    done
-    # Second: exact match "EliteCar Driver"
-    for name in "${_names[@]}"; do
-      [[ "$name" == "EliteCar Driver" ]] && _sorted+=("$name")
-    done
-    # Third: everything else, sorted alphabetically
-    local _others=()
-    for name in "${_names[@]}"; do
-      [[ "$name" != "EliteCar" && "$name" != "EliteCar Driver" ]] && _others+=("$name")
-    done
-    if [[ ${#_others[@]} -gt 0 ]]; then
-      while IFS= read -r name; do
-        _sorted+=("$name")
-      done < <(printf '%s\n' "${_others[@]}" | sort -f)
-    fi
-    MOBILE_APPS=("${_sorted[@]}")
-  fi
+  [[ -d "$MOBILE_DIR" ]] || return 0
+  # Discover folders with package.json; optional ordering lives in project.py.
+  local _discovered name
+  _discovered=$(python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" mobile-apps) || return
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && MOBILE_APPS+=("$name")
+  done <<< "$_discovered"
+  return 0
 }
 
 has_mobile_apps() {
@@ -1635,11 +1671,33 @@ _ensure_metro_tunnels() {
     local metro_log="/tmp/${PROJECT_NAME}-metro-${_port}.log"
     local metro_pid_file="/tmp/${PROJECT_NAME}-metro-${_port}.pid"
 
+    local _named_token _configured_url
+    _named_token=$(sed -n 's/^CLOUDFLARE_TUNNEL_TOKEN=//p' "$ROOT_DIR/.env" | tr -d '\r')
+    _configured_url=$(sed -n "s/^METRO_TUNNEL_URL_${_port}=//p" "$ROOT_DIR/.env" | tr -d '\r')
+    if [[ -n "$_named_token" ]]; then
+      # Named mode never silently falls back to an address that will change.
+      if [[ "$_configured_url" != https://* || "$_configured_url" == *trycloudflare.com* ]]; then
+        echo "⚠️  Set a fixed METRO_TUNNEL_URL_${_port} hostname for ${_folder} in .env"
+      fi
+      # All fixed Metro hostnames are routed by the main named connector.
+      _port=$(( _port + 1 ))
+      continue
+    fi
+
     # Check if cloudflared process is still alive
     local _alive=false
     if [[ -f "$metro_pid_file" ]]; then
       local _mpid; _mpid=$(cat "$metro_pid_file" 2>/dev/null || true)
       [[ -n "$_mpid" ]] && kill -0 "$_mpid" 2>/dev/null && _alive=true
+    fi
+
+    # A quick tunnel can expire while cloudflared keeps retrying forever.
+    if [[ "$_alive" == "true" ]] && tail -20 "$metro_log" 2>/dev/null | grep -q 'Unauthorized: Tunnel not found'; then
+      kill "$_mpid" 2>/dev/null || true
+      rm -f "$metro_pid_file"
+      _alive=false
+      sleep 1
+      kill -9 "$_mpid" 2>/dev/null || true
     fi
 
     # Also re-adopt orphaned cloudflared process for this proxy port
@@ -1839,13 +1897,12 @@ _start_cloudflare_tunnel() {
     [[ $_net_try -lt 5 ]] && sleep 2
   done
   if [[ "$_net_ok" == "false" ]]; then
-    echo "ℹ️  No internet — running without tunnel"
-    _clear_tunnel_urls
+    echo "ℹ️  No internet — preserving tunnel addresses for reconnection"
     return 0
   fi
 
   local _tunnel_token
-  _tunnel_token=$(grep "^CLOUDFLARE_TUNNEL_TOKEN=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]' || true)
+  _tunnel_token=$(grep "^CLOUDFLARE_TUNNEL_TOKEN=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || true)
   local _retry_file="/tmp/${PROJECT_NAME}-tunnel-retry-after"
   if [[ -z "$_tunnel_token" && -f "$_retry_file" ]]; then
     local _retry_after _retry_now
@@ -1862,178 +1919,38 @@ _start_cloudflare_tunnel() {
   local tunnel_pid_file="/tmp/${PROJECT_NAME}-tunnel.pid"
   local _local_host="${PROJECT_HOST}.localhost"
 
-  # ── Step 1: Try to reuse the URL already saved in .env ──────────────────────
-  # Quick tunnel URLs survive as long as the cloudflared process is alive anywhere
-  # on this machine. Before creating a NEW tunnel (which always gets a new URL),
-  # check if the saved URL is still reachable. If it is, we just need to wire up
-  # the local process; we don't need a new one at all.
-  local _saved_url
-  _saved_url=$(grep "^CLOUDFLARE_TUNNEL_URL=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2 || true)
-
-  if [[ -n "$_saved_url" ]]; then
-    # Flush DNS cache first — fresh trycloudflare.com subdomains may not be in
-    # the system resolver yet (macOS caches negative lookups aggressively).
-    # Use sudo -n (non-interactive) so it never prompts for a password.
-    if [[ "$OS" == "mac" ]]; then
-      sudo -n dscacheutil -flushcache 2>/dev/null || dscacheutil -flushcache 2>/dev/null || true
-      sudo -n killall -HUP mDNSResponder 2>/dev/null || killall -HUP mDNSResponder 2>/dev/null || true
-    fi
-
-    # ── Named tunnel fast-path ───────────────────────────────────────────────
-    # For named tunnels (token set) the URL is stable — it never changes between
-    # restarts. If a cloudflared process is already alive (any token-based one),
-    # just reuse the saved URL. If not, skip straight to launching a new one.
-    if [[ -n "$_tunnel_token" ]]; then
-      local _named_pid
-      _named_pid=$(pgrep -f "cloudflared.*run.*--token" 2>/dev/null | head -1 || true)
-      if [[ -n "$_named_pid" ]]; then
-        echo "✅ Cloudflare Tunnel already running"
-        echo "   🌐 Webapp:  $_saved_url"
-        echo "$_named_pid" > "$tunnel_pid_file"
+  # A failed HTTP/DNS/metrics probe is not proof that a tunnel lease died.
+  # Let cloudflared reconnect using its existing identity after network loss.
+  local _saved_url _saved_pid
+  _saved_url=$(sed -n 's/^CLOUDFLARE_TUNNEL_URL=//p' "$ROOT_DIR/.env" | tr -d '\r')
+  if [[ -n "$_tunnel_token" && ( "$_saved_url" != https://* || "$_saved_url" == *trycloudflare.com* ) ]]; then
+    echo "⚠️  Named tunnel requires a fixed CLOUDFLARE_TUNNEL_URL=https://your-hostname in .env"
+    return 0
+  fi
+  _saved_pid=$(cat "$tunnel_pid_file" 2>/dev/null || true)
+  if [[ -z "$_tunnel_token" ]] && { [[ ! "$_saved_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$_saved_pid" 2>/dev/null; }; then
+    _saved_pid=$(pgrep -f "cloudflared tunnel.*--http-host-header ${_local_host}" 2>/dev/null | head -1 || true)
+  fi
+  if [[ "$_saved_pid" =~ ^[0-9]+$ ]] && kill -0 "$_saved_pid" 2>/dev/null &&
+      ps -p "$_saved_pid" -o args= | grep -q '[c]loudflared tunnel'; then
+    if [[ -n "$_tunnel_token" ]] || ! tail -20 "$tunnel_log" 2>/dev/null | grep -q 'Unauthorized: Tunnel not found'; then
+      echo "$_saved_pid" > "$tunnel_pid_file"
+      if [[ -z "$_tunnel_token" ]]; then
+        # The live connector owns its URL; .env may have been copied from an
+        # older workspace. Never register an old hostname against a new lease.
+        _saved_url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$tunnel_log" | head -1 || true)
+      fi
+      echo "✅ Keeping existing Cloudflare Tunnel (including while reconnecting)"
+      if [[ -n "$_saved_url" ]]; then
         _save_tunnel_url "$_saved_url"
         _register_tunnel_with_traefik "$_saved_url"
-        _sync_metro_tunnel_urls_from_logs
-        _ensure_metro_proxies
-        _ensure_metro_tunnels
-        return 0
       fi
-      # No live process — fall through to launch a new one below
-    else
-      # First look for any live cloudflared process for this project (by host header)
-      local _candidate_pid
-      _candidate_pid=$(pgrep -f "cloudflared tunnel.*--http-host-header ${_local_host}" 2>/dev/null | head -1 || true)
-
-      if [[ -n "$_candidate_pid" ]]; then
-        # Process exists — check if the saved URL is actually reachable.
-        # DNS was already flushed above; give the resolver a moment to settle.
-        local _reachable=false
-        for _reach_try in 1 2 3; do
-          if curl -sf --max-time 5 "${_saved_url}" >/dev/null 2>&1; then
-            _reachable=true; break
-          fi
-          [[ $_reach_try -lt 3 ]] && sleep 2
-        done
-
-        if [[ "$_reachable" == "true" ]]; then
-          # Check it's not stuck in a QUIC crash loop
-          local _crash_lines=0
-          if [[ -f "$tunnel_log" ]]; then
-            _crash_lines=$(tail -30 "$tunnel_log" 2>/dev/null | grep -c "control stream encountered a failure" 2>/dev/null; true)
-            _crash_lines=$(echo "$_crash_lines" | tr -d '[:space:]')
-            _crash_lines=${_crash_lines:-0}
-          fi
-          local _metrics_port _ha_conn=1
-          _metrics_port=$(grep -o 'metrics server on 127\.0\.0\.1:[0-9]*' "$tunnel_log" 2>/dev/null \
-            | grep -o '[0-9]*$' | head -1 || true)
-          if [[ -n "$_metrics_port" ]]; then
-            _ha_conn=$(curl -sf --max-time 2 \
-              "http://127.0.0.1:${_metrics_port}/metrics" 2>/dev/null \
-              | (grep '^cloudflared_tunnel_ha_connections ' || true) | awk '{print $2}')
-            _ha_conn="${_ha_conn:-1}"
-          fi
-
-          if [[ "$_crash_lines" -lt 3 ]] || [[ "$_ha_conn" != "0" ]]; then
-            echo "✅ Cloudflare Tunnel already running"
-            echo "   🌐 Webapp:  $_saved_url"
-            echo "$_candidate_pid" > "$tunnel_pid_file"
-            _save_tunnel_url "$_saved_url"
-            _register_tunnel_with_traefik "$_saved_url"
-            _sync_metro_tunnel_urls_from_logs
-            _ensure_metro_proxies
-            _ensure_metro_tunnels
-            return 0
-          else
-            echo "⚠️  Tunnel stuck in QUIC crash loop — restarting with http2..."
-            kill "$_candidate_pid" 2>/dev/null || true
-            rm -f "$tunnel_pid_file" "$tunnel_log"
-            sleep 1
-          fi
-        else
-          # Process running but URL no longer reachable on Cloudflare's edge.
-          # Kill it — the quick tunnel lease has expired; need a new one.
-          echo "⚠️  Previous tunnel URL expired — starting a new tunnel..."
-          kill "$_candidate_pid" 2>/dev/null || true
-          rm -f "$tunnel_pid_file" "$tunnel_log"
-          sleep 0.5
-        fi
-      fi
+      _sync_metro_tunnel_urls_from_logs
+      _ensure_metro_proxies
+      _ensure_metro_tunnels
+      return 0
     fi
   fi
-
-  # ── Step 2: Check PID file for a tracked process (no host-header match above) ─
-  local _tunnel_running=false
-  local _saved_pid=""
-
-  if [[ -f "$tunnel_pid_file" ]]; then
-    _saved_pid=$(cat "$tunnel_pid_file" 2>/dev/null || true)
-    if [[ -n "$_saved_pid" ]] && kill -0 "$_saved_pid" 2>/dev/null; then
-      _tunnel_running=true
-    else
-      rm -f "$tunnel_pid_file"
-      _saved_pid=""
-    fi
-  fi
-
-  if [[ "$_tunnel_running" == "true" ]] && [[ -f "$tunnel_log" ]]; then
-    # Wait up to 10s if the process just started and has no URL yet
-    local existing_url=""
-    local _w=0
-    while [[ $_w -lt 20 ]]; do
-      existing_url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$tunnel_log" 2>/dev/null | head -1 || true)
-      [[ -n "$existing_url" ]] && break
-      sleep 0.5; _w=$((_w + 1))
-    done
-
-    if [[ -n "$existing_url" ]]; then
-      local _metrics_port _healthy=false _crash_lines=0 _ha_conn=1
-      _metrics_port=$(grep -o 'metrics server on 127\.0\.0\.1:[0-9]*' "$tunnel_log" 2>/dev/null \
-        | grep -o '[0-9]*$' | head -1 || true)
-
-      if [[ -n "$_metrics_port" ]] && curl -sf --max-time 3 "http://127.0.0.1:${_metrics_port}/metrics" >/dev/null 2>&1; then
-        _ha_conn=$(curl -sf --max-time 2 "http://127.0.0.1:${_metrics_port}/metrics" 2>/dev/null \
-          | (grep '^cloudflared_tunnel_ha_connections ' || true) | awk '{print $2}')
-        _ha_conn="${_ha_conn:-1}"
-        _crash_lines=$(tail -30 "$tunnel_log" 2>/dev/null | grep -c "control stream encountered a failure" 2>/dev/null; true)
-        _crash_lines=$(echo "$_crash_lines" | tr -d '[:space:]')
-        _crash_lines=${_crash_lines:-0}
-        if [[ "$_ha_conn" != "0" ]] && [[ "$_crash_lines" -lt 3 ]]; then
-          _healthy=true
-        fi
-      fi
-
-      if [[ "$_healthy" == "true" ]]; then
-        echo "✅ Cloudflare Tunnel already running"
-        echo "   🌐 Webapp:  $existing_url"
-        _save_tunnel_url "$existing_url"
-        _register_tunnel_with_traefik "$existing_url"
-        _sync_metro_tunnel_urls_from_logs
-        _ensure_metro_proxies
-        _ensure_metro_tunnels
-        return 0
-      else
-        echo "⚠️  Tunnel broken (QUIC crash loop) — restarting with http2..."
-        local _dead_pid; _dead_pid=$(cat "$tunnel_pid_file" 2>/dev/null || true)
-        [[ -n "$_dead_pid" ]] && kill "$_dead_pid" 2>/dev/null || true
-        rm -f "$tunnel_pid_file" "$tunnel_log"
-        _tunnel_running=false
-      fi
-    else
-      echo "⚠️  Tunnel process stuck (no URL) — restarting..."
-      local _dead_pid; _dead_pid=$(cat "$tunnel_pid_file" 2>/dev/null || true)
-      [[ -n "$_dead_pid" ]] && kill "$_dead_pid" 2>/dev/null || true
-      rm -f "$tunnel_pid_file" "$tunnel_log"
-      _tunnel_running=false
-    fi
-  fi
-
-  # ── Discover mobile apps for Metro tunnels ──────────────────────────────────
-  discover_apps
-  local metro_ports=()
-  local idx=0
-  for folder in "${MOBILE_APPS[@]}"; do
-    metro_ports+=($((8081 + idx)))
-    idx=$((idx + 1))
-  done
 
   echo "🌐 Starting Cloudflare Tunnel for ${PROJECT_DISPLAY_NAME}..."
 
@@ -2086,39 +2003,12 @@ _start_cloudflare_tunnel() {
   fi
   sleep 0.3
 
-  # Kill previous Metro tunnel processes
-  for port in "${metro_ports[@]}"; do
-    local _old_metro_pid_file="/tmp/${PROJECT_NAME}-metro-${port}.pid"
-    if [[ -f "$_old_metro_pid_file" ]]; then
-      local _old_mpid; _old_mpid=$(cat "$_old_metro_pid_file" 2>/dev/null || true)
-      [[ -n "$_old_mpid" ]] && kill "$_old_mpid" 2>/dev/null || true
-      rm -f "$_old_metro_pid_file"
-    fi
-    local _old_mproxy_pid_file="/tmp/${PROJECT_NAME}-metro-proxy-${port}.pid"
-    if [[ -f "$_old_mproxy_pid_file" ]]; then
-      local _old_mppid; _old_mppid=$(cat "$_old_mproxy_pid_file" 2>/dev/null || true)
-      [[ -n "$_old_mppid" ]] && kill "$_old_mppid" 2>/dev/null || true
-      rm -f "$_old_mproxy_pid_file"
-    fi
-  done
-  sleep 0.2
-
-  # Metro tunnels: each Expo app gets its own cloudflared tunnel.
-  # The Metro rewriting proxy is still needed here because Metro embeds
-  # http://localhost:PORT URLs in bundle manifests — those need rewriting
-  # to the tunnel URL so physical devices can load JS bundles.
+  # Web recovery must not replace independent Metro tunnel identities.
   _ensure_metro_proxies
-  for port in "${metro_ports[@]}"; do
-    local metro_log="/tmp/${PROJECT_NAME}-metro-${port}.log"
-    local metro_pid_file="/tmp/${PROJECT_NAME}-metro-${port}.pid"
-    local metro_proxy_port=$(( port + 1000 ))
-    rm -f "$metro_log"
-    _run_detached "$metro_log" "$metro_pid_file" \
-      cloudflared tunnel --protocol http2 --url "http://localhost:${metro_proxy_port}"
-  done
+  _ensure_metro_tunnels
 
   # ── Wait for webapp tunnel URL (up to 90s) ──────────────────────────────────
-  # Named tunnels log their configured hostname; quick tunnels log trycloudflare.com.
+  # Named hostnames come from configuration; quick hostnames come from logs.
   local attempts=0 tunnel_url="" _last_dot=0
   printf "   ⏳ Waiting for tunnel URL"
   while [[ $attempts -lt 180 ]]; do
@@ -2126,14 +2016,7 @@ _start_cloudflare_tunnel() {
     tunnel_url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$tunnel_log" 2>/dev/null | head -1 || true)
     # Named tunnel: look for "Registered tunnel connection" or the configured hostname
     if [[ -z "$tunnel_url" ]] && [[ -n "$_tunnel_token" ]]; then
-      # Named tunnels emit the public hostname in the log once connected
-      tunnel_url=$(grep -oE 'https://[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' "$tunnel_log" 2>/dev/null \
-        | grep -v 'trycloudflare\|cloudflare\.com\|localhost' | head -1 || true)
-      # If no URL yet but tunnel registered successfully, use the saved URL from .env
-      if [[ -z "$tunnel_url" ]] && grep -q "Registered tunnel connection\|Connection registered" "$tunnel_log" 2>/dev/null; then
-        local _prev; _prev=$(grep "^CLOUDFLARE_TUNNEL_URL=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2 || true)
-        [[ -n "$_prev" ]] && tunnel_url="$_prev"
-      fi
+      tunnel_url="$_saved_url"
     fi
     [[ -n "$tunnel_url" ]] && break
     # Cloudflare has already rejected this quick-tunnel request. Do not wait
@@ -2157,12 +2040,11 @@ _start_cloudflare_tunnel() {
       echo "⚠️  Cloudflare rate-limited tunnel creation (429 Too Many Requests)"
       echo "   Too many tunnels were created in a short period."
       echo "   ⏳ Wait ~10 minutes, then run ./dev.sh again."
-      echo "   ℹ️  App is still accessible at http://${PROJECT_HOST}.localhost"
+      echo "   ℹ️  App is still accessible at https://${PROJECT_HOST}.localhost"
     else
       echo "⚠️  Tunnel did not start in time — running without tunnel"
       echo "   Check: tail -f $tunnel_log"
     fi
-    _clear_tunnel_urls
     return 0
   fi
 
@@ -2178,48 +2060,9 @@ _start_cloudflare_tunnel() {
   # Register the tunnel hostname with Traefik so it routes traffic correctly
   _register_tunnel_with_traefik "$tunnel_url"
 
-  # ── Wait for Metro tunnel URLs (up to 60s each) ─────────────────────────────
-  for port in "${metro_ports[@]}"; do
-    local metro_log="/tmp/${PROJECT_NAME}-metro-${port}.log"
-    local metro_attempts=0 metro_url=""
-    while [[ $metro_attempts -lt 120 ]]; do
-      metro_url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$metro_log" 2>/dev/null | head -1 || true)
-      [[ -n "$metro_url" ]] && break
-      sleep 0.5; metro_attempts=$((metro_attempts + 1))
-    done
-    if [[ -n "$metro_url" ]]; then
-      local env_key="METRO_TUNNEL_URL_${port}"
-      if grep -q "^${env_key}=" "$ROOT_DIR/.env" 2>/dev/null; then
-        _sed_inplace "s|^${env_key}=.*|${env_key}=${metro_url}|" "$ROOT_DIR/.env"
-      else
-        echo "${env_key}=${metro_url}" >> "$ROOT_DIR/.env"
-      fi
-      local _app_idx=$(( port - 8081 ))
-      local _app_name="${MOBILE_APPS[$_app_idx]:-app-${port}}"
-      echo "   📱 ${_app_name}:  $metro_url"
+  _sync_metro_tunnel_urls_from_logs
+  _ensure_metro_proxies
 
-      # Restart the Metro rewriting proxy with the now-known tunnel URL.
-      # The proxy was started earlier with an empty tunnel URL (it just forwarded
-      # without rewriting). Now we restart it with the real URL so it rewrites
-      # localhost:PORT → tunnel URL in all Metro manifest/bundle responses.
-      local metro_proxy_port=$(( port + 1000 ))
-      local metro_proxy_pid_file="/tmp/${PROJECT_NAME}-metro-proxy-${port}.pid"
-      local metro_proxy_script="/tmp/${PROJECT_NAME}-metro-proxy-${port}.py"
-      local metro_proxy_log="/tmp/${PROJECT_NAME}-metro-proxy-${port}.log"
-      # Kill the placeholder proxy
-      if [[ -f "$metro_proxy_pid_file" ]]; then
-        local _old_pp; _old_pp=$(cat "$metro_proxy_pid_file" 2>/dev/null || true)
-        [[ -n "$_old_pp" ]] && kill "$_old_pp" 2>/dev/null || true
-        rm -f "$metro_proxy_pid_file"
-      fi
-      sleep 0.2
-      # Restart with the real tunnel URL
-      nohup python3 "$metro_proxy_script" "$port" "$metro_proxy_port" \
-        "$metro_proxy_pid_file" "$metro_url" \
-        >> "$metro_proxy_log" 2>&1 &
-      disown $! 2>/dev/null || true
-    fi
-  done
 }
 
 # ── Per-project tunnel proxy ──────────────────────────────────────────────────
@@ -2472,6 +2315,8 @@ _save_tunnel_url() {
 
 # Clear all tunnel URLs from .env (used on fallback to localhost)
 _clear_tunnel_urls() {
+  # Named hostnames are configuration, not disposable quick-tunnel state.
+  if grep -q '^CLOUDFLARE_TUNNEL_TOKEN=.' "$ROOT_DIR/.env" 2>/dev/null; then return 0; fi
   if [[ -f "$ROOT_DIR/.env" ]]; then
     _sed_inplace "s|^CLOUDFLARE_TUNNEL_URL=.*|CLOUDFLARE_TUNNEL_URL=|" "$ROOT_DIR/.env" 2>/dev/null || true
     _sed_inplace '/^METRO_TUNNEL_URL_[0-9]*=/d' "$ROOT_DIR/.env" 2>/dev/null || true
@@ -2484,6 +2329,13 @@ _sync_metro_tunnel_urls_from_logs() {
   local port=8081
   for folder in "${MOBILE_APPS[@]}"; do
     local log="/tmp/${PROJECT_NAME}-metro-${port}.log"
+    local configured named_token
+    configured=$(sed -n "s/^METRO_TUNNEL_URL_${port}=//p" "$ROOT_DIR/.env" | tr -d '\r')
+    named_token=$(sed -n 's/^CLOUDFLARE_TUNNEL_TOKEN=//p' "$ROOT_DIR/.env" | tr -d '\r')
+    if [[ -n "$named_token" ]]; then
+      port=$((port + 1))
+      continue
+    fi
     if [[ -f "$log" ]]; then
       local url
       url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$log" | head -1 || true)
@@ -2554,19 +2406,29 @@ detect_compose() {
     echo "❌ podman-compose not found. Run: ./dev.sh setup"
     exit 1
   fi
-  
+
   if ! command -v podman &>/dev/null; then
     echo "❌ podman not found. Run: ./dev.sh setup"
     exit 1
   fi
-  
-  # Verify Podman machine is running
-  if ! podman machine list 2>/dev/null | grep -q "Currently running"; then
-    echo "❌ Podman machine is not running"
-    echo "   Start it with: podman machine start"
-    exit 1
+
+  # Verify Podman machine is running (macOS only)
+  # On Linux/WSL, Podman runs natively without a separate VM
+  if [[ "$OS" == "mac" ]]; then
+    if ! podman machine list 2>/dev/null | grep -q "Currently running"; then
+      echo "❌ Podman machine is not running"
+      echo "   Start it with: podman machine start"
+      exit 1
+    fi
+  else
+    # On Linux/WSL, just verify Podman is working
+    if ! podman info >/dev/null 2>&1; then
+      echo "❌ Podman is not responding"
+      echo "   Check if Podman is properly installed and running"
+      exit 1
+    fi
   fi
-  
+
   DC_CMD="podman-compose"
   _wire_podman_socket
   export CONTAINER_RUNTIME="podman"
@@ -2589,15 +2451,50 @@ detect_compose() {
 # system resolver won't auto-resolve — it needs an /etc/hosts entry.
 # This function adds the entry idempotently using sudo (prompts once if needed).
 _ensure_hosts_entry() {
-  local _local_host="${PROJECT_HOST}.localhost"
-  # Only needed when PROJECT_HOST itself contains a dot (multi-label)
-  [[ "$PROJECT_HOST" == *.* ]] || return 0
-  # Already present?
-  grep -qF "$_local_host" /etc/hosts 2>/dev/null && return 0
-  echo "🔧 Adding ${_local_host} to /etc/hosts so browsers can resolve it..."
-  sudo sh -c "echo '127.0.0.1  ${_local_host}' >> /etc/hosts" 2>/dev/null \
-    && echo "   ✅ Added — ${_local_host} now resolves to 127.0.0.1" \
-    || echo "   ⚠️  Could not update /etc/hosts automatically. Add manually:"$'\n'"      127.0.0.1  ${_local_host}"
+  # Windows host resolution is handled by dev.ps1; /etc/hosts in WSL would
+  # not change the Windows browser's resolver.
+  [[ "$OS" == "wsl" ]] && return 0
+  local _local_host _qr_host
+  _qr_host=$(basename "$ROOT_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9.-')
+  for _local_host in "${PROJECT_HOST}.localhost" "${_qr_host}.localhost"; do
+    grep -qF "$_local_host" /etc/hosts 2>/dev/null && continue
+    echo "🔧 Adding ${_local_host} to /etc/hosts so browsers can resolve it..."
+    printf '127.0.0.1  %s\n' "$_local_host" | sudo tee -a /etc/hosts >/dev/null \
+      || echo "   ⚠️  Add manually to /etc/hosts: 127.0.0.1 $_local_host"
+  done
+}
+
+_ensure_local_tls() {
+  local certdir="/tmp/traefik-dynamic/certs" host="${PROJECT_HOST}.localhost"
+  if ! command -v mkcert >/dev/null; then
+    echo "Install mkcert to enable trusted local HTTPS." >&2
+    return 1
+  fi
+  mkdir -p "$certdir"
+  mkcert -install >/dev/null 2>&1
+  if [[ ! -s "$certdir/${PROJECT_NAME}.pem" ]] || ! openssl x509 -checkend 86400 -noout -in "$certdir/${PROJECT_NAME}.pem" >/dev/null 2>&1; then
+    mkcert -cert-file "$certdir/${PROJECT_NAME}.pem" -key-file "$certdir/${PROJECT_NAME}-key.pem" "$host"
+  fi
+  # Keep certificates inside the existing shared mount, including on macOS.
+  if [[ "$OS" == "mac" ]]; then
+    podman machine ssh "mkdir -p '$certdir'"
+    for file in "${PROJECT_NAME}.pem" "${PROJECT_NAME}-key.pem"; do
+      podman machine ssh "cat > '$certdir/$file'" < "$certdir/$file"
+    done
+  fi
+  local config="tls:\n  certificates:\n    - certFile: /traefik-dynamic/certs/${PROJECT_NAME}.pem\n      keyFile: /traefik-dynamic/certs/${PROJECT_NAME}-key.pem\n"
+  if [[ "$OS" == "mac" ]]; then
+    printf '%b' "$config" | podman machine ssh "cat > '/tmp/traefik-dynamic/${PROJECT_NAME}-tls.yml'"
+  else
+    printf '%b' "$config" > "/tmp/traefik-dynamic/${PROJECT_NAME}-tls.yml"
+  fi
+  # WSL's CA store is separate from the Windows browser's current-user store.
+  if grep -qi microsoft /proc/version 2>/dev/null; then
+    local certutil="/mnt/c/Windows/System32/certutil.exe"
+    if [[ -x "$certutil" ]]; then
+      "$certutil" -user -addstore Root "$(wslpath -w "$(mkcert -CAROOT)/rootCA.pem")" >/dev/null
+    fi
+  fi
 }
 
 _ensure_global_traefik() {
@@ -2635,7 +2532,7 @@ _ensure_global_traefik() {
           break
         fi
       done
-      
+
       # Start the Podman socket service if needed
       if [[ "$_podman_socket_needed" == "true" || -z "$_sock" ]]; then
         if [[ -w /run/podman ]]; then
@@ -2647,7 +2544,7 @@ _ensure_global_traefik() {
           mkdir -p /tmp/podman-run-$(id -u)/podman
           _sock="/tmp/podman-run-$(id -u)/podman/podman.sock"
         fi
-        
+
         # Kill any existing socket service and start a new one
         pkill -f "podman system service.*${_sock}" 2>/dev/null || true
         rm -f "$_sock" 2>/dev/null || true
@@ -2694,13 +2591,20 @@ _ensure_global_traefik() {
     _endpoint_args=("--providers.docker.endpoint=unix://${_vm_sock}")
   fi
 
+  _ensure_local_tls
+
   # 3. Config fingerprint — hash of the flags we pass to Traefik.
   #    If it changes (e.g. after a dev.sh update), the container is recreated
   #    automatically. New container labels from projects are picked up live by
   #    the Docker provider — no restart needed for those.
   local _config_sig
-  _config_sig=$(echo "traefik:v3.6.5-selinux-disable-dashboard-fileprovider-http-redirect ${_vm_sock_real:-$_sock} ${_net}" | md5 -q 2>/dev/null \
-             || echo "traefik:v3.6.5-selinux-disable-dashboard-fileprovider-http-redirect ${_vm_sock_real:-$_sock} ${_net}" | md5sum 2>/dev/null | cut -d' ' -f1)
+  # Include the socket inode. If a dead socket is replaced at the same path,
+  # an existing Traefik container is still bound to the old inode and must be
+  # recreated before it can discover routes again.
+  local _sock_inode=""
+  [[ -S "$_sock" ]] && _sock_inode=$(ls -i "$_sock" 2>/dev/null | awk '{print $1}')
+  _config_sig=$(echo "traefik:v3.6.5-selinux-disable-dashboard-fileprovider-project-tls-v1 ${_vm_sock_real:-$_sock} ${_sock_inode} ${_net}" | md5 -q 2>/dev/null \
+             || echo "traefik:v3.6.5-selinux-disable-dashboard-fileprovider-project-tls-v1 ${_vm_sock_real:-$_sock} ${_sock_inode} ${_net}" | md5sum 2>/dev/null | cut -d' ' -f1)
   local _sig_label
   _sig_label=$(podman inspect "$_cname" \
     --format '{{index .Config.Labels "dev.kiro.config-sig"}}' 2>/dev/null || true)
@@ -2752,9 +2656,6 @@ _ensure_global_traefik() {
         --api.insecure=true \
         --entrypoints.web.address=:80 \
         --entrypoints.websecure.address=:443 \
-        --entrypoints.websecure.http.redirections.entryPoint.to=web \
-        --entrypoints.websecure.http.redirections.entryPoint.scheme=http \
-        --entrypoints.websecure.http.redirections.entryPoint.permanent=false \
         --entrypoints.traefik.address=:8080 \
         --entrypoints.web.transport.respondingTimeouts.readTimeout=0 \
         --entrypoints.web.transport.respondingTimeouts.writeTimeout=0 \
@@ -2878,580 +2779,9 @@ ensure_podman_running() {
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-# ── Template sync ─────────────────────────────────────────────────────────────
-# Syncs structural files from the configured template repo (Ezodis/EliteCar.app).
-#
-# OWNERSHIP MODEL — fully dynamic, zero hardcoded file names:
-#
-#   Template owns  → every file that exists in the template repo tree,
-#                    EXCEPT paths listed in _SYNC_PROJECT_PATHS below.
-#                    When the template is restructured, sync just picks it up.
-#
-#   Project owns   → (a) anything in _SYNC_PROJECT_PATHS (path-prefix match)
-#                    (b) any file that exists locally but not in the template
-#                    These are NEVER touched by sync, no matter what.
-#
-# Configure:
-#   _SYNC_TEMPLATE_REPO   — source repo
-#   _SYNC_PROJECT_PATHS   — path prefixes owned by this project.
-#                           Anything under these prefixes is skipped even if
-#                           the template has a file at the same path.
-#                           Exact file paths are also supported.
-# ─────────────────────────────────────────────────────────────────────────────
-_SYNC_TEMPLATE_REPO="Ezodis/EliteCar.app"
-
-# Path prefixes (or exact paths) that belong to THIS project, not the template.
-# Use trailing / for directories, exact path for single files.
-# These are skipped even if the template repo contains them.
-#
-# Keep this list GENERIC — project-specific app dirs (backend/myapp/, etc.)
-# are auto-discovered from backend/project.py → SYNC_PROJECT_PATHS below.
-# Only add paths here that every project should always protect.
-_SYNC_PROJECT_PATHS=(
-  # backend — project-specific config (apps are auto-discovered via project.py below)
-  "backend/project.py"          # project settings + COMPOSE_SERVICES
-  "backend/media/"              # uploaded files (never in template)
-  # frontend/web — project pages and assets
-  "frontend/web/app/"           # Next.js pages, layouts, components
-  "frontend/web/public/"        # project assets (images, icons, etc.)
-)
-
-# Merge extra protected paths from backend/project.py (SYNC_PROJECT_PATHS list).
-# Add project-specific paths there so this file stays a shared template.
-_extra_sync_paths=$(python3 - "$ROOT_DIR/backend/project.py" 2>/dev/null <<'EXTRACT_SYNC_EOF'
-import ast, sys, os
-src = sys.argv[1]
-try:
-    tree = ast.parse(open(src).read())
-except Exception:
-    sys.exit(0)
-for node in ast.walk(tree):
-    if isinstance(node, ast.Assign):
-        for t in node.targets:
-            if isinstance(t, ast.Name) and t.id == "SYNC_PROJECT_PATHS":
-                if isinstance(node.value, (ast.List, ast.Tuple)):
-                    for elt in node.value.elts:
-                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                            print(elt.value)
-EXTRACT_SYNC_EOF
-)
-while IFS= read -r _extra_path; do
-  [[ -n "$_extra_path" ]] && _SYNC_PROJECT_PATHS+=("$_extra_path")
-done <<< "$_extra_sync_paths"
-unset _extra_sync_paths _extra_path
-
-_run_sync() {
-  local _dry=false _yes=false
-  for _a in "$@"; do
-    case "$_a" in
-      --dry-run) _dry=true ;;
-      --yes|-y)  _yes=true ;;
-    esac
-  done
-
-  local R='\033[0;31m' Y='\033[1;33m' G='\033[0;32m' C='\033[0;36m' B='\033[1m' Z='\033[0m'
-
-  command -v curl    &>/dev/null || { echo "❌  curl is required";    return 1; }
-  command -v python3 &>/dev/null || { echo "❌  python3 is required"; return 1; }
-
-  # ── Fetch template repo tree (single API call) ─────────────────────────────
-  echo -e "${B}🔄  Fetching template tree (${_SYNC_TEMPLATE_REPO})...${Z}"
-  local _tree
-  _tree=$(curl -sf "https://api.github.com/repos/${_SYNC_TEMPLATE_REPO}/git/trees/HEAD?recursive=1")
-  if [[ -z "$_tree" ]]; then
-    echo -e "${R}❌  Could not reach GitHub API. Check your internet connection.${Z}"
-    return 1
-  fi
-  local _sha
-  _sha=$(echo "$_tree" | python3 -c "import json,sys; print(json.load(sys.stdin).get('sha','?')[:7])" 2>/dev/null)
-  echo -e "   Repo at commit ${C}${_sha}${Z}"
-
-  # All blob paths in the template, sorted by two-level group for clean display
-  local _template_files
-  _template_files=$(echo "$_tree" | python3 -c "
-import json, sys
-def grp(p):
-    parts = p.split('/')
-    if len(parts) == 1: return ('root', p)
-    if len(parts) == 2: return (parts[0], p)
-    return (parts[0]+'/'+parts[1], p)
-files = [i['path'] for i in json.load(sys.stdin).get('tree', []) if i.get('type') == 'blob']
-files.sort(key=grp)
-print('\n'.join(files))
-")
-
-  # ── Helpers ────────────────────────────────────────────────────────────────
-  # Returns 0 (true) if path is project-owned and should be skipped
-  _sync_is_project_owned() {
-    local _f="$1"
-    for _p in "${_SYNC_PROJECT_PATHS[@]}"; do
-      # trailing / → prefix match; otherwise exact match
-      if [[ "$_p" == */ ]]; then
-        [[ "$_f" == "$_p"* ]] && return 0
-      else
-        [[ "$_f" == "$_p" ]] && return 0
-      fi
-    done
-    return 1
-  }
-
-  _sync_b64_decode() {
-    if base64 --version 2>&1 | grep -q GNU 2>/dev/null; then
-      echo "$1" | tr -d '\n' | base64 -d
-    else
-      echo "$1" | tr -d '\n' | base64 -D
-    fi
-  }
-
-  # Smart-merge requirements/*.txt:
-  #   - Everything ABOVE "# Project-specific integrations" comes from the template
-  #   - Everything FROM that marker downward is kept from the local file untouched
-  #   - If the local file has no marker, the whole file is overwritten (first run)
-  _sync_merge_requirements() {
-    local _lpath="$1" _remote="$2"
-    local _marker="# Project-specific integrations"
-    # If local file doesn't exist or has no marker → use remote as-is
-    if [[ ! -f "$_lpath" ]] || ! grep -qF "$_marker" "$_lpath" 2>/dev/null; then
-      printf '%s' "$_remote"; return
-    fi
-    python3 - "$_lpath" "$_marker" <<PYEOF
-import sys
-lpath   = sys.argv[1]
-marker  = sys.argv[2]
-remote  = sys.stdin.read()
-
-local_lines = open(lpath, encoding='utf-8', errors='replace').read().splitlines(keepends=True)
-
-# Find where the project-specific section starts in the local file
-project_start = None
-for i, line in enumerate(local_lines):
-    if line.rstrip('\r\n') == marker or line.rstrip('\r\n').startswith(marker):
-        project_start = i
-        break
-
-# Find where the template section ends in the remote content
-remote_lines = remote.splitlines(keepends=True)
-remote_top_end = None
-for i, line in enumerate(remote_lines):
-    if line.rstrip('\r\n') == marker or line.rstrip('\r\n').startswith(marker):
-        remote_top_end = i
-        break
-
-if project_start is None or remote_top_end is None:
-    # No marker in one of them — just use remote
-    sys.stdout.write(remote)
-else:
-    # Template top + local project-specific section
-    top = ''.join(remote_lines[:remote_top_end])
-    bottom = ''.join(local_lines[project_start:])
-    # Ensure single blank line between sections
-    result = top.rstrip('\n') + '\n\n' + bottom.lstrip('\n')
-    sys.stdout.write(result)
-PYEOF
-  }
-
-  # Smart-merge package.json: keep local deps/name/version, sync everything else
-  _sync_merge_pkg() {
-    local _lpath="$1" _remote="$2"
-    python3 - "$_lpath" <<PYEOF
-import json, sys, os
-lpath = sys.argv[1]
-try:
-    local = json.load(open(lpath))
-except Exception:
-    local = {}
-try:
-    remote = json.loads("""${_remote//\"/\\\"}""")
-except Exception:
-    print(open(lpath).read() if os.path.exists(lpath) else "{}"); sys.exit()
-merged = dict(remote)
-for k in ("dependencies", "devDependencies", "peerDependencies", "name", "version", "private"):
-    if k in local:
-        merged[k] = local[k]
-print(json.dumps(merged, indent=2))
-PYEOF
-  }
-
-  # Derive a display group from a file path:
-  #   root-level files          → "root"
-  #   single-level dirs         → that dir  (e.g. ".github", "backend", "frontend")
-  #   two-level dirs            → two levels (e.g. "frontend/web", "backend/config")
-  #   deeper                    → same two-level prefix
-  _sync_group_for() {
-    local _f="$1"
-    local _parts; IFS='/' read -ra _parts <<< "$_f"
-    case ${#_parts[@]} in
-      1) echo "root" ;;
-      2) echo "${_parts[0]}" ;;
-      *) echo "${_parts[0]}/${_parts[1]}" ;;
-    esac
-  }
-
-  # ── Process every template-owned file ─────────────────────────────────────
-  local _prev_group="" _group_files=() _group_contents=() _group_dirty=false
-  local _total_updated=0 _total_skipped=0 _total_unchanged=0
-
-  _sync_flush_group() {
-    [[ ${#_group_files[@]} -eq 0 ]] && { _group_dirty=false; return; }
-    if $_group_dirty && ! $_dry; then
-      local _apply=false
-      if $_yes; then
-        _apply=true
-      else
-        echo ""
-        read -r -p "   Apply changes to '${_prev_group}'? [y/N/s(skip)] " _ans
-        case "$_ans" in [Yy]*) _apply=true ;; [Ss]*) echo -e "   ${Y}⊘  skipped${Z}" ;; esac
-      fi
-      if $_apply; then
-        for _j in "${!_group_files[@]}"; do
-          local _dest="$ROOT_DIR/${_group_files[$_j]}"
-          mkdir -p "$(dirname "$_dest")"
-          printf '%s' "${_group_contents[$_j]}" > "$_dest"
-          echo -e "   ${G}✔  written:   ${_group_files[$_j]}${Z}"
-          (( _total_updated++ ))
-        done
-      else
-        (( _total_skipped += ${#_group_files[@]} ))
-      fi
-    elif $_dry && $_group_dirty; then
-      echo -e "   ${Y}(dry-run — no files written)${Z}"
-      (( _total_skipped += ${#_group_files[@]} ))
-    fi
-    _group_files=(); _group_contents=(); _group_dirty=false
-  }
-
-  while IFS= read -r _rf; do
-    local _group; _group=$(_sync_group_for "$_rf")
-
-    if [[ "$_group" != "$_prev_group" ]]; then
-      _sync_flush_group
-      echo ""
-      echo -e "${B}━━━  ${_group}  ━━━${Z}"
-      _prev_group="$_group"
-    fi
-
-    # Skip project-owned paths
-    if _sync_is_project_owned "$_rf"; then
-      echo -e "   ${Y}⊘  project:   ${_rf}${Z}"
-      (( _total_skipped++ )); continue
-    fi
-
-    local _lpath="$ROOT_DIR/$_rf"
-
-    # Fetch file content from GitHub
-    local _info
-    _info=$(curl -sf "https://api.github.com/repos/${_SYNC_TEMPLATE_REPO}/contents/${_rf}" 2>/dev/null)
-    if [[ -z "$_info" ]]; then
-      echo -e "   ${R}⚠  fetch failed: ${_rf}${Z}"; continue
-    fi
-    local _b64
-    _b64=$(echo "$_info" | python3 -c "import json,sys; print(json.load(sys.stdin).get('content','').replace('\n',''))" 2>/dev/null)
-    local _remote; _remote=$(_sync_b64_decode "$_b64")
-
-    # package.json → smart merge; requirements/*.txt → smart merge; everything else → overwrite
-    local _effective="$_remote"
-    if [[ "$_rf" == *"/package.json" || "$_rf" == "package.json" ]] && [[ -f "$_lpath" ]]; then
-      _effective=$(_sync_merge_pkg "$_lpath" "$_remote")
-    elif [[ "$_rf" == backend/requirements/*.txt ]]; then
-      _effective=$(_sync_merge_requirements "$_lpath" "$_remote")
-    fi
-
-    # Compare with local
-    if [[ -f "$_lpath" ]]; then
-      local _local; _local=$(cat "$_lpath")
-      if [[ "$_local" == "$_effective" ]]; then
-        echo -e "   ${G}✓  unchanged: ${_rf}${Z}"
-        (( _total_unchanged++ )); continue
-      fi
-      echo -e "   ${C}~  changed:   ${_rf}${Z}"
-      if ! $_yes && ! $_dry; then
-        diff <(echo "$_local") <(echo "$_effective") 2>/dev/null | head -50 \
-          | sed $'s/^-/\033[31m-/; s/^+/\033[32m+/; s/$/\033[0m/'
-      fi
-    else
-      echo -e "   ${C}+  new file:  ${_rf}${Z}"
-    fi
-
-    _group_dirty=true
-    _group_files+=("$_rf")
-    _group_contents+=("$_effective")
-
-  done <<< "$_template_files"
-
-  _sync_flush_group  # flush last group
-
-  # ── Summary ────────────────────────────────────────────────────────────────
-  local _tmpl_count; _tmpl_count=$(echo "$_template_files" | wc -l | tr -d ' ')
-  echo ""
-  echo -e "${B}━━━  Summary  ━━━${Z}"
-  echo -e "   Template repo:   ${_SYNC_TEMPLATE_REPO} @ ${_sha}"
-  echo -e "   Template files:  ${_tmpl_count} total"
-  echo -e "   Project paths:   ${#_SYNC_PROJECT_PATHS[@]} prefixes protected (app code, assets, project config)"
-  echo ""
-  echo -e "   ${G}✔  updated:   ${_total_updated}${Z}"
-  echo -e "   ${Y}⊘  skipped:   ${_total_skipped}${Z}"
-  echo -e "   ${G}✓  unchanged: ${_total_unchanged}${Z}"
-  $_dry && echo -e "   ${Y}(dry-run — nothing written)${Z}"
-  echo ""
-}
-
-# ── sync push (reverse sync) ──────────────────────────────────────────────────
-# Copies template-owned files FROM this project INTO the local template repo,
-# then opens it in your editor so you can review the diff and push yourself.
-#
-# Uses the same _SYNC_PROJECT_PATHS ownership rules as `sync pull` — any file
-# that `./dev.sh sync` would pull from the template is a candidate to push back.
-#
-# Usage:
-#   ./dev.sh sync push                  → auto-detected sibling Django-Next.js clone
-#   ./dev.sh sync push --dir <path>     → use a specific local clone path
-# ─────────────────────────────────────────────────────────────────────────────
-_run_push_template() {
-  # Auto-detect the template repo clone — no --dir needed in typical setups.
-  # Search order:
-  #   1. Sibling directory matching the template repo name (works when all projects
-  #      sit in the same parent folder, e.g. C:\edy.chat\ or ~/projects/)
-  #   2. ~/<template-repo-name>  (legacy macOS default)
-  local _parent_dir; _parent_dir="$(dirname "$ROOT_DIR")"
-  local _clone_dir=""
-  local _repo_dirname; _repo_dirname=$(basename "$_SYNC_TEMPLATE_REPO")  # e.g., "EliteCar.app"
-
-  # Candidate locations in priority order
-  local _candidates=(
-    "$_parent_dir/$_repo_dirname"
-    "$HOME/$_repo_dirname"
-  )
-  for _c in "${_candidates[@]}"; do
-    if [[ -d "$_c/.git" ]]; then
-      _clone_dir="$_c"
-      break
-    fi
-  done
-  # Default to sibling path even if it doesn't exist yet (error message below will guide)
-  [[ -z "$_clone_dir" ]] && _clone_dir="$_parent_dir/$_repo_dirname"
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --dir) _clone_dir="$2"; shift 2 ;;
-      *) shift ;;
-    esac
-  done
-
-  local R='\033[0;31m' Y='\033[1;33m' G='\033[0;32m' C='\033[0;36m' B='\033[1m' Z='\033[0m'
-
-  command -v git     &>/dev/null || { echo "❌  git is required";    return 1; }
-  command -v python3 &>/dev/null || { echo "❌  python3 is required"; return 1; }
-
-  if [[ ! -d "$_clone_dir/.git" ]]; then
-    echo -e "${R}❌  No git repo found at ${_clone_dir}${Z}"
-    echo -e "   Clone it first:  git clone https://github.com/${_SYNC_TEMPLATE_REPO}.git ${_clone_dir}"
-    return 1
-  fi
-
-  # Show uncommitted changes already in the template repo (informational only — no prompt)
-  local _existing_changes
-  _existing_changes=$(git -C "$_clone_dir" status --porcelain 2>/dev/null)
-  if [[ -n "$_existing_changes" ]]; then
-    echo -e "${Y}ℹ  Template repo has uncommitted changes — will overwrite with project files:${Z}"
-    echo "$_existing_changes" | sed 's/^/   /'
-    echo ""
-  fi
-
-  local _clone_sha; _clone_sha=$(git -C "$_clone_dir" rev-parse --short HEAD 2>/dev/null)
-  echo -e "${B}📤  Pushing template files from this project → ${_clone_dir}${Z}"
-  echo -e "   Template at ${C}${_clone_sha}${Z}  |  Project: ${C}${ROOT_DIR}${Z}"
-  echo ""
-
-  # ── Build the file list from the PROJECT (not the template clone) ─────────
-  # This ensures new files (e.g. dev.ps1) that don't exist in the template yet
-  # are also pushed. We skip directories/files that are project-owned, git-
-  # ignored in the project, or in well-known skip dirs.
-  #
-  # We still read the template clone's git ls-files so we can mark files that
-  # exist in the template but are missing from the project ("not here").
-  local _clone_files
-  _clone_files=$(git -C "$_clone_dir" ls-files 2>/dev/null || true)
-
-  # Build the combined file list: union of clone files + project files,
-  # sorted by two-level group for clean display.
-  local _all_files
-  _all_files=$(python3 - "$ROOT_DIR" "$_clone_dir" <<'PYEOF'
-import sys, os
-
-root       = sys.argv[1]
-clone_dir  = sys.argv[2]
-
-SKIP_DIRS = {
-    '.git', '__pycache__', 'node_modules', '.expo', 'staticfiles',
-    'migrations', 'venv', '.venv', 'dist', 'build', '.next', 'coverage',
-    'media', 'backup', '.docker', 'builds', '.pytest_cache',
-}
-SKIP_FILES = {'.env', '.env.local', '.env.production', '.db_restored'}
-
-def walk_project(root):
-    results = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        # Prune skipped dirs in-place
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for fname in filenames:
-            if fname in SKIP_FILES:
-                continue
-            full = os.path.join(dirpath, fname)
-            rel  = os.path.relpath(full, root).replace(os.sep, '/')
-            results.append(rel)
-    return results
-
-# Clone files (may include files not present in project)
-clone_set = set()
-try:
-    clone_set = set(open(os.path.join(clone_dir, '.git', 'info', 'exclude')).read().splitlines())
-except Exception:
-    pass
-try:
-    import subprocess
-    out = subprocess.check_output(['git', '-C', clone_dir, 'ls-files'], text=True)
-    clone_set = set(out.splitlines())
-except Exception:
-    pass
-
-project_files = set(walk_project(root))
-all_files = project_files | clone_set
-
-def grp(p):
-    parts = p.split('/')
-    if len(parts) == 1: return ('root', p)
-    if len(parts) == 2: return (parts[0], p)
-    return (parts[0]+'/'+parts[1], p)
-
-sorted_files = sorted(all_files, key=grp)
-print('\n'.join(sorted_files))
-PYEOF
-)
-
-  # ── Copy project → clone ───────────────────────────────────────────────────
-  local _total_copied=0 _total_skipped=0 _total_unchanged=0 _total_missing=0
-  local _total_new=0 _prev_group=""
-
-  _push_is_project_owned() {
-    local _f="$1"
-    for _p in "${_SYNC_PROJECT_PATHS[@]}"; do
-      if [[ "$_p" == */ ]]; then
-        [[ "$_f" == "$_p"* ]] && return 0
-      else
-        [[ "$_f" == "$_p" ]] && return 0
-      fi
-    done
-    return 1
-  }
-
-  _push_group_for() {
-    local _parts; IFS='/' read -ra _parts <<< "$1"
-    case ${#_parts[@]} in
-      1) echo "root" ;;
-      2) echo "${_parts[0]}" ;;
-      *) echo "${_parts[0]}/${_parts[1]}" ;;
-    esac
-  }
-
-  while IFS= read -r _tf; do
-    [[ -z "$_tf" ]] && continue
-    local _group; _group=$(_push_group_for "$_tf")
-    if [[ "$_group" != "$_prev_group" ]]; then
-      echo -e "${B}━━━  ${_group}  ━━━${Z}"
-      _prev_group="$_group"
-    fi
-
-    if _push_is_project_owned "$_tf"; then
-      echo -e "   ${Y}⊘  project:   ${_tf}${Z}"
-      (( _total_skipped++ )); continue
-    fi
-
-    # Also skip any backend app dir (has __init__.py) that isn't config/
-    # These are project-specific Django apps, never template files
-    if [[ "$_tf" == backend/*/  ]] || [[ "$_tf" =~ ^backend/([^/]+)/ ]]; then
-      local _app_dir="${BASH_REMATCH[1]}"
-      if [[ "$_app_dir" != "config" && "$_app_dir" != "backup" && "$_app_dir" != "requirements" ]] \
-         && [[ -f "$ROOT_DIR/backend/${_app_dir}/__init__.py" ]]; then
-        echo -e "   ${Y}⊘  app:        ${_tf}${Z}"
-        (( _total_skipped++ )); continue
-      fi
-    fi
-
-    local _src="$ROOT_DIR/$_tf"
-    local _dst="$_clone_dir/$_tf"
-
-    # File exists in template clone but not in this project — keep template version
-    if [[ ! -f "$_src" ]]; then
-      echo -e "   ${Y}?  not here:  ${_tf}  (template version kept)${Z}"
-      (( _total_missing++ )); continue
-    fi
-
-    # New file — doesn't exist in clone yet
-    if [[ ! -f "$_dst" ]]; then
-      mkdir -p "$(dirname "$_dst")"
-      cp "$_src" "$_dst"
-      echo -e "   ${C}+  new file:  ${_tf}${Z}"
-      (( _total_new++ )); (( _total_copied++ )); continue
-    fi
-
-    # Existing file — check if changed
-    if cmp -s "$_src" "$_dst" 2>/dev/null; then
-      echo -e "   ${G}✓  unchanged: ${_tf}${Z}"
-      (( _total_unchanged++ )); continue
-    fi
-
-    mkdir -p "$(dirname "$_dst")"
-    cp "$_src" "$_dst"
-    echo -e "   ${C}~  updated:   ${_tf}${Z}"
-    (( _total_copied++ ))
-
-  done <<< "$_all_files"
-
-  echo ""
-
-  # ── Summary + diff stat ────────────────────────────────────────────────────
-  local _diff_stat
-  _diff_stat=$(git -C "$_clone_dir" diff --stat 2>/dev/null)
-
-  echo -e "${B}━━━  Result  ━━━${Z}"
-  echo -e "   ${C}+  new files: ${_total_new}${Z}"
-  echo -e "   ${C}~  updated:   $(( _total_copied - _total_new ))${Z}"
-  echo -e "   ${G}✓  unchanged: ${_total_unchanged}${Z}"
-  echo -e "   ${Y}⊘  project:   ${_total_skipped}${Z}"
-  [[ $_total_missing -gt 0 ]] && echo -e "   ${Y}?  not here:  ${_total_missing}${Z}"
-  echo ""
-
-  if [[ -z "$_diff_stat" ]] && [[ $_total_copied -eq 0 ]]; then
-    echo -e "${G}✅  Template clone is already up to date — nothing to commit.${Z}"
-    echo ""
-    return 0
-  fi
-
-  if [[ -n "$_diff_stat" ]]; then
-    echo -e "${B}━━━  Changed files  ━━━${Z}"
-    echo "$_diff_stat" | sed 's/^/   /'
-    echo ""
-  fi
-
-  # ── Open in editor ────────────────────────────────────────────────────────
-  echo -e "${B}━━━  Opening ${_clone_dir} in your editor...  ━━━${Z}"
-  if command -v cursor &>/dev/null; then
-    cursor "$_clone_dir" 2>/dev/null &
-  elif command -v code &>/dev/null; then
-    code "$_clone_dir" 2>/dev/null &
-  else
-    echo -e "   (no editor found — open ${_clone_dir} manually)"
-  fi
-
-  echo ""
-  echo -e "   Review the diff, then commit and push:"
-  echo -e "   ${C}cd ${_clone_dir}${Z}"
-  echo -e "   ${C}git diff${Z}                   # full diff"
-  echo -e "   ${C}git add -p${Z}                 # stage selectively"
-  echo -e "   ${C}git commit -m 'your msg'${Z}"
-  echo -e "   ${C}git push${Z}"
-  echo ""
-}
+# Template sync is handled by config/project_config.py before bootstrap above.
+# Pull uses the configured sibling template checkout when present, otherwise GitHub.
+# Push copies shared files into that checkout for review, commit, and publication.
 
 CMD="${1:-}"
 
@@ -3461,23 +2791,10 @@ if [[ "$CMD" == "setup" ]]; then
   exit 0
 fi
 
-if [[ "$CMD" == "sync" ]]; then
-  if [[ "${2:-}" == "push" ]]; then
-    set +e
-    _run_push_template "${@:3}"
-    set -e
-  else
-    set +e
-    _run_sync "${@:2}"
-    set -e
-  fi
-  exit 0
-fi
-
 # Commands that don't need dependency checks or app discovery preamble
 _SKIP_SETUP=false
 case "$CMD" in
-  status|logs|down|stop|rebuild|disk|_status_only|service-logs|sync) _SKIP_SETUP=true ;;
+  status|logs|down|stop|rebuild|disk|_status_only|_metro_tunnels_only|service-logs|sync) _SKIP_SETUP=true ;;
   # ios/android only need Xcode/ADB/Node — no Podman, no Docker deps
   ios|android) _SKIP_SETUP=true ;;
 esac
@@ -3779,7 +3096,7 @@ if [[ "$CMD" == "stop" || "$CMD" == "down" ]]; then
     # Also snapshot total free space on the main volume before deletion,
     # so we can compute a real delta if the above returns 0.
     _DF_FREE_BEFORE=$(df -k / 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
-    
+
     echo "🛑 Stopping ALL Podman services (all projects)..."
 
     # Stop global infrastructure containers (traefik) gracefully first
@@ -3794,7 +3111,7 @@ if [[ "$CMD" == "stop" || "$CMD" == "down" ]]; then
     podman network rm traefik 2>/dev/null || true
     # Clean up traefik dynamic config directory
     rm -rf /tmp/traefik-dynamic 2>/dev/null || true
-    
+
     # On Linux/WSL: prune all images, volumes and build cache BEFORE killing
     # Podman — podman system prune requires the daemon to be alive.
     if [[ "$OS" == "linux" || "$OS" == "wsl" ]]; then
@@ -3808,7 +3125,7 @@ if [[ "$CMD" == "stop" || "$CMD" == "down" ]]; then
     pkill -9 -f "gvproxy.*podman-machine" 2>/dev/null || true
     pkill -9 podman 2>/dev/null || true
     sleep 1
-    
+
     echo "✅ All services stopped."
   else
     _wire_podman_socket
@@ -3823,7 +3140,7 @@ if [[ "$CMD" == "stop" || "$CMD" == "down" ]]; then
     if [[ "$CMD" == "down" ]]; then
       _SPACE_BEFORE=$(_measure_project_storage_kb 2>/dev/null || echo "0")
     fi
-    
+
     echo "🛑 Stopping ${PROJECT_NAME} services..."
     # Scope stop to this project only — never touch containers from other projects.
     # Use -t 1 for 1 second timeout, then force kill. Much faster than default 10s per container.
@@ -3858,7 +3175,7 @@ if [[ "$CMD" == "stop" || "$CMD" == "down" ]]; then
       if command -v podman-compose &>/dev/null; then
         detect_compose
       fi
-      
+
       echo "🗑️  Removing project images and volumes..."
       # Remove project-specific images
       podman images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
@@ -3878,13 +3195,13 @@ if [[ "$CMD" == "stop" || "$CMD" == "down" ]]; then
 
       echo "🗑️  Cleaning temporary files..."
       rm -f "/tmp/${PROJECT_NAME}-mobile-compose.yml" "/tmp/${PROJECT_NAME}-compose.log" "/tmp/${PROJECT_NAME}-mobile.log" 2>/dev/null || true
-      
+
       # Clean up any build artifacts in the project directory
       [[ -d "$ROOT_DIR/backend/__pycache__" ]] && rm -rf "$ROOT_DIR/backend/__pycache__" || true
       [[ -d "$ROOT_DIR/backend/.pytest_cache" ]] && rm -rf "$ROOT_DIR/backend/.pytest_cache" || true
       find "$ROOT_DIR/backend" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
       find "$ROOT_DIR/backend" -type f -name "*.pyc" -delete 2>/dev/null || true
-      
+
       # Clean up node_modules caches if they exist
       if [[ -d "$ROOT_DIR/frontend" ]]; then
         find "$ROOT_DIR/frontend" -type d -name ".expo" -exec rm -rf {} + 2>/dev/null || true
@@ -4115,7 +3432,7 @@ gen_mobile_yaml() {
     echo "    tty: true"
     port=$((port + 1))
   done
-  
+
   # Generate top-level volumes section for all mobile services
   echo ""
   echo "volumes:"
@@ -4497,6 +3814,11 @@ dc_up_ordered() {
            "$ROOT_DIR/backend/media" \
            "$ROOT_DIR/backend/config/staticfiles" 2>/dev/null || true
 
+  # On WSL without systemd Podman does not schedule health checks itself. Start
+  # the fallback before waiting for db/redis; otherwise every launch burns the
+  # full 60-second infrastructure wait even though both services are ready.
+  _start_healthcheck_runner
+
   # ── Stage 1: infrastructure (db + redis) ──────────────────────────────────
   local _infra_svcs=()
   while IFS=' ' read -r _s _p _cn; do
@@ -4675,9 +3997,14 @@ _parse_compose_services() {
     '    if re.match(r"^services\s*:", stripped):' \
     '        in_services = True; indent_services = indent' \
     '        in_ports = False; in_profiles = False; continue' \
+    '    # A Compose document can contain arbitrary top-level sections. Once' \
+    '    # another one begins, none of its child keys are container services.' \
+    '    if in_services and indent <= indent_services:' \
+    '        in_services = False; current_svc = None' \
+    '        in_ports = False; in_profiles = False; continue' \
     '    if not in_services:' \
     '        continue' \
-    '    svc_match = re.match(r"^  (\w[\w-]*)\s*:", stripped)' \
+    '    svc_match = re.match(r"\s+(\w[\w-]*)\s*:", stripped)' \
     '    if svc_match and indent == indent_services + 2:' \
     '        current_svc = svc_match.group(1)' \
     '        if current_svc not in ("volumes", "networks", "configs", "secrets"):' \
@@ -4722,6 +4049,17 @@ _parse_compose_services() {
     '    print(f"{svc} {port} {cname}")' \
     > "$_s"
   python3 "$_s" "$COMPOSE_FILE"
+
+  # Project-specific Compose snippets are separate files and therefore are not
+  # visible to the dev.yml parser above. Include their always-on services so
+  # ordered startup, health reporting, and rebuild commands can manage them.
+  local _i _extra_file
+  for ((_i=0; _i<${#COMPOSE_F[@]}; _i++)); do
+    [[ "${COMPOSE_F[$_i]}" == "-f" ]] || continue
+    _extra_file="${COMPOSE_F[$((_i + 1))]:-}"
+    [[ -f "$_extra_file" && "$_extra_file" != "$COMPOSE_FILE" ]] || continue
+    python3 "$_s" "$_extra_file"
+  done
   rm -f "$_s"
 }
 
@@ -4748,7 +4086,7 @@ _draw_status() {
 
   local _row_idx=1
   local _lw=16
-  
+
   # Use a simple string to track seen services
   local seen_services=""
 
@@ -4759,7 +4097,7 @@ _draw_status() {
       return
     fi
     seen_services="$seen_services|$label|"
-    
+
     local state health dot color badge
     state=$(podman inspect --format '{{.State.Status}}' "$cname" 2>/dev/null || echo "missing")
     health=$(podman inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' "$cname" 2>/dev/null || echo "-")
@@ -4812,6 +4150,201 @@ _draw_status() {
   printf "\n  \033[2mCtrl+C quit  •  ./dev.sh logs <name>\033[0m\n\n"
 }
 
+_print_mobile_qrs() {
+  discover_apps
+  local port=8081 app scheme local_url remote_url url label payload
+  local lan_ip; lan_ip=$(_get_lan_ip)
+  for app in "${MOBILE_APPS[@]}"; do
+    # Evaluate the same config that generates the installed development client.
+    scheme=$(EXPO_PUBLIC_ENV=development node - "$MOBILE_DIR/$app" <<'QR_SCHEME'
+const fs = require('fs'), path = require('path');
+const dir = process.argv[2];
+let cfg = JSON.parse(fs.readFileSync(path.join(dir, 'app.json'), 'utf8'));
+const dynamic = path.join(dir, 'app.config.js');
+if (fs.existsSync(dynamic)) {
+  const value = require(dynamic);
+  cfg = typeof value === 'function' ? value({config: cfg.expo || cfg}) : value;
+}
+cfg = cfg.expo || cfg;
+console.log(Array.isArray(cfg.scheme) ? cfg.scheme[0] : cfg.scheme || `exp+${cfg.slug}`);
+QR_SCHEME
+    ) || { echo "Cannot read Expo scheme for $app"; port=$((port + 1)); continue; }
+    local_url="http://${lan_ip}:${port}"
+    remote_url=$(sed -n "s/^METRO_TUNNEL_URL_${port}=//p" "$ROOT_DIR/.env" | tr -d '\r')
+    printf '\n  %s — SCAN WITH THE DEVELOPMENT APP INSTALLED\n' "$app"
+    for label in LOCAL REMOTE; do
+      url="$local_url"; [[ "$label" == REMOTE ]] && url="$remote_url"
+      printf '\n  %s: %s\n' "$label" "${url:-Tunnel unavailable; retry ./dev.sh qr}"
+      [[ -n "$url" ]] || continue
+      payload=$(python3 -c 'import sys,urllib.parse; print(sys.argv[1]+"://expo-development-client/?url="+urllib.parse.quote(sys.argv[2],safe=""))' "$scheme" "$url")
+      printf '  %s\n' "$payload"
+      if command -v qrencode >/dev/null; then
+        qrencode -t ANSIUTF8 -m 3 "$payload"
+      else
+        echo "  Install qrencode to display this QR (apt install qrencode / brew install qrencode)."
+      fi
+    done
+    port=$((port + 1))
+  done
+}
+
+_qr_page_link() {
+  local root="$1" app="${2:-}" project state url host config dest port
+  [[ -d "$root/frontend/mobile" ]] || return 1
+  project=$(basename "$root" | tr -cd 'a-zA-Z0-9' | tr '[:upper:]' '[:lower:]')
+  host=$(basename "$root" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9.-')
+  host="${host}.localhost"
+  # The link is stable even while the local QR service is recovering.
+  printf 'http://%s/qr' "$host"
+  if [[ -n "$app" ]]; then
+    printf '/%s' "$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1].lower().replace(" ", "-"), safe=""))' "$app")"
+  fi
+  state="/tmp/${project}-qr-server-v3.url"
+  url=$(cat "$state" 2>/dev/null || true)
+  if [[ -z "$url" ]] || ! curl -fs --max-time 1 "$url/health" >/dev/null 2>&1; then
+    rm -f "$state"
+    # Keep the helper source in this entry point; only the runtime copy lives in /tmp.
+    local qr_script="/tmp/${project}-qr-server.py"
+    cat > "$qr_script" <<'QR_SERVER_PY'
+"""Serve project-local development-client QR codes for the live monitor."""
+import html
+import json
+import os
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import quote, unquote, urlparse
+
+
+def main():
+    root, state = map(Path, sys.argv[1:3])
+    lan_ip = sys.argv[3]
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            path = unquote(urlparse(self.path).path)
+            if path == '/health':
+                self.respond('ok', 'text/plain')
+                return
+            apps = sorted((p for p in (root / 'frontend/mobile').iterdir()
+                           if (p / 'app.json').is_file()), key=lambda p: p.name.lower())
+            selected = apps if path.rstrip('/') == '/qr' else [
+                p for p in apps if path == '/qr/' + p.name.lower().replace(' ', '-')]
+            if not selected:
+                self.send_error(404)
+                return
+            try:
+                sections = ''.join(self.app_section(app, apps) for app in selected)
+                project = html.escape(root.name)
+                self.respond('<!doctype html><html lang="en"><meta charset="utf-8">'
+                             '<meta name="viewport" content="width=device-width, initial-scale=1">'
+                             f'<title>{project} · Mobile Apps</title><style>'
+                             ':root{color-scheme:dark}*{box-sizing:border-box}'
+                             'body{font:15px/1.5 system-ui;background:#14131a;color:#edeaf3;margin:0;padding:48px 24px}'
+                             'main,header{max-width:1000px;margin:0 auto}header{margin-bottom:40px}'
+                             '.eyebrow{color:#a995e8;font-size:12px;letter-spacing:.12em;text-transform:uppercase}'
+                             'h1{font-size:32px;letter-spacing:-.04em;margin:8px 0}header p{color:#a9a3b5}'
+                             'article{margin-bottom:36px}h2{font-size:19px;margin:0 0 14px}h3{font-size:14px;margin:0 0 18px}'
+                             '.codes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}'
+                             'section{background:#1d1b25;border:1px solid #302c3c;padding:24px;border-radius:16px}'
+                             'svg{display:block;width:100%;max-width:260px;height:auto;background:white;border-radius:8px}'
+                             'a{color:#9fcfff;text-underline-offset:4px}small{display:block;color:#a9a3b5;overflow-wrap:anywhere}'
+                             '@media(max-width:620px){body{padding:28px 18px}.codes{grid-template-columns:1fr}}'
+                             f'</style><header><div class="eyebrow">{project}</div><h1>Mobile Apps</h1>'
+                             '<p>Scan a code to open your development app. Use Local on the same Wi-Fi, '
+                             'or Remote from anywhere.</p></header><main>' + sections + '</main></html>')
+            except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+                self.send_error(503, 'QR generation unavailable; check qrencode and the app configuration.')
+
+        def app_section(self, app, apps):
+            config = json.loads((app / 'app.json').read_text())['expo']
+            if (app / 'app.config.js').is_file():
+                result = subprocess.run(
+                    ['node', '-e', 'const p=process.argv[1]; let c=require(p+"/app.json").expo; '
+                     'let v=require(p+"/app.config.js"); v=typeof v==="function"?v({config:c}):v; '
+                     'console.log(JSON.stringify(v.expo||v));', str(app)],
+                    env={**os.environ, 'EXPO_PUBLIC_ENV': 'development'},
+                    check=True, capture_output=True, text=True, timeout=10)
+                config = json.loads(result.stdout)
+            scheme = config.get('scheme') or 'exp+' + config['slug']
+            if isinstance(scheme, list):
+                scheme = scheme[0]
+            port = 8081 + apps.index(app)
+            env = dict(line.split('=', 1) for line in (root / '.env').read_text().splitlines()
+                       if '=' in line and not line.lstrip().startswith('#'))
+            cards = []
+            for label, url in [('Local · same Wi-Fi', f'http://{lan_ip}:{port}'),
+                               ('Remote', env.get(f'METRO_TUNNEL_URL_{port}', '').strip())]:
+                if not url:
+                    cards.append(f'<section><h3>{label}</h3><p>Tunnel unavailable.</p></section>')
+                    continue
+                payload = f'{scheme}://expo-development-client/?url={quote(url, safe="")}'
+                svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-', payload],
+                                     check=True, capture_output=True, text=True, timeout=10).stdout
+                svg = svg[svg.index('<svg'):]
+                cards.append(f'<section><h3>{label}</h3>{svg}<p><a href="{html.escape(payload, quote=True)}">'
+                             f'Open {html.escape(app.name)}</a></p><small>{html.escape(url)}</small></section>')
+            return f'<article><h2>{html.escape(app.name)}</h2><div class="codes">' + ''.join(cards) + '</div></article>'
+
+        def respond(self, body, content_type='text/html'):
+            data = body.encode()
+            self.send_response(200)
+            self.send_header('Content-Type', content_type + '; charset=utf-8')
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(('0.0.0.0' if '--proxy' in sys.argv else '127.0.0.1', 0), Handler)
+    state.write_text(f'http://127.0.0.1:{server.server_port}')
+    server.serve_forever()
+
+
+if __name__ == '__main__':
+    main()
+QR_SERVER_PY
+    _run_detached "/tmp/${project}-qr-server.log" "/tmp/${project}-qr-server.pid" \
+      python3 "$qr_script" "$root" "$state" "$(_get_lan_ip)" --proxy
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      [[ -s "$state" ]] && break
+      sleep 0.1
+    done
+    url=$(cat "$state" 2>/dev/null || true)
+  fi
+  [[ -n "$url" ]] || return 1
+  port="${url##*:}"
+  dest="/tmp/traefik-dynamic/${project}-qr.yml"
+  config=$(cat <<QR_ROUTE
+http:
+  routers:
+    ${project}-qr:
+      rule: 'Host(\`${host}\`) && (Path(\`/qr\`) || PathPrefix(\`/qr/\`))'
+      entryPoints: [web]
+      priority: 1000
+      service: ${project}-qr
+  services:
+    ${project}-qr:
+      loadBalancer:
+        servers:
+          - url: "http://host.containers.internal:${port}"
+QR_ROUTE
+)
+  if [[ "$OS" == "mac" ]]; then
+    # The file provider runs inside Podman's VM on macOS.
+    local encoded
+    encoded=$(printf '%s\n' "$config" | base64 | tr -d '\n')
+    podman machine ssh "mkdir -p /tmp/traefik-dynamic; echo '$encoded' | base64 -d > '${dest}.tmp'; cmp -s '${dest}.tmp' '$dest' || mv '${dest}.tmp' '$dest'" >/dev/null 2>&1 || return 1
+  else
+    mkdir -p /tmp/traefik-dynamic
+    if [[ ! -f "$dest" ]] || [[ "$(cat "$dest")" != "$config" ]]; then
+      printf '%s\n' "$config" > "${dest}.tmp"
+      mv "${dest}.tmp" "$dest"
+    fi
+  fi
+}
+
 _draw_status_live() {
   local _rows_file="$1"
   : > "$_rows_file"
@@ -4833,6 +4366,21 @@ _draw_status_live() {
   _all_containers=$(podman ps -a \
     --format '{{.Names}}|{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.service"}}' \
     2>/dev/null || true)
+
+  # Size the shared column from complete display names so every row aligns.
+  local _display_label _width_cn _width_proj _width_svc
+  while IFS='|' read -r _width_cn _width_proj _width_svc; do
+    _display_label="${_width_svc:-$_width_cn}"
+    _display_label="${_display_label#mobile-}"
+    [[ ${#_display_label} -gt $_lw ]] && _lw=${#_display_label}
+  done <<< "$_all_containers"
+  for _display_label in "${MOBILE_APPS[@]}"; do
+    [[ ${#_display_label} -gt $_lw ]] && _lw=${#_display_label}
+  done
+  while read -r _width_svc _width_cn; do
+    _display_label="${_width_svc#mobile-}"
+    [[ ${#_display_label} -gt $_lw ]] && _lw=${#_display_label}
+  done < <(_parse_compose_services)
 
   # Other compose projects (all except current)
   local _other_projects=()
@@ -4873,196 +4421,99 @@ _draw_status_live() {
     printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$_url" "$_label"
   }
 
-  # Helper: print URL lines for a project
-  _proj_urls() {
-    local _host="$1" _root="$2"
-    local _tunnel=""
-    [[ -n "$_root" ]] && _tunnel=$(grep "^CLOUDFLARE_TUNNEL_URL=" "$_root/.env" 2>/dev/null | cut -d'=' -f2 || true)
-    printf "  \033[2m  %-12s\033[0m \033[36m%s\033[0m\n" "web:" "http://${_host}"
-    [[ -n "$_tunnel" ]] && printf "  \033[2m  \033[36m%s\033[0m\n" "$(_hyperlink "$_tunnel" "tunnel:")"
-    # Show metro tunnel URLs for this project (scan all METRO_TUNNEL_URL_* keys)
-    if [[ -n "$_root" && -f "$_root/.env" ]]; then
-      # Build port→app-name map by scanning the project's mobile dir (same sort as discover_apps)
-      local _other_mobile_dir="$_root/frontend/mobile"
-      local _other_apps=()
-      if [[ -d "$_other_mobile_dir" ]]; then
-        local _other_names=()
-        while IFS= read -r -d '' _odir; do
-          local _oname; _oname=$(basename "$_odir")
-          [[ "$_oname" == "node_modules" || "$_oname" == "shared" || "$_oname" == "scripts" || "$_oname" == "builds" ]] && continue
-          [[ -f "$_odir/package.json" ]] || continue
-          _other_names+=("$_oname")
-        done < <(find "$_other_mobile_dir" -mindepth 1 -maxdepth 1 -type d -print0)
-        if [[ ${#_other_names[@]} -gt 0 ]]; then
-          while IFS= read -r _oname; do
-            _other_apps+=("$_oname")
-          done < <(printf '%s\n' "${_other_names[@]}" | sort -f)
-        fi
-      fi
-      local _oidx=0
-      while IFS='=' read -r _key _murl; do
-        [[ -z "$_murl" ]] && continue
-        local _oapp_name="${_other_apps[$_oidx]:-${_key#METRO_TUNNEL_URL_}}"
-        printf "  \033[2m  \033[36m%s\033[0m\n" "$(_hyperlink "$_murl" "metro (${_oapp_name}):")"
-        _oidx=$((_oidx + 1))
-      done < <(grep "^METRO_TUNNEL_URL_" "$_root/.env" 2>/dev/null | sort -t_ -k4 -n || true)
-    fi
-  }
-
+  # Render rows first so the header reflects exactly the statuses in this frame.
+  local _core_rows="${_tmp}.core" _mobile_rows="${_tmp}.mobile"
+  local _section_ready _header_icon _row_indent=""
+  local _projects=("${_other_projects[@]}" "$PROJECT_NAME")
   {
     echo ""
-
-    # ── 1. Global infra always first ────────────────────────────────────────
     if [[ ${#_global_containers[@]} -gt 0 ]]; then
-      printf "  \033[1;35m⬡ infrastructure\033[0m\n\n"
+      _section_ready=true
+      local _infra_links=""
+      : > "$_core_rows"
       for _gcn in "${_global_containers[@]}"; do
         printf '%s|%s\n' "$_gcn" "$_gcn" >> "$_rows_file"
-        local _gcn_links=()
-        [[ "$_gcn" == "traefik" ]] && _gcn_links+=("http://traefik.localhost	traefik.localhost")
-        _draw_status_live_row "$_gcn" "$_gcn" "$_lw" "" "$_sf" "${_gcn_links[@]}" || true
+        [[ "$_gcn" == "traefik" ]] && _infra_links="  $(_hyperlink "http://traefik.localhost" "traefik.localhost")"
+        _draw_status_live_row "$_gcn" "$_gcn" "$_lw" "" "$_sf" >> "$_core_rows" || true
       done
+      _header_icon=$'⬡\u0336'; $_section_ready && _header_icon='⬢'
+      printf '  \033[1;35m%s infrastructure\033[0m\033[37m%s\033[0m\n\n' "$_header_icon" "$_infra_links"
+      cat "$_core_rows"
       echo ""
     fi
 
-    # ── 2. Other running projects ───────────────────────────────────────────
-    for _proj in "${_other_projects[@]}"; do
-      local _display _root
-      _resolve_proj "$_proj" _display _root
-      local _host; _host=$(echo "$_display" | tr '[:upper:]' '[:lower:]').localhost
-      local _otunnel=""
-      [[ -n "$_root" ]] && _otunnel=$(grep "^CLOUDFLARE_TUNNEL_URL=" "$_root/.env" 2>/dev/null | cut -d'=' -f2 || true)
-
-      # Build port→app-name map for metro links
-      local _oprojs_mobile_dir="$_root/frontend/mobile"
-      local _oprojs_apps=()
-      if [[ -n "$_root" && -d "$_oprojs_mobile_dir" ]]; then
-        local _opnames=()
-        while IFS= read -r -d '' _opd; do
-          local _opn; _opn=$(basename "$_opd")
-          [[ "$_opn" == "node_modules" || "$_opn" == "shared" || "$_opn" == "scripts" || "$_opn" == "builds" ]] && continue
-          [[ -f "$_opd/package.json" ]] || continue
-          _opnames+=("$_opn")
-        done < <(find "$_oprojs_mobile_dir" -mindepth 1 -maxdepth 1 -type d -print0)
-        [[ ${#_opnames[@]} -gt 0 ]] && while IFS= read -r _opn; do
-          _oprojs_apps+=("$_opn")
-        done < <(printf '%s\n' "${_opnames[@]}" | sort -f)
+    for _proj in "${_projects[@]}"; do
+      local _display _root _host _tunnel _seen="|" _project_rows="" _label _cn _p _svc
+      if [[ "$_proj" == "$PROJECT_NAME" ]]; then
+        _display="$PROJECT_DISPLAY_NAME"; _root="$ROOT_DIR"; _host="${PROJECT_HOST}.localhost"
+      else
+        _resolve_proj "$_proj" _display _root
+        _host="$(printf '%s' "$_display" | tr '[:upper:]' '[:lower:]').localhost"
       fi
-      # Build metro url array indexed by port order
-      local _ometro_urls=()
-      if [[ -n "$_root" && -f "$_root/.env" ]]; then
-        while IFS='=' read -r _ok _ov; do
-          [[ -n "$_ov" ]] && _ometro_urls+=("$_ov")
-        done < <(grep "^METRO_TUNNEL_URL_" "$_root/.env" 2>/dev/null | sort -t_ -k4 -n || true)
-      fi
-
-      printf "  \033[1;34m⬡ %s\033[0m\n\n" "$_display"
-      local _seen_proj=""
-      local _omidx=0
+      _tunnel=$(sed -n 's/^CLOUDFLARE_TUNNEL_URL=//p' "$_root/.env" 2>/dev/null | tr -d '\r')
       while IFS='|' read -r _cn _p _svc; do
-        [[ "$_p" != "$_proj" ]] && continue
-        [[ -z "$_cn" ]] && continue
-        local _label="${_svc:-$_cn}"
-        case "$_seen_proj" in *"|${_label}|"*) continue ;; esac
-        _seen_proj="${_seen_proj}|${_label}|"
-        printf '%s|%s\n' "$_label" "$_cn" >> "$_rows_file"
-        local _row_links=()
-        # frontend → web link + tunnel link
-        if [[ "$_label" == "frontend" ]]; then
-          _row_links+=("http://${_host}	${_host}")
-          [[ -n "$_otunnel" ]] && _row_links+=("${_otunnel}	tunnel")
-        fi
-        # mobile-* → metro tunnel link (match by index order)
-        if [[ "$_label" == mobile-* ]]; then
-          local _omurl="${_ometro_urls[$_omidx]:-}"
-          local _omname="${_oprojs_apps[$_omidx]:-$_label}"
-          if [[ -n "$_omurl" ]]; then
-            _row_links+=("${_omurl}	metro")
-            _row_links+=("${_omurl}	tunnel")
-          fi
-          _omidx=$((_omidx + 1))
-        fi
-        _draw_status_live_row "$_label" "$_cn" "$_lw" "" "$_sf" "${_row_links[@]}" || true
+        [[ "$_p" == "$_proj" && -n "$_cn" ]] || continue
+        _label="${_svc:-$_cn}"
+        case "$_seen" in *"|${_label}|"*) continue ;; esac
+        _seen+="${_label}|"
+        _project_rows+="${_label}|${_cn}"$'\n'
       done <<< "$_all_containers"
+
+      # Include expected services even before their containers have been created.
+      if [[ "$_proj" == "$PROJECT_NAME" ]]; then
+        local _port _override
+        while read -r _svc _port _override; do
+          [[ -n "$_svc" ]] || continue
+          case "$_seen" in *"|${_svc}|"*) continue ;; esac
+          _seen+="${_svc}|"
+          _project_rows+="${_svc}|${_override:-${PROJECT_NAME}-${_svc}-1}"$'\n'
+        done < <(_parse_compose_services | sort -u)
+        for folder in "${MOBILE_APPS[@]}"; do
+          _svc=$(folder_to_service "$folder")
+          case "$_seen" in *"|${_svc}|"*) continue ;; esac
+          _seen+="${_svc}|"
+          _project_rows+="${_svc}|${PROJECT_NAME}-${_svc}-1"$'\n'
+        done
+      fi
+
+      _section_ready=true
+      local _project_links=""
+      : > "$_core_rows"; : > "$_mobile_rows"
+      while IFS='|' read -r _label _cn; do
+        [[ -n "$_cn" ]] || continue
+        local _destination="$_core_rows"
+        _row_indent=""
+        if [[ "$_label" == "frontend" ]]; then
+          _project_links="  $(_hyperlink "http://${_host}" "${_host}")"
+          [[ -n "$_tunnel" ]] && _project_links+="  $(_hyperlink "$_tunnel" "tunnel")"
+        fi
+        if [[ "$_label" == mobile-* ]]; then
+          _destination="$_mobile_rows"
+        fi
+        printf '%s|%s\n' "$_label" "$_cn" >> "$_rows_file"
+        _draw_status_live_row "$_label" "$_cn" "$_lw" "" "$_sf" >> "$_destination" || true
+      done <<< "$_project_rows"
+      _row_indent=""
+      _header_icon=$'⬡\u0336'; $_section_ready && _header_icon='⬢'
+      if [[ -s "$_mobile_rows" ]]; then
+        local _qr_url
+        _qr_url=$(_qr_page_link "$_root" </dev/null) || true
+        [[ -n "$_qr_url" ]] && _project_links+="  $(_hyperlink "$_qr_url" "QR")"
+      fi
+      printf '  \033[1;34m%s %s\033[0m\033[37m%s\033[0m\n\n' "$_header_icon" "$_display" "$_project_links"
+      cat "$_core_rows"
+      if [[ -s "$_mobile_rows" ]]; then
+        echo ""
+        cat "$_mobile_rows"
+      fi
       echo ""
     done
-
-    # ── 3. Current project last — always complete (running + missing) ────────
-    printf "  \033[1;34m⬡ %s\033[0m\n\n" "$PROJECT_DISPLAY_NAME"
-    local _seen_cur=""
-    local _cur_host; _cur_host=$(echo "${PROJECT_DISPLAY_NAME}" | tr '[:upper:]' '[:lower:]').localhost
-    local _cur_tunnel; _cur_tunnel=$(grep "^CLOUDFLARE_TUNNEL_URL=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2 || echo "")
-    # Build metro URL array for current project
-    local _cur_metro_urls=()
-    local _cmport=8081
-    for _cmapp in "${MOBILE_APPS[@]}"; do
-      local _cmurl; _cmurl=$(grep "^METRO_TUNNEL_URL_${_cmport}=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2 || echo "")
-      _cur_metro_urls+=("$_cmurl")
-      _cmport=$((_cmport + 1))
-    done
-    local _cur_midx=0
-
-    while IFS='|' read -r _cn _p _svc; do
-      [[ "$_p" != "$PROJECT_NAME" ]] && continue
-      [[ -z "$_cn" ]] && continue
-      local _label="${_svc:-$_cn}"
-      case "$_seen_cur" in *"|${_label}|"*) continue ;; esac
-      _seen_cur="${_seen_cur}|${_label}|"
-      printf '%s|%s\n' "$_label" "$_cn" >> "$_rows_file"
-      local _crow_links=()
-      if [[ "$_label" == "frontend" ]]; then
-        _crow_links+=("http://${_cur_host}	${_cur_host}")
-        [[ -n "$_cur_tunnel" ]] && _crow_links+=("${_cur_tunnel}	tunnel")
-      fi
-      if [[ "$_label" == mobile-* ]]; then
-        local _cmurl="${_cur_metro_urls[$_cur_midx]:-}"
-        if [[ -n "$_cmurl" ]]; then
-          _crow_links+=("${_cmurl}	metro")
-          _crow_links+=("${_cmurl}	tunnel")
-        fi
-        _cur_midx=$((_cur_midx + 1))
-      fi
-      _draw_status_live_row "$_label" "$_cn" "$_lw" "" "$_sf" "${_crow_links[@]}" || true
-    done <<< "$_all_containers"
-
-    local _svc _port _cname_override
-    while IFS=' ' read -r _svc _port _cname_override; do
-      [[ -z "$_svc" ]] && continue
-      case "$_seen_cur" in *"|${_svc}|"*) continue ;; esac
-      _seen_cur="${_seen_cur}|${_svc}|"
-      local _cn="${_cname_override:-${PROJECT_NAME}-${_svc}-1}"
-      printf '%s|%s\n' "$_svc" "$_cn" >> "$_rows_file"
-      local _crow_links=()
-      if [[ "$_svc" == "frontend" ]]; then
-        _crow_links+=("http://${_cur_host}	${_cur_host}")
-        [[ -n "$_cur_tunnel" ]] && _crow_links+=("${_cur_tunnel}	tunnel")
-      fi
-      _draw_status_live_row "$_svc" "$_cn" "$_lw" "" "$_sf" "${_crow_links[@]}" || true
-    done < <(_parse_compose_services | sort -u)
-
-    local _live_cache; _live_cache=$(_build_cname_cache)
-    for folder in "${MOBILE_APPS[@]}"; do
-      local slug; slug=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-      local _msvc; _msvc=$(folder_to_service "$folder")
-      case "$_seen_cur" in *"|${slug}|"*) continue ;; esac
-      case "$_seen_cur" in *"|${_msvc}|"*) continue ;; esac
-      _seen_cur="${_seen_cur}|${slug}|"
-      local _mc; _mc=$(_cname_from_cache "$_live_cache" "$_msvc" "${PROJECT_NAME}-${_msvc}-1")
-      printf '%s|%s\n' "$slug" "$_mc" >> "$_rows_file"
-      local _cmurl="${_cur_metro_urls[$_cur_midx]:-}"
-      local _crow_links=()
-      [[ -n "$_cmurl" ]] && _crow_links+=("${_cmurl}	metro")
-      _cur_midx=$((_cur_midx + 1))
-      _draw_status_live_row "$slug" "$_mc" "$_lw" "" "$_sf" "${_crow_links[@]}" || true
-    done
-
-    echo ""
     printf "  \033[2mCtrl+C to quit\033[0m\n\n"
-
   } > "$_tmp" 2>/dev/null
-  rm -f "$_sf"
   cat "$_tmp"
-  rm -f "$_tmp"
+  rm -f "$_tmp" "$_sf" "$_core_rows" "$_mobile_rows"
 }
+
 _draw_status_live_row() {
   local label="$1" cname="$2" lw="$3" port="$4" sf="$5"
   # $6 onward: optional link pairs encoded as "url TAB label", one per arg
@@ -5070,13 +4521,13 @@ _draw_status_live_row() {
   local state health dot color badge uptime cpu mem last_log
   local _info
   local _rebuild_status_file="/tmp/${PROJECT_NAME}-rebuild-status"
-  
+
   # Check if this service is being rebuilt
   local is_restarting=false
   if [[ -f "$_rebuild_status_file" ]] && grep -q "^${label}$" "$_rebuild_status_file" 2>/dev/null; then
     is_restarting=true
   fi
-  
+
   # Use gtimeout (macOS coreutils) or timeout (Linux); fall back to plain call if neither exists
   if command -v gtimeout &>/dev/null; then
     _info=$(gtimeout 10 podman inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}|{{.State.StartedAt}}' "$cname" 2>/dev/null) || _info="missing|-|-"
@@ -5089,7 +4540,7 @@ _draw_status_live_row() {
   state=$(printf '%s' "$_info" | cut -d'|' -f1)
   health=$(printf '%s' "$_info" | cut -d'|' -f2)
   local started_at; started_at=$(printf '%s' "$_info" | cut -d'|' -f3)
-  
+
   # Override status if service is being rebuilt
   if $is_restarting; then
     dot='◐' color=$'\033[33m' badge="restarting"
@@ -5098,6 +4549,7 @@ _draw_status_live_row() {
       running)
         case "$health" in
           healthy)  dot='●' color=$'\033[32m' badge="healthy"  ;;
+          unhealthy) dot='●' color=$'\033[31m' badge="unhealthy" ;;
           starting) dot='◐' color=$'\033[33m' badge="starting" ;;
           *)        dot='●' color=$'\033[32m' badge="running"  ;;
         esac ;;
@@ -5106,7 +4558,12 @@ _draw_status_live_row() {
       *)              dot='◐' color=$'\033[33m'   badge="$state"  ;;
     esac
   fi
-  
+
+  # Dynamically scoped by the frame renderer; no extra container probes needed.
+  if [[ "$badge" != "healthy" && "$badge" != "running" ]]; then
+    _section_ready=false
+  fi
+
   uptime=""
   if [[ "$state" == "running" && -n "$started_at" && "$started_at" != "-" ]]; then
     local _se _ne _diff _dt
@@ -5133,8 +4590,16 @@ _draw_status_live_row() {
       mem=$(printf '%s' "$_sl" | cut -d'|' -f3 | cut -d' ' -f1)
     fi
   fi
-  local lbl="$label"
-  [[ ${#lbl} -gt $lw ]] && lbl="${lbl:0:$(( lw - 1 ))}…"
+  # Keep service identifiers intact for actions; simplify only the display name.
+  local lbl="${label#mobile-}"
+  if [[ "$label" == mobile-* ]]; then
+    case "$badge" in
+      healthy|running) dot='◆' color=$'\033[32m' ;;
+      starting|restarting) dot='◇' color=$'\033[33m' ;;
+      *) dot='◇' color=$'\033[31m' ;;
+    esac
+  fi
+  [[ ${#lbl} -gt $lw ]] && lw=${#lbl}
   local port_col=""
   [[ -n "$port" && "$port" != "0" ]] && port_col=":${port}"
   # Build optional link badges (appended after stats)
@@ -5142,9 +4607,19 @@ _draw_status_live_row() {
   for _lp in "${_link_args[@]}"; do
     local _lurl="${_lp%%	*}"
     local _llabel="${_lp##*	}"
-    # Use printf to emit actual ESC bytes for OSC 8 hyperlink
-    _links_str+="  $(printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$_lurl" "$_llabel")"
+
+    # Check if this is a shell command (not a real URL)
+    if [[ "$_lurl" =~ ^(powershell|shell):// ]]; then
+      # Extract command from pseudo-protocol
+      local _cmd="${_lurl#*://}"
+      # Don't create a hyperlink, just show the label and command in a copyable format
+      _links_str+="  $(printf '\033[2m[\033[0m\033[36m%s\033[0m\033[2m: %s]\033[0m' "$_llabel" "$_cmd")"
+    else
+      # Use printf to emit actual ESC bytes for OSC 8 hyperlink
+      _links_str+="  $(printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$_lurl" "$_llabel")"
+    fi
   done
+  printf '%s' "${_row_indent:-}"
   printf "  %s%s\033[0m  %-${lw}s  %s%-9s\033[0m  \033[2m%-5s  %-7s  %-8s  %s\033[0m%s\n" \
     "$color" "$dot" "$lbl" "$color" "$badge" "$uptime" "$cpu" "$mem" "$port_col" "$_links_str"
   return 0
@@ -5217,9 +4692,9 @@ print_status() {
   printf "  \033[2m%s\033[0m\n" "$(printf '─%.0s' $(seq 1 58))"
   printf "  \033[1mURLs\033[0m\n"
   echo ""
-  printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Web:"     "http://${_local_host}"
-  printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "API:"     "http://${_local_host}/api"
-  printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Admin:"   "http://${_local_host}/admin"
+  printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Web:"     "https://${_local_host}"
+  printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "API:"     "https://${_local_host}/api"
+  printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Admin:"   "https://${_local_host}/admin"
   printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Traefik:" "http://traefik.localhost"
 
   if [[ -n "$_tunnel_url" ]]; then
@@ -5275,7 +4750,7 @@ live_monitor() {
   # Check if Podman machine exists and is running, but DON'T create or start it
   # Status command should only show status, not change anything
   local _machine_running=false
-  if [[ "$OS" == "mac" || "$OS" == "windows" ]]; then
+  if [[ "$OS" == "mac" ]]; then
     # Check if VM files exist
     if [[ -f "$HOME/.local/share/containers/podman/machine/applehv/podman-machine-default-arm64.raw" ]] || \
        [[ -f "$HOME/.local/share/containers/podman/machine/qemu/podman-machine-default_fedora-coreos.qcow2" ]]; then
@@ -5285,8 +4760,11 @@ live_monitor() {
       fi
     fi
   else
-    # Linux - podman runs natively, no VM needed
-    _machine_running=true
+    # Linux/WSL - podman runs natively, no VM needed
+    # Just verify Podman is responding
+    if podman info >/dev/null 2>&1; then
+      _machine_running=true
+    fi
   fi
 
   if ! $_machine_running; then
@@ -5353,7 +4831,7 @@ run_mobile() {
   if has_mobile_apps; then
     # Auto-update EXPO_PUBLIC_API_URL with current local IP
     update_mobile_ip
-    
+
     local services
     services=$(mobile_service_names)
     echo "📱 Starting mobile services: $services"
@@ -5532,14 +5010,8 @@ _follow_logs() {
 }
 
 # ── Tunnel watchdog ───────────────────────────────────────────────────────────
-# Runs backend/config/tunnel-watchdog.sh in the background (double-forked so it
-# survives terminal close). Checks every 30s for three failure modes:
-#   1. Process dead → restart with http2
-#   2. URL no longer reachable on Cloudflare edge → restart (lease expired)
-#   3. QUIC crash loop (process alive, metrics show 0 ha_connections + repeated
-#      "control stream" errors) → kill and restart with http2
-# Always tries to reuse the existing URL first; only creates a new tunnel when
-# the current one is genuinely dead or its Cloudflare lease has expired.
+# Detached watchdog: preserve live connectors during network/DNS/origin failures.
+# Restart only exited processes or explicitly rejected quick-tunnel identities.
 _start_tunnel_watchdog() {
   local watchdog_pid_file="/tmp/${PROJECT_NAME}-tunnel-watchdog.pid"
 
@@ -5548,7 +5020,8 @@ _start_tunnel_watchdog() {
   if [[ -f "$watchdog_pid_file" ]]; then
     local old_pid; old_pid=$(cat "$watchdog_pid_file" 2>/dev/null || true)
     if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
-      return 0
+      if grep -q "preserve-identity-v5" "/tmp/${PROJECT_NAME}-tunnel-watchdog.sh" 2>/dev/null; then return 0; fi
+      kill "$old_pid" 2>/dev/null || true
     fi
     rm -f "$watchdog_pid_file"
   fi
@@ -5568,7 +5041,7 @@ _start_tunnel_watchdog() {
   local _wlog="/tmp/${PROJECT_NAME}-tunnel-watchdog.log"
   # Named tunnel token — empty string if using quick tunnels
   local _wtok
-  _wtok=$(grep "^CLOUDFLARE_TUNNEL_TOKEN=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]' || true)
+  _wtok=$(grep "^CLOUDFLARE_TUNNEL_TOKEN=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || true)
 
   # Write watchdog logic to a temp script file and run it detached.
   # Writing to a file avoids bash 3.2's parser choking on quotes/parens inside
@@ -5576,9 +5049,11 @@ _start_tunnel_watchdog() {
   local _wscript="/tmp/${PROJECT_NAME}-tunnel-watchdog.sh"
   cat > "$_wscript" <<'WATCHDOG_SCRIPT_EOF'
 #!/bin/bash
+# preserve-identity-v5
 # Args: pname rdir lhost tlog tpid wpid [tunnel_token]
 _pname="$1"; _rdir="$2"; _lhost="$3"; _tlog="$4"; _tpid="$5"; _wpid="$6"; _tok="${7:-}"
 _retry_file="/tmp/${_pname}-tunnel-retry-after"
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 
 echo $$ > "$_wpid"
 
@@ -5708,15 +5183,35 @@ _tw_url_healthy() {
   [[ -z "$_url" ]] && return 1
   # First check: does the hostname resolve at all?
   local _host="${_url#https://}"; _host="${_host%%/*}"
-  if ! python3 -c "import socket; socket.getaddrinfo('${_host}', 443)" 2>/dev/null; then
+  if ! python3 -c 'import socket,sys; socket.getaddrinfo(sys.argv[1], 443)' "$_host" 2>/dev/null; then
     return 1  # DNS failure — tunnel lease expired
   fi
   # Second check: HTTP response. Anything except connection refused / timeout is
   # considered "up" — a 502/503 means Traefik is routing but the app isn't ready,
   # which is a transient condition, not a dead tunnel.
   local _code
-  _code=$(curl -sf --max-time 10 -o /dev/null -w '%{http_code}' "$_url" 2>/dev/null || echo "000")
-  [[ "$_code" != "000" ]]
+  _code=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "$_url" 2>/dev/null || true)
+  [[ -n "$_code" && "$_code" != "000" ]]
+}
+
+# Confirm missing public DNS independently of the machine's DNS cache. Timeouts,
+# SERVFAIL and transport errors are inconclusive and must preserve the tunnel.
+_tw_dns_expired() {
+  [[ -z "$_tok" && "$1" == https://*.trycloudflare.com ]] || return 1
+  python3 - "$1" <<'DNS_CHECK'
+import json, sys, urllib.parse, urllib.request
+host = urllib.parse.urlsplit(sys.argv[1]).hostname
+try:
+    for resolver in ('https://dns.google/resolve', 'https://cloudflare-dns.com/dns-query'):
+        url = resolver + '?' + urllib.parse.urlencode({'name': host, 'type': 'A'})
+        request = urllib.request.Request(url, headers={'Accept': 'application/dns-json'})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if json.load(response).get('Status') != 3:
+                sys.exit(1)
+except Exception:
+    sys.exit(1)
+sys.exit(0)
+DNS_CHECK
 }
 
 _tw_restart() {
@@ -5769,11 +5264,7 @@ _tw_restart() {
     _url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$_tlog" 2>/dev/null | head -1 || true)
     # Named tunnel: look for stable domain or "registered" confirmation
     if [[ -z "$_url" ]] && [[ -n "$_tok" ]]; then
-      _url=$(grep -oE 'https://[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' "$_tlog" 2>/dev/null \
-        | grep -v 'trycloudflare\|cloudflare\.com\|localhost' | head -1 || true)
-      if [[ -z "$_url" ]] && grep -q "Registered tunnel connection\|Connection registered" "$_tlog" 2>/dev/null; then
-        _url=$(grep "^CLOUDFLARE_TUNNEL_URL=" "$_rdir/.env" 2>/dev/null | cut -d'=' -f2 || true)
-      fi
+      _url=$(sed -n 's/^CLOUDFLARE_TUNNEL_URL=//p' "$_rdir/.env" | tr -d '\r')
     fi
     [[ -n "$_url" ]] && break
     if grep -q "429\|Too Many Requests\|error code: 1015" "$_tlog" 2>/dev/null; then
@@ -5833,36 +5324,39 @@ while true; do
     continue
   fi
   if [[ "$_was_offline" == "true" ]]; then
-    echo "[watchdog $(date '+%H:%M:%S')] Network back — restarting tunnel..."
+    echo "[watchdog $(date '+%H:%M:%S')] Network back — allowing existing tunnel to reconnect..."
     _tw_flush_dns
     _was_offline=false
-    _tw_restart "Network restored"
     _crash_streak=0; _bad_streak=0
-    continue
   fi
 
   # ── Check 1: is the cloudflared process alive? ────────────────────────────
-  _pid=$(pgrep -f "cloudflared tunnel.*--http-host-header ${_lhost}" 2>/dev/null | head -1 || true)
-  if [[ -z "$_pid" ]]; then
+  _pid=$(cat "$_tpid" 2>/dev/null || true)
+  if [[ ! "$_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$_pid" 2>/dev/null || ! ps -p "$_pid" -o args= | grep -q "[c]loudflared tunnel"; then
     _tw_restart "Process gone"
     _crash_streak=0; _bad_streak=0
     continue
   fi
 
-  # ── Check 2: is the QUIC crashing? ───────────────────────────────────────
-  if _tw_is_crash_looping; then
-    _crash_streak=$((_crash_streak+1))
-    if [[ "$_crash_streak" -ge 2 ]]; then
-      _tw_restart "QUIC crash loop"
-      _crash_streak=0; _bad_streak=0
-      continue
-    fi
-  else
-    _crash_streak=0
+  # Only an explicit rejected quick-tunnel identity warrants replacing a live
+  # connector. Network outages and origin failures must retain the same URL.
+  if [[ -z "$_tok" ]] && tail -20 "$_tlog" | grep -q 'Unauthorized: Tunnel not found'; then
+    _tw_restart "Cloudflare rejected expired tunnel identity"
+    continue
   fi
+  (cd "$_rdir" && bash dev.sh _metro_tunnels_only) >/dev/null 2>&1 || true
 
   # ── Check 3: is the saved URL still alive on Cloudflare's edge? ──────────
   _saved=$(grep "^CLOUDFLARE_TUNNEL_URL=" "$_rdir/.env" 2>/dev/null | cut -d= -f2- || true)
+  if [[ -z "$_tok" ]]; then
+    _live_url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$_tlog" | head -1 || true)
+    if [[ -n "$_live_url" && "$_live_url" != "$_saved" ]]; then
+      _saved="$_live_url"
+      _tw_save_url "$_saved"
+      _tw_register_traefik "$_saved" 2>/dev/null || true
+      _bad_streak=0
+    fi
+  fi
   if [[ -n "$_saved" ]]; then
     if _tw_url_healthy "$_saved"; then
       # URL is healthy — make sure Traefik config is still in place
@@ -5890,35 +5384,28 @@ while true; do
           _last_reg_attempt=$(date +%s)
         fi
       elif [[ "$_bad_streak" -ge 3 ]]; then
-        # 3 consecutive failures (~60s) → restart
-        _tw_restart "URL dead after 3 checks"
+        if _tw_dns_expired "$_saved"; then
+          _tw_restart "Quick-tunnel hostname expired (confirmed by two public DNS resolvers)"
+        else
+          # Ordinary outages and origin failures retain the same identity.
+          _tw_register_traefik "$_saved" 2>/dev/null || true
+        fi
         _crash_streak=0; _bad_streak=0
       fi
     fi
   else
     # No URL saved at all — start a fresh tunnel
-    _tw_restart "No tunnel URL in .env"
+    # Keep the connector alive while it negotiates its URL.
     _crash_streak=0; _bad_streak=0
   fi
 done
 WATCHDOG_SCRIPT_EOF
   chmod +x "$_wscript"
 
-  # Double-fork: outer ( ) & detaches from terminal; inner nohup survives session end.
-  # setsid is Linux-only — on macOS the double-fork is sufficient.
-  (
-    if command -v setsid &>/dev/null; then
-      setsid bash "$_wscript" \
-        "$_pname" "$_rdir" "$_lhost" "$_tlog" "$_tpid" "$_wpid" "$_wtok" \
-        >> "$_wlog" 2>&1 &
-    else
-      nohup bash "$_wscript" \
-        "$_pname" "$_rdir" "$_lhost" "$_tlog" "$_tpid" "$_wpid" "$_wtok" \
-        >> "$_wlog" 2>&1 &
-    fi
-    disown $! 2>/dev/null || true
-  ) &
-  disown $! 2>/dev/null || true
+  # Use the same waited double-fork as the tunnel processes; the launch must
+  # finish detaching before a short-lived WSL invocation exits.
+  _run_detached "$_wlog" "$_wpid" bash "$_wscript" \
+    "$_pname" "$_rdir" "$_lhost" "$_tlog" "$_tpid" "$_wpid" "$_wtok"
 }
 _open_safari() {
   # Determine the URL to open: tunnel if available, otherwise project localhost
@@ -5928,7 +5415,7 @@ _open_safari() {
   if [[ -n "$_tunnel_url" ]]; then
     _open_url="$_tunnel_url"
   else
-    _open_url="http://${PROJECT_HOST}.localhost"
+    _open_url="https://${PROJECT_HOST}.localhost"
   fi
 
   case "$OS" in
@@ -5983,9 +5470,9 @@ _print_access_urls() {
   local _local_host="${PROJECT_HOST}.localhost"
 
   echo "   🏠 Local (zero latency):"
-  echo "      Web app:  http://${_local_host}"
-  echo "      API:      http://${_local_host}/api"
-  echo "      Admin:    http://${_local_host}/admin"
+  echo "      Web app:  https://${_local_host}"
+  echo "      API:      https://${_local_host}/api"
+  echo "      Admin:    https://${_local_host}/admin"
   echo "      Traefik:  http://localhost  (dashboard — all projects)"
   discover_apps
   local _port=8081
@@ -6168,14 +5655,14 @@ _open_devtools() {
 _do_rebuild() {
   local specific_service="${1:-}"  # optional: rebuild only this service
   local _rebuild_status_file="/tmp/${PROJECT_NAME}-rebuild-status"
-  
+
   if [[ -n "$specific_service" ]]; then
     # ── Rebuild a specific service ──────────────────────────────────────────
     echo "🔧 Rebuilding service: $specific_service"
-    
+
     # Mark service as restarting in status file
     echo "$specific_service" >> "$_rebuild_status_file"
-    
+
     # Check if it's a mobile service
     if [[ "$specific_service" == mobile-* ]]; then
       local yml_file="/tmp/${PROJECT_NAME}-mobile-compose.yml"
@@ -6230,16 +5717,16 @@ _do_rebuild() {
         >> "/tmp/${PROJECT_NAME}-compose.log" 2>&1 || true
       podman start "$_core_cname" >> "/tmp/${PROJECT_NAME}-compose.log" 2>&1 || true
     fi
-    
+
     echo ""
     echo "✅ Service $specific_service rebuilt and restarted."
     echo "   (Live monitor will show 'restarting' status for a few more seconds)"
     echo ""
-    
+
     # Wait so the live monitor can display the restarting status
     # (monitor refreshes every 3 seconds)
     sleep 5
-    
+
     # Remove service from rebuild status file
     if [[ -f "$_rebuild_status_file" ]]; then
       grep -v "^${specific_service}$" "$_rebuild_status_file" > "${_rebuild_status_file}.tmp" 2>/dev/null || true
@@ -6247,34 +5734,34 @@ _do_rebuild() {
       # Clean up empty file
       [[ ! -s "$_rebuild_status_file" ]] && rm -f "$_rebuild_status_file"
     fi
-    
+
     _draw_status
     echo ""
     echo "   Run ./dev.sh status to monitor service health."
     echo ""
     return
   fi
-  
+
   # ── Full rebuild (all services) ─────────────────────────────────────────
   echo "🧨 Rebuild: performing deep clean (same as ./dev.sh down)..."
   echo ""
-  
+
   # Mark all services as restarting
   discover_apps
   discover_core_svcs
   : > "$_rebuild_status_file"
-  
+
   # Mark all core services
   while IFS=' ' read -r _svc _port _cname_override; do
     [[ -n "$_svc" ]] && echo "$_svc" >> "$_rebuild_status_file"
   done < <(_parse_compose_services)
-  
+
   # Mark all mobile services
   for folder in "${MOBILE_APPS[@]}"; do
     local slug; slug=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
     echo "$slug" >> "$_rebuild_status_file"
   done
-  
+
   # ── Snapshot disk usage before cleanup ───────────────────────────────────
   _disk_before=$(podman system df --format '{{.Size}}' 2>/dev/null | awk '
     function to_bytes(s,   n, u) {
@@ -6288,7 +5775,7 @@ _do_rebuild() {
     { total += to_bytes($1) }
     END { printf "%d\n", total }
   ' 2>/dev/null || echo "0")
-  
+
   echo "🛑 Stopping ${PROJECT_NAME} services..."
   _project_containers=$(podman ps -a --filter "label=io.podman.compose.project=${PROJECT_NAME}" --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')
   if [[ -n "${_project_containers// /}" ]]; then
@@ -6345,13 +5832,13 @@ _do_rebuild() {
 
   echo "🗑️  Cleaning temporary files..."
   rm -f "/tmp/${PROJECT_NAME}-mobile-compose.yml" "/tmp/${PROJECT_NAME}-compose.log" "/tmp/${PROJECT_NAME}-mobile.log"
-  
+
   # Clean up any build artifacts in the project directory
   [[ -d "$ROOT_DIR/backend/__pycache__" ]] && rm -rf "$ROOT_DIR/backend/__pycache__"
   [[ -d "$ROOT_DIR/backend/.pytest_cache" ]] && rm -rf "$ROOT_DIR/backend/.pytest_cache"
   find "$ROOT_DIR/backend" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
   find "$ROOT_DIR/backend" -type f -name "*.pyc" -delete 2>/dev/null || true
-  
+
   # Clean up node_modules caches if they exist
   if [[ -d "$ROOT_DIR/frontend" ]]; then
     find "$ROOT_DIR/frontend" -type d -name ".expo" -exec rm -rf {} + 2>/dev/null || true
@@ -6464,7 +5951,7 @@ _do_rebuild() {
   echo ""
   echo "✅ Rebuild complete. Services are running in the background."
   echo ""
-  
+
   # Clear rebuild status file
   rm -f "$_rebuild_status_file"
 
@@ -6713,7 +6200,7 @@ _install_android_sdk() {
 # Boot the Android emulator if not already running; returns the device serial
 _ensure_emulator() {
   _setup_android_path
-  
+
   # ── Ensure KVM is available (required for x86_64 emulator) ─────────────────
   if [[ "$OS" == "wsl" ]] || [[ "$OS" == "linux" ]]; then
     if [[ ! -e /dev/kvm ]]; then
@@ -6722,7 +6209,7 @@ _ensure_emulator() {
       sudo chmod 666 /dev/kvm 2>/dev/null || true
     fi
   fi
-  
+
   local adb_cmd="${ANDROID_HOME}/platform-tools/adb"
   local emu_cmd="${ANDROID_HOME}/emulator/emulator"
   local avdmanager_cmd="${ANDROID_HOME}/cmdline-tools/latest/bin/avdmanager"
@@ -6804,7 +6291,7 @@ _install_app_on_emulator() {
   local app_dir="$MOBILE_DIR"
   local METRO_BASE=8081
   local metro_port=$METRO_BASE
-  
+
   _setup_android_path
   local adb_cmd="${ANDROID_HOME}/platform-tools/adb"
 
@@ -6862,7 +6349,7 @@ try {
 } catch(_){}
 console.log('');
 " 2>/dev/null || echo "")
-  
+
   # Check for development APK first (hyphenated), then EAS-style "(development)", then production APK
   local apk_cache="$ROOT_DIR/frontend/mobile/builds/${app_key}-development.apk"
   if [[ ! -f "$apk_cache" ]]; then
@@ -6890,7 +6377,7 @@ console.log('');
   # Launch app
   if [[ -n "$bundle_id" ]]; then
     echo "🎯 Launching $found_folder..."
-    
+
     # Always setup adb reverse for emulators
     if [[ "$device" == emulator-* ]]; then
       # Emulator - use localhost with adb reverse
@@ -6903,7 +6390,7 @@ console.log('');
       # Physical device - check for tunnel URL
       local metro_tunnel_url
       metro_tunnel_url=$(grep "^METRO_TUNNEL_URL_${metro_port}=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2 || echo "")
-      
+
       if [[ -n "$metro_tunnel_url" ]]; then
         metro_url_raw="$metro_tunnel_url"
         echo "   🌐 Using tunnel URL: $metro_tunnel_url"
@@ -6914,25 +6401,25 @@ console.log('');
         metro_url_raw="http://localhost:${metro_port}"
       fi
     fi
-    
+
     # URL-encode the Metro URL for the deep link
     local metro_url; metro_url=$(printf '%s' "$metro_url_raw" | sed 's/:/%3A/g; s/\//%2F/g')
-    
+
     echo "   📱 Connecting to Metro: $metro_url_raw"
-    
+
     # Use the Expo Dev Client deep link to directly connect to Metro
     # This bypasses auto-discovery and connects immediately
     "$adb_cmd" -s "$device" shell am start \
       -a android.intent.action.VIEW \
       -d "exp+${slug}://expo-development-client/?url=${metro_url}" \
       "$bundle_id" 2>/dev/null || true
-    
+
     # Small delay to ensure deep link is processed
     sleep 1
-    
+
     # Now bring the app to foreground
     "$adb_cmd" -s "$device" shell am start -n "${bundle_id}/.MainActivity" 2>/dev/null || true
-    
+
     echo "   ✅ App launched with automatic Metro connection"
   fi
 }
@@ -7382,7 +6869,7 @@ smart_launch() {
   # ── Selective rebuilding: only fix what's broken ────────────────────────────
   echo ""
   echo "🔍 Analyzing service status..."
-  
+
   if [[ ${#running_services[@]} -gt 0 ]]; then
     echo "✅ Running services: ${running_services[*]}"
   fi
@@ -7452,18 +6939,18 @@ smart_launch() {
       echo "🔧 Rebuilding service: $svc"
       local yml_file="/tmp/${PROJECT_NAME}-mobile-compose.yml"
       gen_mobile_yaml > "$yml_file"
-      
+
       echo "  🗑️  Stopping and removing container..."
       podman stop "${PROJECT_NAME}-${svc}-1" 2>/dev/null || true
       podman rm "${PROJECT_NAME}-${svc}-1" 2>/dev/null || true
-      
+
       echo "  📦 Rebuilding mobile service (no cache)..."
       $DC_CMD -p "$PROJECT_NAME" "${COMPOSE_F[@]}" -f "$yml_file" build --no-cache "$svc" 2>/dev/null || true
-      
+
       echo "  🚀 Starting service..."
       "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" -f "$yml_file" up -d --force-recreate "$svc" \
         >> "/tmp/${PROJECT_NAME}-mobile.log" 2>&1 || true
-      
+
       echo "  ✅ Service $svc rebuilt"
     done
 
@@ -7558,7 +7045,7 @@ _ensure_android_dir() {
         exit 1
       }
     fi
-    # Load .env so app.config.js can read EXPO_PUBLIC_* vars (e.g. Google Maps key)
+    # Load .env so app.config.js can read EXPO_PUBLIC_* vars (including project integrations)
     local _prebuild_env=()
     if [[ -f "$ROOT_DIR/.env" ]]; then
       while IFS= read -r _line; do
@@ -7574,33 +7061,8 @@ _ensure_android_dir() {
     echo "✅ android/ directory generated by expo prebuild"
   fi
 
-  # ── 3. Inject Google Maps API key into AndroidManifest.xml ───────────────
-  # expo prebuild writes the key from android.config.googleMaps.apiKey into the
-  # manifest. If the key was missing at prebuild time (e.g. android/ already
-  # existed from a previous run without the key), we patch it in directly now.
-  local _maps_key=""
-  if [[ -f "$ROOT_DIR/.env" ]]; then
-    _maps_key=$(grep '^EXPO_PUBLIC_GOOGLE_MAPS_API_KEY=' "$ROOT_DIR/.env" | cut -d= -f2- | tr -d '"'"'" | head -1 || true)
-  fi
-  [[ -z "$_maps_key" ]] && _maps_key="${EXPO_PUBLIC_GOOGLE_MAPS_API_KEY:-}"
-
-  local _manifest="$android_dir/app/src/main/AndroidManifest.xml"
-  if [[ -n "$_maps_key" ]] && [[ -f "$_manifest" ]]; then
-    local _geo_tag='com.google.android.geo.API_KEY'
-    if grep -q "$_geo_tag" "$_manifest"; then
-      # Key entry exists — update the value in case it changed or was empty
-      sed -i.bak \
-        "s|android:name=\"${_geo_tag}\" android:value=\"[^\"]*\"|android:name=\"${_geo_tag}\" android:value=\"${_maps_key}\"|g" \
-        "$_manifest" && rm -f "${_manifest}.bak"
-      echo "✅ Google Maps API key updated in AndroidManifest.xml"
-    else
-      # Key entry missing — insert it before </application>
-      sed -i.bak \
-        "s|</application>|        <meta-data android:name=\"${_geo_tag}\" android:value=\"${_maps_key}\"/>\n    </application>|g" \
-        "$_manifest" && rm -f "${_manifest}.bak"
-      echo "✅ Google Maps API key injected into AndroidManifest.xml"
-    fi
-  fi
+  # Project-native metadata is an optional literal mapping in project.py.
+  python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" android-metadata "$android_dir"
 
   # ── 4. Copy assets from frontend/web/public ──────────────────────────
   # expo prebuild reads icon/splash from app.json paths relative to the app dir.
@@ -7657,15 +7119,24 @@ _ensure_android_dir() {
 }
 
 # ── EAS cloud build ──────────────────────────────────────────────────────────
-# Usage: _do_eas_build <app> [android|ios|all] [production]
+# Usage: _do_eas_build <app> [android|ios|ios-simulator|all] [production]
 # Runs `eas build` for the given app in the EAS cloud.
-# Fully automatic — creates/re-links the EAS project if needed, no prompts.
-# Defaults: platform=all, profile=development
+# Creates/re-links the EAS project if needed; signing setup can prompt on a terminal.
+# Defaults: platform=all, profile=development (real device)
+# Platforms:
+#   - ios              → Real iOS device build (default for ios)
+#   - ios-simulator    → iOS simulator build
+#   - android          → Android APK (works on both emulator and device)
+# Profiles:
+#   - development          → Real device build with Metro hot reload (default)
+#   - development-simulator → iOS simulator build with Metro hot reload
+#   - production           → Production build for real devices
 # Use 'production' flag for production builds
 _do_eas_build() {
   local build_app="$1"
   local build_platform="${2:-all}"
   local eas_profile="development"
+  local is_simulator=false
 
   # Strip optional "project/" prefix from app name (e.g. "myproject/myapp" → "myapp")
   if [[ "$build_app" == */* ]]; then
@@ -7679,14 +7150,30 @@ _do_eas_build() {
     set +a
   fi
 
-  # Check for 'production' flag anywhere in the arguments
+  # Check for 'ios-simulator' in platform argument first
+  if [[ "$build_platform" == "ios-simulator" ]]; then
+    is_simulator=true
+    build_platform="ios"
+  fi
+
+  # Check for profile flags anywhere in the arguments
   shift 2 2>/dev/null || shift 1 2>/dev/null || true
   for _arg in "$@"; do
     if [[ "$_arg" == "production" ]]; then
       eas_profile="production"
+      is_simulator=false  # production is always for real devices
+      break
+    elif [[ "$_arg" == "simulator" ]]; then
+      # This comes from _do_build when it detects ios-simulator
+      is_simulator=true
       break
     fi
   done
+
+  # Apply simulator profile if needed
+  if [[ "$is_simulator" == true ]]; then
+    eas_profile="development-simulator"
+  fi
 
   # ── Resolve app folder ───────────────────────────────────────────────────
   discover_apps
@@ -7785,7 +7272,7 @@ console.log('');
       # Try to query the project to see if it exists for this account
       local project_check
       project_check=$(cd "$app_dir" && eas project:info 2>&1 || true)
-      
+
       if echo "$project_check" | grep -q "does not exist\|not found\|GraphQL request failed"; then
         echo "⚠️  Project ID $current_id doesn't belong to current account — will create new project"
         current_id=""
@@ -7960,15 +7447,41 @@ console.log('✅ app.config.js updated — owner: ' + owner + ', projectId: ' + 
   echo "========================================="
   echo ""
 
-  # Run the build and capture the build URL from output
+  # Run the build with --no-wait to return immediately after submission
+  echo "🚀 Submitting build to EAS..."
   local _eas_output
-  # shellcheck disable=SC2086
-  _eas_output=$(cd "$app_dir" && eas build \
+  local _eas_exit
+  local _eas_log
+
+  # Change to app directory and run eas build
+  cd "$app_dir"
+
+  # `eas credentials` is an interactive manager, not a credential probe.
+  # Let the build itself resolve signing, keeping stdin attached for prompts.
+  local _eas_mode_args=(--non-interactive)
+  if [[ -t 0 && ( "$build_platform" == "ios" || "$build_platform" == "all" ) && "$is_simulator" != true ]]; then
+    _eas_mode_args=()
+    echo "   Apple signing prompts will appear here if setup is needed."
+  fi
+
+  # Stream progress immediately, while retaining build URLs for downloads.
+  # Save EAS's status inside each branch before PIPESTATUS is overwritten.
+  _eas_log=$(mktemp "${TMPDIR:-/tmp}/eas-build.XXXXXX")
+  if eas build \
     --profile "$eas_profile" \
     $eas_platform_flag \
-    --non-interactive \
-    2>&1) && _eas_exit=0 || _eas_exit=$?
-  echo "$_eas_output"
+    --no-wait \
+    "${_eas_mode_args[@]}" \
+    2>&1 | tee "$_eas_log"; then
+    _eas_exit=${PIPESTATUS[0]}
+  else
+    _eas_exit=${PIPESTATUS[0]}
+  fi
+  _eas_output=$(cat "$_eas_log")
+  rm -f "$_eas_log"
+
+  # Go back to root
+  cd "$ROOT_DIR"
 
   if [[ $_eas_exit -ne 0 ]]; then
     echo ""
@@ -7976,18 +7489,19 @@ console.log('✅ app.config.js updated — owner: ' + owner + ', projectId: ' + 
     echo "   Check the output above for details."
     echo "   Common fixes:"
     echo "     • Not logged in:   eas login"
+    echo "     • iOS signing:    rerun this build in an interactive terminal to configure Apple credentials"
     echo "     • Wrong profile:   ./dev.sh build $build_app $build_platform production"
     echo "     • Build locally:   ./dev.sh build $build_app $build_platform local"
     exit 1
   fi
 
   echo ""
-  echo "✅ EAS build complete for '$build_folder'."
+  echo "✅ EAS build submitted for '$build_folder'."
 
   # ── Auto-download APK and install on emulator ────────────────────────────
   # Only for android + development/device profiles (which produce APKs, not AABs)
   if [[ "$build_platform" == "android" || "$build_platform" == "all" ]]; then
-    if [[ "$eas_profile" == "development" || "$eas_profile" == "production" ]]; then
+    if [[ "$eas_profile" == "development" || "$eas_profile" == "development-simulator" || "$eas_profile" == "production" ]]; then
       echo ""
       echo "📥 Downloading APK from EAS..."
 
@@ -8043,9 +7557,9 @@ console.log('✅ app.config.js updated — owner: ' + owner + ', projectId: ' + 
   fi
 
   # ── Auto-download IPA for iOS ────────────────────────────────────────────
-  # Download IPA for simulator builds (development/production profiles)
+  # Download IPA for all iOS builds (both simulator and device)
   if [[ "$build_platform" == "ios" || "$build_platform" == "all" ]]; then
-    if [[ "$eas_profile" == "development" || "$eas_profile" == "production" ]]; then
+    if [[ "$eas_profile" == "development" || "$eas_profile" == "development-simulator" || "$eas_profile" == "production" ]]; then
       echo ""
       echo "📥 Downloading IPA from EAS..."
 
@@ -8093,7 +7607,7 @@ console.log('✅ app.config.js updated — owner: ' + owner + ', projectId: ' + 
 
         echo "   Downloading → $ipa_out"
         curl -L --progress-bar "$artifact_url_ios" -o "$ipa_out" && echo "✅ IPA saved to frontend/mobile/builds/${ipa_filename}"
-        
+
         echo ""
         echo "   To install on simulator, run: ./dev.sh ios"
       fi
@@ -8105,7 +7619,15 @@ console.log('✅ app.config.js updated — owner: ' + owner + ', projectId: ' + 
 }
 
 # ── Build command: Podman images or native APK/IPA ───────────────────────────
-# Usage: _do_build [<app> [android|ios] [local] [production]]
+# Usage: _do_build [<app> [android|ios|ios-simulator] [local] [production]]
+#
+# Without app name: builds core Podman images
+# With app name + platform:
+#   - ios          → EAS cloud build for real iOS device (default)
+#   - ios-simulator → EAS cloud build for iOS simulator
+#   - android      → EAS cloud build for Android (works on emulator and device)
+#   - local        → Native local build (requires Xcode/Android Studio)
+#   - production   → Production build (real devices only)
 _do_build() {
   local build_app="${1:-}"
   local build_platform="android"
@@ -8128,8 +7650,15 @@ _do_build() {
         build_production=true
         _extra_args+=("production")
         ;;
-      android|ios)
-        build_platform="$_arg"
+      android)
+        build_platform="android"
+        ;;
+      ios)
+        build_platform="ios"
+        ;;
+      ios-simulator)
+        build_platform="ios-simulator"
+        _extra_args+=("simulator")
         ;;
     esac
   done
@@ -8185,15 +7714,16 @@ _do_build() {
       local build_type="Debug"
       local gradle_task="assembleDebug"
       local build_env="development"
-      local api_url="${EXPO_PUBLIC_API_URL:-http://192.168.1.71:8000}"
-      
+      local api_url
+
       if [[ "$build_production" == true ]]; then
         build_type="Release"
         gradle_task="assembleRelease"
         build_env="production"
-        # For production, use production API URL if set, otherwise use default
-        api_url="${EXPO_PUBLIC_API_URL_PRODUCTION:-https://api.${PROJECT_DISPLAY_NAME}}"
       fi
+
+      api_url=$(python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" \
+        mobile-api-url "$build_env" "http://$(_get_lan_ip):8000") || return 1
 
       echo ""
       echo "========================================="
@@ -8206,9 +7736,8 @@ _do_build() {
 
       "$gradlew" -p "$android_dir" clean 2>&1 || true
 
-      if EXPO_PUBLIC_ENV="$build_env" \
-         EXPO_PUBLIC_API_URL="$api_url" \
-         "$gradlew" -p "$android_dir" "$gradle_task" 2>&1; then
+      if EXPO_PUBLIC_API_URL="$api_url" python3 "$ROOT_DIR/backend/config/project_config.py" \
+         "$ROOT_DIR" run-build "$build_env" "$gradlew" -p "$android_dir" "$gradle_task" 2>&1; then
         local built_apk
         if [[ "$build_production" == true ]]; then
           built_apk=$(find "$android_dir/app/build/outputs/apk/release" -name "*.apk" 2>/dev/null | head -1)
@@ -8223,7 +7752,7 @@ _do_build() {
           else
             apk_filename="${slug}-${build_env}.apk"
           fi
-          
+
           cp "$built_apk" "$output_dir/$apk_filename"
           echo ""
           echo "✅ APK built → frontend/mobile/builds/$apk_filename"
@@ -8542,6 +8071,214 @@ case "$CMD" in
     _do_build "${@:2}"
     ;;
 
+  build-all)
+    # ── ./dev.sh build-all [android|ios] [development|production] [testflight] ────────────
+    # Start builds for all mobile apps (sequential, but you can open multiple terminals for parallel)
+    BUILD_PLATFORM="${2:-ios}"
+    BUILD_PROFILE="${3:-development}"
+    TESTFLIGHT_FLAG="${4:-}"
+
+    # If testflight flag is provided, use development-testflight profile
+    if [[ "$TESTFLIGHT_FLAG" == "testflight" ]]; then
+      if [[ "$BUILD_PROFILE" == "development" ]]; then
+        BUILD_PROFILE="development-testflight"
+        echo ""
+        echo "📱 TestFlight mode enabled: using development-testflight profile"
+        echo "   • Development client with Metro hot reload"
+        echo "   • Auto-submit to TestFlight after build"
+        echo ""
+      else
+        echo ""
+        echo "⚠️  TestFlight flag only works with development profile"
+        echo "   Using $BUILD_PROFILE profile instead"
+        echo ""
+      fi
+    fi
+
+    echo ""
+    echo "🚀 Building all apps for $BUILD_PLATFORM ($BUILD_PROFILE profile)"
+    echo "──────────────────────────────────────────────────────────────────"
+    echo ""
+    echo "💡 TIP: For parallel builds, open multiple terminals and run:"
+    echo ""
+
+    # Get list of mobile apps
+    APPS=()
+    if [[ -d "$MOBILE_DIR" ]]; then
+      while IFS= read -r -d '' folder; do
+        app_name=$(basename "$folder")
+        # Skip node_modules, shared, scripts, and hidden folders
+        [[ "$app_name" =~ ^(node_modules|shared|scripts|packages|\.) ]] && continue
+        # Only include folders with package.json
+        if [[ -f "$folder/package.json" ]]; then
+          APPS+=("$app_name")
+          app_slug=$(echo "$app_name" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9.-')
+          echo "   Terminal $(( ${#APPS[@]} )): ./dev.sh build $app_slug $BUILD_PLATFORM $BUILD_PROFILE"
+        fi
+      done < <(find "$MOBILE_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
+    fi
+
+    if [[ ${#APPS[@]} -eq 0 ]]; then
+      echo "❌ No mobile apps found in $MOBILE_DIR"
+      exit 1
+    fi
+
+    echo ""
+    echo "──────────────────────────────────────────────────────────────────"
+    echo ""
+    echo "Building ${#APPS[@]} app(s) sequentially..."
+    echo ""
+
+    # Build each app
+    FAILED=()
+    SUCCEEDED=()
+
+    for app in "${APPS[@]}"; do
+      app_slug=$(echo "$app" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9.-')
+      echo ""
+      echo "═══════════════════════════════════════════════════════════════════"
+      echo "📦 Building: $app"
+      echo "═══════════════════════════════════════════════════════════════════"
+      echo ""
+
+      # Use absolute path to call dev.sh
+      if bash "$ROOT_DIR/dev.sh" build "$app_slug" "$BUILD_PLATFORM" "$BUILD_PROFILE"; then
+        SUCCEEDED+=("$app")
+        echo ""
+        echo "✅ $app build completed successfully"
+      else
+        FAILED+=("$app")
+        echo ""
+        echo "❌ $app build failed"
+      fi
+    done
+
+    # Print summary
+    echo ""
+    echo "══════════════════════════════════════════════════════════════════"
+    echo "📊 Build Summary"
+    echo "══════════════════════════════════════════════════════════════════"
+    echo "Total apps: ${#APPS[@]}"
+    echo "Succeeded: ${#SUCCEEDED[@]} (${SUCCEEDED[*]:-none})"
+    echo "Failed: ${#FAILED[@]} (${FAILED[*]:-none})"
+    echo "══════════════════════════════════════════════════════════════════"
+
+    if [[ ${#FAILED[@]} -gt 0 ]]; then
+      echo ""
+      echo "⚠️  Some builds failed."
+      exit 1
+    fi
+
+    echo ""
+    echo "🎉 All builds completed successfully!"
+    ;;
+
+  eas)
+    # ── ./dev.sh eas [whoami|login|logout] ───────────────────────────────────
+    # Interactive EAS authentication management
+    EAS_CMD="${2:-whoami}"
+
+    # Ensure EAS CLI is available
+    if ! command -v eas &>/dev/null; then
+      echo "📦 Installing EAS CLI..."
+      npm install -g eas-cli
+    fi
+
+    case "$EAS_CMD" in
+      whoami|who)
+        echo ""
+        echo "📱 EAS Account Information"
+        echo "──────────────────────────────────────────────────────────────────"
+
+        # Check EXPO_TOKEN first
+        if [[ -n "${EXPO_TOKEN:-}" ]]; then
+          echo "   Authentication: EXPO_TOKEN (from .env)"
+          EAS_USER=$(eas whoami 2>/dev/null | head -1 | awk '{print $1}' || echo "")
+          if [[ -n "$EAS_USER" ]]; then
+            echo "   Logged in as: $EAS_USER"
+            # Get account/organization info
+            EAS_ORG=$(eas whoami 2>/dev/null | grep -E "^•" | awk '{print $2}' | tr -d '()' | head -1 || echo "")
+            [[ -n "$EAS_ORG" ]] && echo "   Organization: $EAS_ORG"
+          else
+            echo "   ❌ EXPO_TOKEN is set but invalid"
+            echo "   Update EXPO_TOKEN in .env or unset it to use interactive login"
+          fi
+        else
+          # Check interactive login state
+          EAS_USER=$(node -e "
+try {
+  const os=require('os'),path=require('path'),fs=require('fs');
+  const s=JSON.parse(fs.readFileSync(path.join(os.homedir(),'.expo','state.json'),'utf8'));
+  console.log(s.auth?.username||'');
+} catch(e){console.log('');}
+" 2>/dev/null || echo "")
+
+          if [[ -n "$EAS_USER" ]]; then
+            echo "   Authentication: Interactive (from ~/.expo/state.json)"
+            echo "   Logged in as: $EAS_USER"
+            # Try to get organization info
+            EAS_ORG=$(eas whoami 2>/dev/null | grep -E "^•" | awk '{print $2}' | tr -d '()' | head -1 || echo "")
+            [[ -n "$EAS_ORG" ]] && echo "   Organization: $EAS_ORG"
+          else
+            echo "   ❌ Not logged in"
+            echo ""
+            echo "   To log in, run: ./dev.sh eas login"
+            echo "   Or set EXPO_TOKEN in .env for CI/automation"
+          fi
+        fi
+        echo "──────────────────────────────────────────────────────────────────"
+        echo ""
+        ;;
+
+      login)
+        if [[ -n "${EXPO_TOKEN:-}" ]]; then
+          echo "⚠️  EXPO_TOKEN is set in .env"
+          echo "   Using token-based authentication. To use interactive login:"
+          echo "   1. Remove or comment out EXPO_TOKEN in .env"
+          echo "   2. Run: ./dev.sh eas login"
+          exit 1
+        fi
+
+        echo ""
+        echo "🔐 Logging in to EAS..."
+        echo ""
+        cd "$MOBILE_DIR" && eas login
+        echo ""
+        echo "✅ Login successful!"
+        # Show who we're logged in as
+        "$0" eas whoami
+        ;;
+
+      logout)
+        if [[ -n "${EXPO_TOKEN:-}" ]]; then
+          echo "⚠️  Using EXPO_TOKEN authentication"
+          echo "   To log out, remove or comment out EXPO_TOKEN in .env"
+          exit 1
+        fi
+
+        echo ""
+        echo "👋 Logging out from EAS..."
+        cd "$MOBILE_DIR" && eas logout
+        echo ""
+        echo "✅ Logged out successfully"
+        ;;
+
+      *)
+        echo "Usage: ./dev.sh eas [whoami|login|logout]"
+        echo ""
+        echo "Commands:"
+        echo "  whoami  - Show current EAS account"
+        echo "  login   - Log in to EAS interactively"
+        echo "  logout  - Log out from EAS"
+        echo ""
+        echo "Authentication methods:"
+        echo "  1. Interactive: Use 'eas login' for manual auth (default)"
+        echo "  2. Token: Set EXPO_TOKEN in .env for CI/automation"
+        exit 1
+        ;;
+    esac
+    ;;
+
   up)
     echo "🚀 Starting core services..."
     dc_up_ordered
@@ -8565,7 +8302,11 @@ case "$CMD" in
     _draw_status
     ;;
 
-  status)
+  qr)
+    _print_mobile_qrs
+    ;;
+
+  status|monitor)
     # Disable errexit for the monitor so errors don't kill the loop
     set +e
     live_monitor
@@ -8610,14 +8351,14 @@ case "$CMD" in
     # ./dev.sh check [service_name]
     discover_apps
     discover_core_svcs
-    
+
     _cache=$(_build_cname_cache)
 
     if [[ -n "${2:-}" ]]; then
       # Check specific service
       svc="$2"
       cname=""
-      
+
       # Check if it's a core service
       found=false
       _line="" _check_svc="" _port="" _cname_override=""
@@ -8633,7 +8374,7 @@ case "$CMD" in
           break
         fi
       done < <(_parse_compose_services)
-      
+
       # Check if it's a mobile service
       if ! $found; then
         for folder in "${MOBILE_APPS[@]}"; do
@@ -8645,18 +8386,18 @@ case "$CMD" in
           fi
         done
       fi
-      
+
       if ! $found; then
         echo "❌ Service '$svc' not found"
         exit 1
       fi
-      
+
       status=$(_container_status "$cname")
       state=$(_container_state "$cname")
       echo "Service: $svc"
       echo "Container: $cname"
       echo "Status: $status ($state)"
-      
+
       if [[ "$status" == "broken" ]]; then
         echo ""
         echo "💡 To fix this service, run: ./dev.sh rebuild $svc"
@@ -8665,7 +8406,7 @@ case "$CMD" in
       # Check all services
       echo "🔍 Service Status Check"
       echo ""
-      
+
       echo "Core Services:"
       _line="" _svc="" _port="" _cname_override=""
       while IFS=' ' read -r _svc _port _cname_override; do
@@ -8686,7 +8427,7 @@ case "$CMD" in
         esac
         printf "  %s %-15s %s\n" "$icon" "$_svc" "$status"
       done < <(_parse_compose_services)
-      
+
       if has_mobile_apps; then
         echo ""
         echo "Mobile Services:"
@@ -8704,7 +8445,7 @@ case "$CMD" in
           printf "  %s %-15s %s\n" "$icon" "$svc" "$status"
         done
       fi
-      
+
       echo ""
       echo "Emulator:"
       if _emulator_running; then
@@ -8720,13 +8461,13 @@ case "$CMD" in
     if [[ -n "${2:-}" ]]; then
       # Rebuild specific service
       svc_to_rebuild="$2"
-      
+
       # Validate service exists
       discover_apps
       discover_core_svcs
-      
+
       found=false
-      
+
       # Check core services
       _line="" _check_svc="" _port="" _cname_override=""
       while IFS=' ' read -r _check_svc _port _cname_override; do
@@ -8736,7 +8477,7 @@ case "$CMD" in
           break
         fi
       done < <(_parse_compose_services)
-      
+
       # Check mobile services
       if ! $found && has_mobile_apps; then
         for folder in "${MOBILE_APPS[@]}"; do
@@ -8747,7 +8488,7 @@ case "$CMD" in
           fi
         done
       fi
-      
+
       if ! $found; then
         echo "❌ Service '$svc_to_rebuild' not found"
         echo ""
@@ -8764,7 +8505,7 @@ case "$CMD" in
         fi
         exit 1
       fi
-      
+
       _do_rebuild "$svc_to_rebuild"
     else
       # Rebuild all services
@@ -8789,7 +8530,7 @@ case "$CMD" in
     echo "🔍 iOS Networking Configuration Verification"
     echo "=============================================="
     echo ""
-    
+
     # 1. Check Mac's IP address
     echo "1️⃣  Checking Mac's local IP address..."
     LOCAL_IP=$(_get_lan_ip)
@@ -8801,7 +8542,7 @@ case "$CMD" in
       echo "   ✅ Local IP: $LOCAL_IP"
     fi
     echo ""
-    
+
     # 2. Check each discovered mobile app config
     discover_apps
     local _app_step=2
@@ -8911,7 +8652,7 @@ case "$CMD" in
     if has_mobile_apps; then
       # Auto-update EXPO_PUBLIC_API_URL with current local IP
       update_mobile_ip
-      
+
       mobile_svcs=$(mobile_service_names)
       echo "📱 Starting mobile services: $mobile_svcs"
       yml_file="/tmp/${PROJECT_NAME}-mobile-compose.yml"
@@ -9001,7 +8742,7 @@ case "$CMD" in
     RELEASE_PLATFORM="${2:-android}"  # Default to android
     RELEASE_SETUP="false"
     RELEASE_LOCAL="false"
-    
+
     # Check for 'setup' and 'local' flags
     for arg in "$@"; do
       if [[ "$arg" == "setup" ]]; then
@@ -9017,22 +8758,22 @@ case "$CMD" in
       echo "🔐 iOS Credential Setup (Interactive)"
       echo "   This will configure iOS certificates and provisioning profiles"
       echo ""
-      
+
       discover_apps
       for folder in "${MOBILE_APPS[@]}"; do
         slug=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
         app_dir="$MOBILE_DIR/$folder"
-        
+
         echo "========================================="
         echo "📱 Setting up iOS credentials: $folder"
         echo "========================================="
         echo ""
-        
+
         cd "$app_dir" || exit 1
         eas build --platform ios --profile production
         echo ""
       done
-      
+
       echo "✅ iOS credential setup complete!"
       exit 0
     fi
@@ -9040,10 +8781,10 @@ case "$CMD" in
     # Handle setup mode for Android (keystore generation)
     if [[ "$RELEASE_SETUP" == "true" && "$RELEASE_PLATFORM" == "android" ]]; then
       SETUP_APP="${3:-}"
-      
+
       # Setup Java environment
       _setup_java_env || exit 1
-      
+
       # Load keystore passwords from .env
       if [[ -f "$ROOT_DIR/.env" ]]; then
         KEYSTORE_PASS=$(grep "^ANDROID_KEYSTORE_PASSWORD=" "$ROOT_DIR/.env" | cut -d'=' -f2 || echo "android")
@@ -9053,17 +8794,17 @@ case "$CMD" in
         KEYSTORE_PASS="android"
         KEY_PASS="android"
       fi
-      
+
       discover_apps
       for folder in "${MOBILE_APPS[@]}"; do
         if [[ -z "$SETUP_APP" ]] || echo "$folder" | grep -qi "$SETUP_APP"; then
           slug=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-          
+
           # Read package name from app.config.js or app.json
           app_config_js="$MOBILE_DIR/$folder/app.config.js"
           app_json="$MOBILE_DIR/$folder/app.json"
           package_name=""
-          
+
           if [[ -f "$app_config_js" ]]; then
             # Extract package name from app.config.js
             package_name=$(node -e "
@@ -9072,7 +8813,7 @@ case "$CMD" in
               console.log(pkg);
             " 2>/dev/null || echo "")
           fi
-          
+
           if [[ -z "$package_name" && -f "$app_json" ]]; then
             # Extract package name from app.json
             package_name=$(node -e "
@@ -9081,15 +8822,15 @@ case "$CMD" in
               console.log(pkg);
             " 2>/dev/null || echo "")
           fi
-          
+
           # Fallback to slug-based package name
           if [[ -z "$package_name" ]]; then
             package_name="com.${slug//-/}"
           fi
-          
+
           keystore_path="$MOBILE_DIR/$folder/android/app/${slug}-release.keystore"
           props_file="$MOBILE_DIR/$folder/android/gradle.properties"
-          
+
           if [[ -f "$keystore_path" ]]; then
             echo "⚠️  Keystore already exists for '$folder'"
             echo "   Package: $package_name"
@@ -9099,12 +8840,12 @@ case "$CMD" in
             echo "   rm \"$keystore_path\""
             continue
           fi
-          
+
           echo "🔑 Generating release keystore for '$folder'..."
           echo "   Package: $package_name"
           echo "   Keystore: ${slug}-release.keystore"
           echo ""
-          
+
           keytool -genkey -v \
             -storetype PKCS12 \
             -keystore "$keystore_path" \
@@ -9113,30 +8854,30 @@ case "$CMD" in
             -storepass "$KEYSTORE_PASS" \
             -keypass "$KEY_PASS" \
             -dname "CN=$folder, OU=Mobile, O=$PROJECT_DISPLAY_NAME, L=Unknown, ST=Unknown, C=US"
-          
+
           echo ""
           echo "✅ Keystore created for '$folder'"
           echo ""
           echo "📋 Certificate Fingerprints:"
           echo ""
-          
+
           # Get SHA-1 fingerprint
           SHA1=$(keytool -list -v -keystore "$keystore_path" -alias "${slug}-release" -storepass "$KEYSTORE_PASS" 2>/dev/null | grep "SHA1:" | sed 's/.*SHA1: //' || echo "")
-          
+
           # Get SHA-256 fingerprint
           SHA256=$(keytool -list -v -keystore "$keystore_path" -alias "${slug}-release" -storepass "$KEYSTORE_PASS" 2>/dev/null | grep "SHA256:" | sed 's/.*SHA256: //' || echo "")
-          
+
           if [[ -n "$SHA1" ]]; then
             echo "   SHA-1:   $SHA1"
           fi
           if [[ -n "$SHA256" ]]; then
             echo "   SHA-256: $SHA256"
           fi
-          
+
           echo ""
           echo "   Location: $keystore_path"
           echo ""
-          
+
           # Update gradle.properties
           { echo ""; echo "# Release signing"
             echo "RELEASE_STORE_FILE=${slug}-release.keystore"
@@ -9153,19 +8894,19 @@ case "$CMD" in
     if [[ "$RELEASE_LOCAL" == "false" ]]; then
       discover_apps
       [[ ${#MOBILE_APPS[@]} -eq 0 ]] && echo "⚠️  No mobile apps found." && exit 1
-      
+
       echo ""
       echo "☁️  Building release for $RELEASE_PLATFORM in the cloud (EAS)..."
       echo "   Use 'local' flag to build locally instead"
       echo ""
-      
+
       for folder in "${MOBILE_APPS[@]}"; do
         slug=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-        
+
         # Reuse _do_eas_build so project linking is handled automatically
         _do_eas_build "$slug" "$RELEASE_PLATFORM" "production"
       done
-      
+
       echo ""
       echo "✅ Cloud builds submitted!"
       echo "   Download from: https://expo.dev"
@@ -9178,7 +8919,7 @@ case "$CMD" in
       echo "   For iOS, use cloud builds: ./dev.sh release ios"
       exit 1
     fi
-    
+
     discover_apps
     [[ ${#MOBILE_APPS[@]} -eq 0 ]] && echo "⚠️  No mobile apps found." && exit 1
 
@@ -9197,86 +8938,34 @@ case "$CMD" in
     for folder in "${MOBILE_APPS[@]}"; do
       android_dir="$MOBILE_DIR/$folder/android"
       slug=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-      
+
       # Ensure android directory exists and is properly configured
       if [[ ! -d "$android_dir" ]] || [[ ! -f "$android_dir/gradlew" ]]; then
         echo "📦 Preparing android directory for '$folder'..."
         _ensure_android_dir "$folder" "$android_dir"
       fi
-      
+
       # Verify android directory was created successfully
       if [[ ! -f "$android_dir/gradlew" ]]; then
         echo "❌ Failed to prepare android directory for '$folder'"
         failed+=("$folder")
         continue
       fi
-      
+
       echo ""
       echo "========================================="
       echo "📦 Building release AAB: $folder"
       echo "========================================="
       echo "sdk.dir=$ANDROID_HOME" > "$android_dir/local.properties"
-      
-      # Set production environment and API URL for release builds
-      # Load all necessary environment variables from .env
-      # Derive a fallback prod URL from the project folder name:
-      _proj_domain=$(echo "$PROJECT_DISPLAY_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/\.app$//')
-      _fallback_prod_url="https://api.${_proj_domain}.app"
 
-      if [[ -f "$ROOT_DIR/.env" ]]; then
-        # Load production API URL
-        PROD_API_URL=$(grep "^EXPO_PUBLIC_API_URL_PRODUCTION=" "$ROOT_DIR/.env" | cut -d'=' -f2 || echo "$_fallback_prod_url")
-        
-        # Load Google Maps API key (same for dev and prod)
-        GOOGLE_MAPS_KEY=$(grep "^EXPO_PUBLIC_GOOGLE_MAPS_API_KEY=" "$ROOT_DIR/.env" | cut -d'=' -f2 || echo "")
-        
-        # Load Twilio credentials (same for dev and prod)
-        TWILIO_ACCOUNT_SID=$(grep "^TWILIO_ACCOUNT_SID=" "$ROOT_DIR/.env" | cut -d'=' -f2 || echo "")
-        TWILIO_AUTH_TOKEN=$(grep "^TWILIO_AUTH_TOKEN=" "$ROOT_DIR/.env" | cut -d'=' -f2 || echo "")
-        TWILIO_PHONE_NUMBER=$(grep "^TWILIO_PHONE_NUMBER=" "$ROOT_DIR/.env" | cut -d'=' -f2 || echo "")
-        
-        # Load Stripe keys - use production keys if available, otherwise fall back to dev keys
-        STRIPE_PUBLISHABLE_KEY=$(grep "^EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY_PRODUCTION=" "$ROOT_DIR/.env" | cut -d'=' -f2 || \
-                                 grep "^EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY=" "$ROOT_DIR/.env" | cut -d'=' -f2 || echo "")
-      else
-        echo "⚠️  .env file not found. Using defaults."
-        PROD_API_URL="$_fallback_prod_url"
-        GOOGLE_MAPS_KEY=""
-        TWILIO_ACCOUNT_SID=""
-        TWILIO_AUTH_TOKEN=""
-        TWILIO_PHONE_NUMBER=""
-        STRIPE_PUBLISHABLE_KEY=""
+      # Load every public project variable and apply *_PRODUCTION overrides.
+      # Project integrations require no names or credentials in this template.
+      if ! ANDROID_HOME="$ANDROID_HOME" python3 "$ROOT_DIR/backend/config/project_config.py" \
+          "$ROOT_DIR" run-build production "$android_dir/gradlew" -p "$android_dir" bundleRelease 2>&1; then
+        echo "❌ Build failed for '$folder'"
+        failed+=("$folder")
+        continue
       fi
-      
-      echo "   Environment: production"
-      echo "   API URL: $PROD_API_URL"
-      echo "   Google Maps API: ${GOOGLE_MAPS_KEY:0:20}..."
-      if [[ "$STRIPE_PUBLISHABLE_KEY" == pk_live_* ]]; then
-        echo "   Stripe: LIVE key (${STRIPE_PUBLISHABLE_KEY:0:15}...)"
-      elif [[ "$STRIPE_PUBLISHABLE_KEY" == pk_test_* ]]; then
-        echo "   Stripe: TEST key (${STRIPE_PUBLISHABLE_KEY:0:15}...)"
-        echo "   ⚠️  WARNING: Using test Stripe key in production build!"
-      fi
-      echo ""
-      
-      # Export all environment variables for the build
-      export EXPO_PUBLIC_ENV=production
-      export EXPO_PUBLIC_API_URL="$PROD_API_URL"
-      export EXPO_PUBLIC_GOOGLE_MAPS_API_KEY="$GOOGLE_MAPS_KEY"
-      export EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY="$STRIPE_PUBLISHABLE_KEY"
-      export TWILIO_ACCOUNT_SID="$TWILIO_ACCOUNT_SID"
-      export TWILIO_AUTH_TOKEN="$TWILIO_AUTH_TOKEN"
-      export TWILIO_PHONE_NUMBER="$TWILIO_PHONE_NUMBER"
-      
-      ANDROID_HOME="$ANDROID_HOME" \
-      EXPO_PUBLIC_ENV=production \
-      EXPO_PUBLIC_API_URL="$PROD_API_URL" \
-      EXPO_PUBLIC_GOOGLE_MAPS_API_KEY="$GOOGLE_MAPS_KEY" \
-      EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY="$STRIPE_PUBLISHABLE_KEY" \
-      TWILIO_ACCOUNT_SID="$TWILIO_ACCOUNT_SID" \
-      TWILIO_AUTH_TOKEN="$TWILIO_AUTH_TOKEN" \
-      TWILIO_PHONE_NUMBER="$TWILIO_PHONE_NUMBER" \
-      "$android_dir/gradlew" -p "$android_dir" bundleRelease 2>&1
       aab="$android_dir/app/build/outputs/bundle/release/app-release.aab"
       if [[ -f "$aab" ]]; then
         cp "$aab" "$OUTPUT_DIR/${slug}-release.aab"
@@ -9330,7 +9019,7 @@ case "$CMD" in
       echo "❌ Android SDK install failed. Check the output above for errors."
       exit 1
     fi
-    
+
     # Start emulator if not running
     if ! _emulator_running; then
       echo "🚀 Starting Android emulator..."
@@ -9339,7 +9028,7 @@ case "$CMD" in
       echo "✅ Android emulator already running"
       # Still set up adb reverse and install apps
       _setup_physical_devices
-      
+
       # Install apps if they exist
       discover_apps
       if has_mobile_apps; then
@@ -9352,7 +9041,7 @@ case "$CMD" in
         done
       fi
     fi
-    
+
     echo ""
     echo "✅ Android environment ready!"
     echo "   Emulator is running with port forwarding configured"
@@ -9361,12 +9050,12 @@ case "$CMD" in
   disk)
     echo "💾 Disk Usage Analysis"
     echo ""
-    
+
     # Podman system usage
     echo "📊 Podman Resources:"
     podman system df 2>/dev/null || echo "   (Podman not running)"
     echo ""
-    
+
     # Podman machine disk (macOS/Windows)
     if [[ "$OS" == "mac" || "$OS" == "windows" ]]; then
       echo "🖥️  Podman Machine Disk:"
@@ -9384,11 +9073,11 @@ case "$CMD" in
       fi
       echo ""
     fi
-    
+
     # Project directory caches
     echo "📁 Project Directory Caches:"
     _total_cache=0
-    
+
     if [[ -d "$ROOT_DIR/backend" ]]; then
       _pycache=$(find "$ROOT_DIR/backend" -type d -name "__pycache__" -exec du -sk {} + 2>/dev/null | awk '{sum+=$1} END {print sum}')
       if [[ -n "$_pycache" && "$_pycache" -gt 0 ]]; then
@@ -9396,21 +9085,21 @@ case "$CMD" in
         _total_cache=$((_total_cache + _pycache))
       fi
     fi
-    
+
     if [[ -d "$ROOT_DIR/frontend" ]]; then
       _expo_cache=$(find "$ROOT_DIR/frontend" -type d -name ".expo" -exec du -sk {} + 2>/dev/null | awk '{sum+=$1} END {print sum}')
       if [[ -n "$_expo_cache" && "$_expo_cache" -gt 0 ]]; then
         echo "   Expo cache: $(numfmt --to=iec --suffix=B $((_expo_cache * 1024)) 2>/dev/null || echo \"${_expo_cache}K\")"
         _total_cache=$((_total_cache + _expo_cache))
       fi
-      
+
       _node_cache=$(find "$ROOT_DIR/frontend" -type d -path "*/node_modules/.cache" -exec du -sk {} + 2>/dev/null | awk '{sum+=$1} END {print sum}')
       if [[ -n "$_node_cache" && "$_node_cache" -gt 0 ]]; then
         echo "   Node modules cache: $(numfmt --to=iec --suffix=B $((_node_cache * 1024)) 2>/dev/null || echo \"${_node_cache}K\")"
         _total_cache=$((_total_cache + _node_cache))
       fi
     fi
-    
+
     if [[ $_total_cache -gt 0 ]]; then
       echo "   Total project caches: $(numfmt --to=iec --suffix=B $((_total_cache * 1024)) 2>/dev/null || echo \"${_total_cache}K\")"
     else
@@ -9814,6 +9503,29 @@ case "$CMD" in
       echo "     git push"
       echo ""
       echo "   Production will auto-restore this snapshot on the next deploy."
+    fi
+    ;;
+
+  qr)
+    # ── ./dev.sh qr [app-name] ──────────────────────────────────────────────────
+    # Display QR codes for a specific mobile app or all apps
+    APP_NAME="${2:-}"
+
+    if [[ -z "$APP_NAME" ]]; then
+      # No app specified - show QR codes for all apps
+      discover_apps
+      if [[ ${#MOBILE_APPS[@]} -eq 0 ]]; then
+        echo "❌ No mobile apps found in $MOBILE_DIR"
+        exit 1
+      fi
+      _print_mobile_qrs
+    else
+      # Show QR codes for specific app by running show-qr.sh
+      if [[ ! -f "$ROOT_DIR/show-qr.sh" ]]; then
+        echo "❌ show-qr.sh script not found"
+        exit 1
+      fi
+      bash "$ROOT_DIR/show-qr.sh" "$APP_NAME"
     fi
     ;;
 

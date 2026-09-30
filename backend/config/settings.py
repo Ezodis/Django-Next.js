@@ -1,13 +1,29 @@
 import logging
+import importlib
 import os
 from datetime import timedelta
 from pathlib import Path
 
 import dj_database_url
 
+from .project_config import find_apps
+
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def env_value(name, default):
+    value = os.getenv(name)
+    return value if value and value.strip() else default
+
+
+def env_int(name, default):
+    return int(env_value(name, default))
+
+
+def env_bool(name, default):
+    return env_value(name, str(default)).lower() == "true"
 
 
 # Core ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
@@ -16,7 +32,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv("DJANGO_DEBUG", "False").lower() == "true"
+DEBUG = env_bool("DJANGO_DEBUG", False)
 
 DOMAIN = os.getenv("DOMAIN")
 if not DOMAIN and not DEBUG:
@@ -40,21 +56,6 @@ else:
 
 
 # Applications ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
-
-def find_apps(base_dir, exclude_dirs=None):
-    """Dynamically discover Django apps in base_dir."""
-    exclude_dirs = list(exclude_dirs or []) + ['config']
-    apps = []
-    for item in os.listdir(base_dir):
-        item_path = os.path.join(base_dir, item)
-        if (
-            os.path.isdir(item_path)
-            and item not in exclude_dirs
-            and os.path.isfile(os.path.join(item_path, '__init__.py'))
-        ):
-            apps.append(item)
-    return apps
-
 
 INSTALLED_APPS = [
     'corsheaders',
@@ -114,11 +115,11 @@ if DEBUG:
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",
-            "NAME": os.getenv("DB_NAME", "postgres"),
-            "USER": os.getenv("DB_USER", "postgres"),
-            "PASSWORD": os.getenv("DB_PASSWORD", "postgres"),
-            "HOST": os.getenv("DB_HOST", "db"),
-            "PORT": os.getenv("DB_PORT", "5432"),
+            "NAME": env_value("DB_NAME", "postgres"),
+            "USER": env_value("DB_USER", "postgres"),
+            "PASSWORD": env_value("DB_PASSWORD", "postgres"),
+            "HOST": env_value("DB_HOST", "db"),
+            "PORT": env_value("DB_PORT", "5432"),
         }
     }
 else:
@@ -126,7 +127,7 @@ else:
         "default": dj_database_url.config(
             default="postgres://user:password@host:5432/dbname",
             conn_max_age=600,
-            ssl_require=os.getenv("DB_SSL_REQUIRE", "true").lower() == "true",
+            ssl_require=env_bool("DB_SSL_REQUIRE", True),
         )
     }
 
@@ -138,9 +139,9 @@ REDIS_URL = os.getenv('REDIS_URL')
 if DEBUG:
     # In dev, auto-build Redis URL from individual env vars (set by Docker Compose)
     if not REDIS_URL:
-        REDIS_HOST = os.getenv('REDIS_HOST', 'redis')
-        REDIS_PORT = os.getenv('REDIS_PORT', '6379')
-        REDIS_DB   = os.getenv('REDIS_DB', '0')
+        REDIS_HOST = env_value('REDIS_HOST', 'redis')
+        REDIS_PORT = env_value('REDIS_PORT', '6379')
+        REDIS_DB   = env_value('REDIS_DB', '0')
         REDIS_URL  = f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
 
 if REDIS_URL:
@@ -151,12 +152,15 @@ if REDIS_URL:
             'OPTIONS': {
                 'CLIENT_CLASS': 'django_redis.client.DefaultClient',
                 'CONNECTION_POOL_KWARGS': {
-                    'max_connections': int(os.getenv('REDIS_MAX_CONNECTIONS', '50')),
+                    'max_connections': env_int('REDIS_MAX_CONNECTIONS', 50),
                     'retry_on_timeout': True,
                 },
             },
-            'KEY_PREFIX': BASE_DIR.parent.name.lower().replace(' ', '_').replace('-', '_'),
-            'TIMEOUT': int(os.getenv('CACHE_TIMEOUT', '300')),  # 5 minutes default
+            'KEY_PREFIX': env_value(
+                'CACHE_KEY_PREFIX',
+                env_value('COMPOSE_PROJECT_NAME', DOMAIN or BASE_DIR.parent.name or BASE_DIR.name),
+            ),
+            'TIMEOUT': env_int('CACHE_TIMEOUT', 300),  # 5 minutes default
         }
     }
     SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
@@ -166,7 +170,7 @@ else:
     CACHES = {
         'default': {
             'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-            'TIMEOUT': int(os.getenv('CACHE_TIMEOUT', '300')),
+            'TIMEOUT': env_int('CACHE_TIMEOUT', 300),
         }
     }
     SESSION_ENGINE = 'django.contrib.sessions.backends.db'
@@ -187,12 +191,8 @@ AUTH_PASSWORD_VALIDATORS = [
 
 # Internationalisation ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
 
-LANGUAGE_CODE = os.getenv('LANGUAGE_CODE', 'en-us')
-LANGUAGES = [
-    ('en', 'English'),
-    ('es', 'Spanish'),
-]
-TIME_ZONE = os.getenv('TIME_ZONE', 'UTC')
+LANGUAGE_CODE = env_value('LANGUAGE_CODE', 'en-us')
+TIME_ZONE = env_value('TIME_ZONE', 'UTC')
 USE_I18N = True
 USE_TZ = True
 
@@ -207,8 +207,8 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 PRIVATE_ASSETS_PATH = os.path.join(BASE_DIR.parent, 'private_assets')
 
-DATA_UPLOAD_MAX_MEMORY_SIZE = int(os.getenv('DATA_UPLOAD_MAX_MEMORY_SIZE', '524288000'))  # 500 MB default
-FILE_UPLOAD_MAX_MEMORY_SIZE = int(os.getenv('FILE_UPLOAD_MAX_MEMORY_SIZE', '10485760'))   # 10 MB default
+DATA_UPLOAD_MAX_MEMORY_SIZE = env_int('DATA_UPLOAD_MAX_MEMORY_SIZE', 524288000)  # 500 MB default
+FILE_UPLOAD_MAX_MEMORY_SIZE = env_int('FILE_UPLOAD_MAX_MEMORY_SIZE', 10485760)   # 10 MB default
 
 
 # REST Framework & JWT ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
@@ -230,14 +230,14 @@ REST_FRAMEWORK = {
         'rest_framework.throttling.UserRateThrottle',
     ],
     'DEFAULT_THROTTLE_RATES': {
-        'anon': os.getenv('THROTTLE_ANON', '10000/hour'),
-        'user': os.getenv('THROTTLE_USER', '100000/hour'),
+        'anon': env_value('THROTTLE_ANON', '10000/hour'),
+        'user': env_value('THROTTLE_USER', '100000/hour'),
     },
 }
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(hours=int(os.getenv('JWT_ACCESS_TOKEN_HOURS', '1'))),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=int(os.getenv('JWT_REFRESH_TOKEN_DAYS', '7'))),
+    'ACCESS_TOKEN_LIFETIME': timedelta(hours=env_int('JWT_ACCESS_TOKEN_HOURS', 1)),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=env_int('JWT_REFRESH_TOKEN_DAYS', 7)),
     'ROTATE_REFRESH_TOKENS': True,
     'BLACKLIST_AFTER_ROTATION': True,
 }
@@ -292,14 +292,6 @@ else:
             f"https://api.{DOMAIN}",
         ])
     
-    # Dynamic Vercel preview support - extract project name from domain
-    if DOMAIN:
-        project_name = DOMAIN.split('.')[0]
-        vercel_preview_pattern = f"https://{project_name}-*.vercel.app"
-        if vercel_preview_pattern not in CORS_ALLOWED_ORIGINS:
-            CORS_ALLOWED_ORIGINS.append(vercel_preview_pattern)
-            logger.info(f"Added Vercel preview pattern to CORS allowed origins: {vercel_preview_pattern}")
-    
     # Extra origins for staging, preview deploys, etc. (comma-separated)
     # Supports both exact URLs and patterns like "https://*.example.com"
     extra_origins = os.getenv("EXTRA_CORS_ORIGINS", "")
@@ -309,6 +301,21 @@ else:
                 CORS_ALLOWED_ORIGINS.append(origin)
             if origin not in CSRF_TRUSTED_ORIGINS:
                 CSRF_TRUSTED_ORIGINS.append(origin)
+
+# Hosting providers and preview URL formats are configured explicitly.
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    pattern.strip() for pattern in os.getenv('EXTRA_CORS_ORIGIN_REGEXES', '').split(',')
+    if pattern.strip()
+]
+CSRF_TRUSTED_ORIGINS.extend(
+    origin.strip() for origin in os.getenv('EXTRA_CSRF_ORIGINS', '').split(',')
+    if origin.strip() and origin.strip() not in CSRF_TRUSTED_ORIGINS
+)
+if DEBUG and os.getenv('PROJECT_HOST'):
+    CSRF_TRUSTED_ORIGINS.extend([
+        f"http://{os.environ['PROJECT_HOST']}.localhost",
+        f"https://{os.environ['PROJECT_HOST']}.localhost",
+    ])
 
 CORS_EXPOSE_HEADERS = ['Content-Type', 'X-CSRFToken']
 CORS_ALLOW_HEADERS = [
@@ -348,7 +355,7 @@ else:
         CSRF_COOKIE_DOMAIN = f".{DOMAIN}"
 
 SESSION_COOKIE_HTTPONLY = True
-SESSION_COOKIE_AGE = int(os.getenv('SESSION_COOKIE_AGE', '86400'))  # 1 day default
+SESSION_COOKIE_AGE = env_int('SESSION_COOKIE_AGE', 86400)  # 1 day default
 SESSION_EXPIRE_AT_BROWSER_CLOSE = False
 SESSION_SAVE_EVERY_REQUEST = False  # Only save modified sessions
 
@@ -361,7 +368,7 @@ X_FRAME_OPTIONS = 'DENY'
 
 if not DEBUG:
     SECURE_SSL_REDIRECT = True
-    SECURE_HSTS_SECONDS = int(os.getenv('SECURE_HSTS_SECONDS', '31536000'))  # 1 year default
+    SECURE_HSTS_SECONDS = env_int('SECURE_HSTS_SECONDS', 31536000)  # 1 year default
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
@@ -374,19 +381,31 @@ EMAIL_BACKEND = (
     if not DEBUG
     else 'django.core.mail.backends.console.EmailBackend'
 )
-EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
-EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
-EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'true').lower() == 'true'
+EMAIL_HOST = env_value('EMAIL_HOST', 'localhost')
+EMAIL_PORT = env_int('EMAIL_PORT', 587)
+EMAIL_USE_TLS = env_bool('EMAIL_USE_TLS', True)
 EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', '')
 
-print(f"⊧ {DATABASES['default']['ENGINE']}")
-print(f"⊧ DEBUG: {DEBUG} | HOSTS: {ALLOWED_HOSTS}")
-if REDIS_URL:
-    print(f"⊧ Cache: Redis ({REDIS_URL.split('@')[-1]})")
+logger.info("Database: %s | DEBUG: %s", DATABASES['default']['ENGINE'], DEBUG)
+
+
+# Apply project settings while preserving discovered and core Django apps.
+# Missing project.py is supported; errors inside an existing module must surface.
+try:
+    _project = importlib.import_module('project')
+except ModuleNotFoundError as _error:
+    if _error.name != 'project':
+        raise
 else:
-    print(f"⊧ Cache: in-memory (no Redis)")
+    for _name, _value in vars(_project).items():
+        if not _name.isupper() or _name.startswith('_'):
+            continue
+        if _name == 'INSTALLED_APPS':
+            INSTALLED_APPS = list(dict.fromkeys(INSTALLED_APPS + list(_value)))
+        else:
+            globals()[_name] = _value
 
 
 # Dev server autoreloader exclusions ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
@@ -396,27 +415,17 @@ if DEBUG:
     try:
         import django.utils.autoreload as _autoreload
 
-        _EXCLUDE_PREFIXES = (
-            str(BASE_DIR / 'media'),
-            str(BASE_DIR.parent / 'imports'),
-            '/imports',
+        _EXCLUDE_PREFIXES = tuple(
+            Path(path).resolve() for path in [MEDIA_ROOT] + list(globals().get('AUTORELOAD_EXCLUDE_PATHS', []))
         )
 
         _orig_watched_files = _autoreload.StatReloader.watched_files
 
         def _patched_watched_files(self, include_globs=True):
             for path in _orig_watched_files(self, include_globs):
-                if not any(str(path).startswith(ex) for ex in _EXCLUDE_PREFIXES):
+                if not any(Path(path).resolve().is_relative_to(ex) for ex in _EXCLUDE_PREFIXES):
                     yield path
 
         _autoreload.StatReloader.watched_files = _patched_watched_files
     except Exception:
         pass  # non-fatal — skip if Django internals changed
-
-
-# Project-specific settings ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
-# Import backend/project.py settings
-try:
-    from project import *  # noqa: F401, F403
-except ImportError:
-    pass

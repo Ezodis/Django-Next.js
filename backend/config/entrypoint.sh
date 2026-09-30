@@ -48,18 +48,7 @@ fi
 
 # Auto-restore from backup if present
 if [ -f /backend/backup/backup.sh ]; then
-    RESTORE_MARKER="/backend/backup/.db_restored"
-    NEWEST_SNAPSHOT=$(ls -1t /backend/backup/start/*.tar.gz 2>/dev/null | head -n 1)
-
-    # Force restore if the books table is empty, regardless of marker
-    if [ -n "$NEWEST_SNAPSHOT" ]; then
-        BOOK_COUNT=$(psql -t -c "SELECT COUNT(*) FROM books_book;" 2>/dev/null | tr -d '[:space:]' || echo "0")
-        if [ "$BOOK_COUNT" = "0" ] || [ -z "$BOOK_COUNT" ]; then
-            echo "📚 books_book table is empty — forcing restore from snapshot"
-            rm -f "$RESTORE_MARKER"
-        fi
-    fi
-
+    # The backup utility owns restore eligibility and its completion marker.
     /backend/backup/backup.sh auto-restore || true
 fi
 

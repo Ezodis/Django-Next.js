@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Windows entry point for dev.sh.
@@ -55,6 +55,8 @@ function Test-UbuntuInstalled {
 
 function Get-WslPath {
     param([string]$WinPath)
+    # Forward slashes survive native argument passing in Windows PowerShell.
+    $WinPath = $WinPath -replace '\\', '/'
     $wslPath = $null
     try {
         $wslPath = ((wsl.exe -d Ubuntu -- wslpath -a "$WinPath" 2>$null) -join '' -replace "`r", '').Trim()
@@ -96,6 +98,97 @@ function Find-ScrcpyExecutable {
     $command = Get-Command scrcpy -ErrorAction SilentlyContinue
     if ($command) { return $command.Source }
     return $null
+}
+
+function Ensure-WSLPortForwarding {
+    # Fix WSL2 port forwarding to localhost - only runs if needed and has admin rights
+    if (-not (Test-UbuntuInstalled)) { return }
+
+    try {
+        # Check if localhost:80 is already accessible
+        $client = New-Object System.Net.Sockets.TcpClient
+        try {
+            $connect = $client.ConnectAsync('127.0.0.1', 80)
+            $testConnection = $connect.Wait(1500) -and $client.Connected
+        } finally {
+            $client.Dispose()
+        }
+    } catch { }
+
+    # Keep the existing web alias and the project host.
+    $projectHost = ((Get-Item $ROOT_DIR).Name -replace '[^a-zA-Z0-9]', '').ToLowerInvariant() + '.localhost'
+    $hostsPath = Join-Path $env:WINDIR 'System32\drivers\etc\hosts'
+    $hostsContent = Get-Content -LiteralPath $hostsPath -ErrorAction SilentlyContinue
+    $missingHosts = @(@($projectHost) | Select-Object -Unique | Where-Object {
+        $aliasPattern = '^\s*127\.0\.0\.1\s+[^#]*\b' + [regex]::Escape($_) + '(\s|$)'
+        -not ($hostsContent -match $aliasPattern)
+    })
+    $hasHostsEntry = $missingHosts.Count -eq 0
+    $hostsEntry = "127.0.0.1 $($missingHosts -join ' ')"
+    if ($testConnection -and $hasHostsEntry) { return }
+
+    # Check if we're already running as admin
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    if ($isAdmin) {
+        if (-not $hasHostsEntry) {
+            Add-Content -LiteralPath $hostsPath -Value "`n$hostsEntry"
+            _ok "Mapped https://$projectHost"
+        }
+        if ($testConnection) { return }
+        # We have admin rights - fix port forwarding silently
+        try {
+            $wslIP = (wsl.exe -d Ubuntu -- hostname -I 2>$null).Split()[0].Trim()
+            if ($wslIP) {
+                # Remove any existing rule first
+                netsh interface portproxy delete v4tov4 listenport=80 listenaddress=0.0.0.0 2>$null | Out-Null
+                # Add the new rule
+                netsh interface portproxy add v4tov4 listenport=80 listenaddress=0.0.0.0 connectport=80 connectaddress=$wslIP 2>$null | Out-Null
+
+                # Also add port 443 for HTTPS
+                netsh interface portproxy delete v4tov4 listenport=443 listenaddress=0.0.0.0 2>$null | Out-Null
+                netsh interface portproxy add v4tov4 listenport=443 listenaddress=0.0.0.0 connectport=443 connectaddress=$wslIP 2>$null | Out-Null
+            }
+        } catch { }
+    } else {
+        if (-not $hasHostsEntry) {
+            # Ask once for the smallest possible elevation: add only this
+            # project's loopback name, then continue starting normally.
+            $elevatedScript = "`$hosts = '$hostsPath'; `$entry = '$hostsEntry'; if (-not (Select-String -LiteralPath `$hosts -SimpleMatch `$entry -Quiet -ErrorAction SilentlyContinue)) { Add-Content -LiteralPath `$hosts -Value ([Environment]::NewLine + `$entry) }"
+            $encodedScript = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($elevatedScript))
+            Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList "-NoProfile -EncodedCommand $encodedScript" -ErrorAction SilentlyContinue
+            _warn "Approve the one-time UAC prompt to map $($missingHosts -join ", ") locally."
+        }
+        if ($testConnection) { return }
+        # Not admin - check if forwarding is needed
+        try {
+            # Try to connect to WSL IP directly
+            $wslIP = (wsl.exe -d Ubuntu -- hostname -I 2>$null).Split()[0].Trim()
+            if ($wslIP) {
+                $client = New-Object System.Net.Sockets.TcpClient
+                try {
+                    $connect = $client.ConnectAsync($wslIP, 80)
+                    $wslTest = $connect.Wait(1500) -and $client.Connected
+                } finally {
+                    $client.Dispose()
+                }
+                if ($wslTest -and -not $testConnection) {
+                    # WSL is reachable but localhost isn't - offer to fix
+                    Write-Host ""
+                    _warn "localhost:80 is not accessible (WSL2 port forwarding issue)"
+                    _step "You can access via WSL IP:  http://$wslIP/"
+                    Write-Host ""
+                    $response = Read-Host "  Fix port forwarding permanently? (requires admin) [Y/n]"
+                    if ($response -ne 'n' -and $response -ne 'N') {
+                        # Re-run this script with admin rights
+                        $scriptPath = $MyInvocation.MyCommand.Path
+                        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" $($DevArgs -join ' ')" -Verb RunAs
+                        exit 0
+                    }
+                }
+            }
+        } catch { }
+    }
 }
 
 function Install-Scrcpy {
@@ -375,7 +468,7 @@ _need() {
 }
 
 # Core utilities
-_need curl ca-certificates gnupg git python3
+_need curl ca-certificates gnupg git python3 rsync
 
 # Node.js LTS (via NodeSource)
 if ! command -v node &>/dev/null; then
@@ -468,8 +561,35 @@ echo "  OK All tools ready inside Ubuntu"
     Write-Host ""
 }
 
-# ── 5. Convert Windows path → WSL2 path and hand off ────────────────────────
+# Cloud builds need the original Git checkout for EAS's project archive.
+# The container mirror intentionally excludes .git; it is for local services.
+if ($DevArgs.Count -gt 1 -and $DevArgs[0] -eq 'build' -and $DevArgs -notcontains 'local') {
+    $cloudRoot = Get-WslPath $ROOT_DIR
+    $cloudArgs = Build-ArgStr $DevArgs
+    $cloudScript = "/tmp/devtools-cloud-build-$PID.sh"
+    $cloudScriptWin = "\\wsl.localhost\Ubuntu\tmp\devtools-cloud-build-$PID.sh"
+    $cloudContent = "#!/bin/bash`nexport PATH=`"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:`$HOME/.local/bin`"`ncd '$cloudRoot'`nsed -i 's/\r//' dev.sh`nexec bash dev.sh $cloudArgs`n"
+    [System.IO.File]::WriteAllText($cloudScriptWin, $cloudContent, (New-Object System.Text.UTF8Encoding $false))
+    try {
+        wsl.exe -d Ubuntu -- bash $cloudScript
+        $cloudExit = $LASTEXITCODE
+    } finally {
+        wsl.exe -d Ubuntu -- rm -f $cloudScript 2>$null | Out-Null
+    }
+    exit $cloudExit
+}
+
+# ── Fix WSL2 port forwarding if needed ────────────────────────────────────────
+Ensure-WSLPortForwarding
+
+# ── 5. Mirror the Windows workspace into WSL and hand off ───────────────────
+# Podman running inside WSL cannot reliably bind-mount files from C:\.  The
+# failure presents as EIO scandir/stat errors in Next and Django, leaving both
+# frontend and backend dead.  Run containers from a native WSL mirror instead,
+# and keep that mirror refreshed in the background while the launcher runs.
 $wslRoot = Get-WslPath $ROOT_DIR
+$workspaceLeaf = ((Get-Item $ROOT_DIR).Name -replace '[^a-zA-Z0-9._-]', '-').ToLowerInvariant()
+$wslWorkspace = "/root/.codex-workspaces/$workspaceLeaf"
 $argStr = Build-ArgStr $DevArgs
 
 # Write the command to a temp script to avoid PowerShell quoting issues.
@@ -477,8 +597,80 @@ $argStr = Build-ArgStr $DevArgs
 # PowerShell adds CRLF which bash misparsed, mangling the argument list.
 $tmpScript = "/tmp/devtools-run-$PID.sh"
 $tmpScriptWin = "\\wsl.localhost\Ubuntu\tmp\devtools-run-$PID.sh"
-$bashContent = "#!/bin/bash`nexport PATH=`"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:`$HOME/.local/bin`"`ncd '$wslRoot'`nsed -i 's/\r//' dev.sh`nexec bash dev.sh $argStr`n"
-[System.IO.File]::WriteAllText($tmpScriptWin, $bashContent, (New-Object System.Text.UTF8Encoding $false))
+$bashContent = @"
+#!/bin/bash
+set -e
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:`$HOME/.local/bin"
+SOURCE_DIR='$wslRoot'
+WORKSPACE_DIR='$wslWorkspace'
+SYNC_PID_FILE="/tmp/devtools-sync-$workspaceLeaf.pid"
+mkdir -p "`$WORKSPACE_DIR"
+
+sync_runtime_env() {
+  local source="`$1"
+  local target="`$2"
+  [[ ! -f "`$source" ]] && return
+  python3 -c '
+import re, sys
+from pathlib import Path
+
+def merge(source, runtime):
+    values = dict(line.split("=", 1) for line in runtime.splitlines()
+                  if "=" in line and not line.startswith("#"))
+    source_values = dict(line.split("=", 1) for line in source.splitlines()
+                         if "=" in line and not line.startswith("#"))
+    if source_values.get("CLOUDFLARE_TUNNEL_TOKEN", "").strip():
+        return source
+    retained = {key: value for key, value in values.items()
+                if re.fullmatch(r"CLOUDFLARE_TUNNEL_URL|METRO_TUNNEL_URL_\d+", key)
+                and re.fullmatch(r"https://[a-z0-9-]+\.trycloudflare\.com/?", value)}
+    lines = []
+    for line in source.splitlines():
+        key = line.partition("=")[0]
+        lines.append(f"{key}={retained.pop(key)}" if key in retained else line)
+    lines.extend(f"{key}={value}" for key, value in retained.items())
+    return "\n".join(lines) + "\n"
+
+source, target = map(Path, sys.argv[1:])
+if source.exists():
+    target.write_text(merge(source.read_text(), target.read_text() if target.exists() else ""))
+' "`$source" "`$target"
+}
+
+sync_workspace() {
+  local keep_runtime_env="`$1"
+  if [[ "`$keep_runtime_env" != "live" ]]; then
+    sync_runtime_env "`$SOURCE_DIR/.env" "`$WORKSPACE_DIR/.env"
+  fi
+  rsync -a --delete \
+    --exclude '.git/' --exclude 'node_modules/' --exclude '.next/' \
+    --exclude '.expo/' --exclude '__pycache__/' --exclude '*.pyc' \
+    --exclude 'backend/media/' --exclude 'backend/config/staticfiles/' \
+    --exclude '/.env' \
+    "`$SOURCE_DIR/" "`$WORKSPACE_DIR/"
+}
+
+sync_workspace
+if [[ -f "`$SYNC_PID_FILE" ]] && ! kill -0 "`$(cat "`$SYNC_PID_FILE" 2>/dev/null)" 2>/dev/null; then rm -f "`$SYNC_PID_FILE"; fi
+if [[ ! -f "`$SYNC_PID_FILE" ]]; then
+  (
+    while true; do
+      # dev.sh writes runtime tunnel URLs into .env.  Preserve those values
+      # after the initial copy while syncing every source edit from Windows.
+      sync_workspace live >/dev/null 2>&1 || true
+      sleep 1
+    done
+  ) &
+  echo "`$!" > "`$SYNC_PID_FILE"
+fi
+
+cd "`$WORKSPACE_DIR"
+sed -i 's/\r//' dev.sh
+exec bash dev.sh $argStr
+"@
+# Convert CRLF to LF before writing
+$bashContentUnix = $bashContent -replace "`r`n", "`n" -replace "`r", "`n"
+[System.IO.File]::WriteAllText($tmpScriptWin, $bashContentUnix, (New-Object System.Text.UTF8Encoding $false))
 wsl.exe -d Ubuntu -- chmod +x $tmpScript
 wsl.exe -d Ubuntu -- bash $tmpScript
 $devShExitCode = $LASTEXITCODE
@@ -488,21 +680,24 @@ wsl.exe -d Ubuntu -- rm -f $tmpScript 2>$null | Out-Null
 if ($DevArgs.Count -gt 0 -and $DevArgs[0] -eq 'android') {
     Write-Host ""
     Write-Host "  >> Opening emulator window..." -ForegroundColor Cyan
-    
+
+    # Derive the window label from this checkout; quote for the WSL shell.
+    $emulatorTitle = (Get-Item -LiteralPath $ROOT_DIR).Name + ' Emulator'
+    $quotedTitle = "'" + $emulatorTitle.Replace("'", "'\''") + "'"
     # Launch scrcpy from WSL using WSLg to display the emulator
-    Start-Process wsl -ArgumentList "-d", "Ubuntu", "--", "bash", "-c", "export DISPLAY=:0; scrcpy --serial=emulator-5554 --max-size=1024 --window-title='EliteCar Emulator'" -WindowStyle Hidden
-    
+    Start-Process wsl -ArgumentList "-d", "Ubuntu", "--", "bash", "-c", "export DISPLAY=:0; scrcpy --serial=emulator-5554 --max-size=1024 --window-title=$quotedTitle" -WindowStyle Hidden
+
     Start-Sleep 3
-    
+
     Write-Host ""
     Write-Host "  =================================================================" -ForegroundColor Green
     Write-Host "  ✅ EMULATOR WINDOW IS OPENING!" -ForegroundColor Green
     Write-Host "  =================================================================" -ForegroundColor Green
     Write-Host ""
-    Write-Host "  Look for a window titled 'EliteCar Emulator'" -ForegroundColor Cyan
+    Write-Host "  Look for a window titled '$emulatorTitle'" -ForegroundColor Cyan
     Write-Host "  (It may take 10-15 seconds to appear)" -ForegroundColor Gray
     Write-Host ""
-    Write-Host "  📱 Your EliteCar app is installed and ready!" -ForegroundColor Yellow
+    Write-Host "  📱 The project apps are installed and ready!" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "  📊 Connected to:" -ForegroundColor Yellow
     Write-Host "    • Metro bundler: http://10.0.2.2:8081" -ForegroundColor White
@@ -514,4 +709,5 @@ if ($DevArgs.Count -gt 0 -and $DevArgs[0] -eq 'android') {
     Write-Host ""
 }
 
+# Metro is managed once by dev.sh in containers.
 exit $devShExitCode

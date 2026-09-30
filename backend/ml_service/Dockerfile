@@ -15,9 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY config/requirements/ ./requirements/
+COPY backend/requirements/ ./requirements/
 RUN pip install --upgrade pip && \
-    pip wheel --wheel-dir /wheels --prefer-binary -r requirements/base.txt && \
+    pip wheel --wheel-dir /wheels --prefer-binary -r requirements/deployment.txt -r requirements/ml.txt
 
 # ---------- Runtime Stage ----------
 FROM python:3.12.5-slim-bookworm AS python-run-stage
@@ -42,9 +42,9 @@ RUN pip install --no-cache-dir --no-index --find-links=/wheels --only-binary=:al
 RUN addgroup --system django && adduser --system --ingroup django django
 
 # Copy only necessary application code
-COPY --chown=django:django config/ /backend/config/
-COPY --chown=django:django ml_service/ /backend/ml_service/
-COPY --chown=django:django manage.py /backend/
+COPY --chown=django:django backend/config/ /backend/config/
+COPY --chown=django:django backend/ml_service/ /backend/ml_service/
+COPY --chown=django:django backend/manage.py /backend/
 
 # Create minimal settings for ML-only service
 RUN cat > /backend/config/settings_ml.py <<'EOF'

@@ -89,32 +89,13 @@ if not DEBUG:
 
 
 # Sync protection ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
-# Auto-discovered — no need to hardcode.
-# Backend: any folder with an __init__.py (Django apps), excluding config/
-# Mobile:  any folder with a package.json under frontend/mobile/, excluding shared/
-_MOBILE_SKIP = {'shared', 'node_modules', 'scripts', 'packages'}
-_PROJECT_ROOT = _BASE_DIR.parent
-
-SYNC_PROJECT_PATHS = (
-    # All Django apps in backend/
-    [
-        f"backend/{item}/"
-        for item in os.listdir(_BASE_DIR)
-        if item != 'config'
-        and os.path.isdir(_BASE_DIR / item)
-        and os.path.isfile(_BASE_DIR / item / '__init__.py')
-    ]
-    +
-    # All Expo/RN apps in frontend/mobile/
-    [
-        f"frontend/mobile/{item}/"
-        for item in os.listdir(_PROJECT_ROOT / 'frontend' / 'mobile')
-        if item not in _MOBILE_SKIP
-        and os.path.isdir(_PROJECT_ROOT / 'frontend' / 'mobile' / item)
-        and os.path.isfile(_PROJECT_ROOT / 'frontend' / 'mobile' / item / 'package.json')
-    ]
-    if (_PROJECT_ROOT / 'frontend' / 'mobile').is_dir() else []
-)
+# Shared tooling discovers application paths without importing this module.
+# Keep these bootstrap options as literal values.
+SYNC_PROJECT_PATHS = ["backend/ml_service/"]
+SYNC_TEMPLATE_REPO = "Ezodis/Django-Next.js"
+MOBILE_APP_ORDER = []
+MOBILE_ANDROID_METADATA = {}
+AUTORELOAD_EXCLUDE_PATHS = [str(_BASE_DIR.parent / 'imports'), '/imports']
 
 
 # Compose services ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿

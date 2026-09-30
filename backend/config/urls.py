@@ -13,21 +13,9 @@ from django.views.decorators.http import require_http_methods
 from django.views.static import serve
 from rest_framework_simplejwt.views import TokenRefreshView
 
+from .project_config import find_apps
+
 logger = logging.getLogger(__name__)
-
-
-def find_apps(base_dir, exclude_dirs=None):
-    exclude_dirs = list(exclude_dirs or []) + ["config", "__pycache__"]
-    apps = []
-    for item in os.listdir(base_dir):
-        item_path = os.path.join(base_dir, item)
-        if (
-            os.path.isdir(item_path)
-            and item not in exclude_dirs
-            and os.path.isfile(os.path.join(item_path, "__init__.py"))
-        ):
-            apps.append(item)
-    return apps
 
 
 def _try_include(app, url_module=None):
@@ -36,8 +24,10 @@ def _try_include(app, url_module=None):
     try:
         importlib.import_module(module)
         return include(module)
-    except ModuleNotFoundError:
-        return None
+    except ModuleNotFoundError as error:
+        if error.name == module:
+            return None
+        raise
 
 
 def health_check(request):
@@ -95,6 +85,9 @@ urlpatterns = [
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 apps = find_apps(BASE_DIR, exclude_dirs=["backend", "migrations"])
+apps = [app for app in apps if app in settings.INSTALLED_APPS or any(
+    installed.startswith(f'{app}.') for installed in settings.INSTALLED_APPS
+)]
 
 # CUSTOM_URL_PREFIXES is defined in settings.py under project-specific integrations
 custom_prefixes = getattr(settings, "CUSTOM_URL_PREFIXES", {})
