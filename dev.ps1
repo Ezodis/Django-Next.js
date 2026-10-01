@@ -19,7 +19,8 @@
 
     All steps are idempotent — safe to re-run at any time.
 
-    SYNC FAST-PATH
+    FILE MAINTENANCE FAST-PATH
+      Project commands declared in backend/project.py also skip bootstrap.
       .\dev.ps1 sync                Skip the full bootstrap.  WSL2 Ubuntu must
                                     already be installed (run .\dev.ps1 once
                                     first).  Only curl + python3 are verified.
@@ -235,17 +236,23 @@ function Install-Scrcpy {
     }
 }
 
-# ── sync fast-path ─────────────────────────────────────────────────────────────
-# `.\dev.ps1 sync [flags]` skips the full tool bootstrap (podman, cloudflared,
+# ── file maintenance fast-path ─────────────────────────────────────────────────────────────
+# Sync and declared project commands skip the full tool bootstrap (podman, cloudflared,
 # etc.) and goes directly to WSL2 with only the minimal tools sync needs
 # (curl, python3, git, bash — all pre-installed in Ubuntu).
 # This makes `.\dev.ps1 sync` as fast as possible: no package manager installs,
 # no Podman machine startup, just WSL2 → bash dev.sh sync.
-if ($DevArgs.Count -gt 0 -and $DevArgs[0] -eq 'sync') {
+$isProjectCommand = $false
+if ($DevArgs.Count -gt 0 -and $DevArgs[0] -ne 'sync' -and (Test-UbuntuInstalled)) {
+    $commandRoot = Get-WslPath $ROOT_DIR
+    wsl.exe -d Ubuntu -- python3 "$commandRoot/backend/config/project_config.py" "$commandRoot" has-dev-command $DevArgs[0]
+    $isProjectCommand = $LASTEXITCODE -eq 0
+}
+if ($DevArgs.Count -gt 0 -and ($DevArgs[0] -eq 'sync' -or $isProjectCommand)) {
     # 1. Verify WSL2 Ubuntu is ready
     if (-not (Test-UbuntuInstalled)) {
         _fail "WSL2 Ubuntu is not installed."
-        _fail "Run  .\dev.ps1  first to do the one-time setup, then re-run  .\dev.ps1 sync"
+        _fail "Run  .\dev.ps1  first to do the one-time setup, then re-run  .\dev.ps1 $($DevArgs[0])"
         exit 1
     }
 
@@ -255,7 +262,7 @@ if ($DevArgs.Count -gt 0 -and $DevArgs[0] -eq 'sync') {
         if ($out -notmatch 'ready') { throw "not ready" }
     } catch {
         _fail "WSL2 Ubuntu is installed but not responding."
-        _fail "Try:  wsl -d Ubuntu  to diagnose, then re-run  .\dev.ps1 sync"
+        _fail "Try:  wsl -d Ubuntu  to diagnose, then re-run  .\dev.ps1 $($DevArgs[0])"
         exit 1
     }
 
@@ -278,7 +285,7 @@ echo "  OK python3 $(python3 --version 2>/dev/null)"
         _warn "Prerequisite check had warnings (non-fatal, continuing...)"
     }
 
-    # 4. Convert path and run dev.sh sync inside WSL2
+    # 4. Run file maintenance on the original checkout inside WSL2
     $wslRoot2 = Get-WslPath $ROOT_DIR
     $argStr2  = Build-ArgStr $DevArgs
     $tmpScript2    = "/tmp/devtools-sync-$PID.sh"
@@ -644,25 +651,35 @@ sync_workspace() {
   fi
   rsync -a --delete \
     --exclude '.git/' --exclude 'node_modules/' --exclude '.next/' \
-    --exclude '.expo/' --exclude '__pycache__/' --exclude '*.pyc' \
+    --exclude '.expo/' --exclude '.metro-cache/' --exclude '.gradle/' \
+    --exclude '.cxx/' --exclude 'Pods/' --exclude 'build/' --exclude 'dist/' \
+    --exclude '.venv/' --exclude 'venv/' --exclude '__pycache__/' --exclude '*.pyc' \
     --exclude 'backend/media/' --exclude 'backend/config/staticfiles/' \
-    --exclude '/.env' \
+    --exclude '/.env' --exclude '/.dev-sync.lock' --exclude '/.dev-sync.pid' \
     "`$SOURCE_DIR/" "`$WORKSPACE_DIR/"
 }
 
 sync_workspace
-if [[ -f "`$SYNC_PID_FILE" ]] && ! kill -0 "`$(cat "`$SYNC_PID_FILE" 2>/dev/null)" 2>/dev/null; then rm -f "`$SYNC_PID_FILE"; fi
-if [[ ! -f "`$SYNC_PID_FILE" ]]; then
-  (
-    while true; do
-      # dev.sh writes runtime tunnel URLs into .env.  Preserve those values
-      # after the initial copy while syncing every source edit from Windows.
-      sync_workspace live >/dev/null 2>&1 || true
-      sleep 1
-    done
-  ) &
-  echo "`$!" > "`$SYNC_PID_FILE"
+# Normalize before launching the detached worker from the launcher itself.
+sed -i 's/\r//' "`$WORKSPACE_DIR/dev.sh"
+# Stop the old launcher-bound worker when upgrading to the detached worker.
+if [[ -f "`$SYNC_PID_FILE" ]]; then
+  OLD_PID="`$(cat "`$SYNC_PID_FILE" 2>/dev/null)"
+  if [[ "`$OLD_PID" =~ ^[0-9]+`$ ]] && [[ "`$(ps -p "`$OLD_PID" -o args=)" == *devtools-run-* ]]; then
+    pkill -TERM -P "`$OLD_PID" 2>/dev/null || true
+    kill "`$OLD_PID" 2>/dev/null || true
+  fi
 fi
+# flock in the worker prevents duplicate loops on repeated launcher commands.
+nohup setsid bash "`$WORKSPACE_DIR/dev.sh" _workspace-sync "`$SOURCE_DIR" "`$WORKSPACE_DIR" \
+  </dev/null >>"/tmp/devtools-sync-$workspaceLeaf.log" 2>&1 &
+SYNC_START_PID="`$!"
+disown
+# Wait for the worker to detach before the short-lived WSL invocation exits.
+for attempt in {1..20}; do
+  [[ -f "`$WORKSPACE_DIR/.dev-sync.pid" ]] && kill -0 "`$(cat "`$WORKSPACE_DIR/.dev-sync.pid")" 2>/dev/null && break
+  sleep 0.1
+done
 
 cd "`$WORKSPACE_DIR"
 sed -i 's/\r//' dev.sh

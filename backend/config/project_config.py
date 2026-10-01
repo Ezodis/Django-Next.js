@@ -9,6 +9,7 @@ import fnmatch
 import json
 import os
 import re
+import runpy
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -20,7 +21,7 @@ MOBILE_SKIP = {'shared', 'node_modules', 'scripts', 'packages', 'builds'}
 # Shared architecture boundaries. New files inside shared directories are
 # discovered automatically; application source and project.py stay project-owned.
 SHARED_PATHS = (
-    'dev.sh', 'dev.ps1', 'dev.yml', '.gitattributes', '.dockerignore',
+    'AGENTS.md', 'dev.sh', 'dev.ps1', 'dev.yml', '.gitattributes', '.dockerignore',
     'backend/config/*', 'backend/manage.py', 'backend/backup/*.sh',
     'backend/requirements/base.txt', 'backend/requirements/development.txt',
     'backend/requirements/deployment.txt',
@@ -346,6 +347,20 @@ if __name__ == '__main__':
         print('\n'.join(sync_paths(root)))
     elif option == 'sync-repo':
         print(configured_repo(root))
+    elif option == 'has-dev-command':
+        raise SystemExit(0 if sys.argv[3] in project_option(root, 'DEV_COMMANDS', {}) else 1)
+    elif option == 'run-dev-command':
+        command = project_option(root, 'DEV_COMMANDS', {}).get(sys.argv[3])
+        if not command:
+            raise SystemExit(f'Unknown project command: {sys.argv[3]}')
+        os.environ.update(environment_values(root))
+        sys.path.insert(0, str(Path(root).resolve() / 'backend'))
+        namespace = runpy.run_path(str(Path(root).resolve() / 'backend/project.py'))
+        handler = namespace.get(command)
+        if not callable(handler):
+            raise SystemExit(f'Project command handler is not callable: {command}')
+        result = handler(*sys.argv[4:])
+        raise SystemExit(result if isinstance(result, int) else 0)
     elif option == 'sync':
         try:
             raise SystemExit(run_sync(root, sys.argv[3:]))

@@ -1,5 +1,7 @@
 # Core dependencies shared across all environments
 Django==4.2.16
+# IANA timezone data for minimal containers and Windows.
+tzdata>=2024.2
 djangorestframework==3.15.2
 djangorestframework-simplejwt==5.3.1
 django-cors-headers==4.4.0

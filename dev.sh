@@ -83,11 +83,54 @@ set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Keep the detached Windows-to-WSL mirror worker in the launcher itself.
+if [[ "${1:-}" == "_workspace-sync" ]]; then
+  set -u
+  SOURCE_DIR="$(realpath "$2")"
+  WORKSPACE_DIR="$(realpath "$3")"
+  [[ "$SOURCE_DIR" != "$WORKSPACE_DIR" && "$WORKSPACE_DIR" == /root/.codex-workspaces/* ]] || exit 1
+  # One worker per runtime workspace. The lock is released even after a crash.
+  exec 9>"$WORKSPACE_DIR/.dev-sync.lock"
+  flock -n 9 || exit 0
+  echo "$$" > "$WORKSPACE_DIR/.dev-sync.pid"
+  excludes=(--exclude .git/ --exclude node_modules/ --exclude .next/
+    --exclude .expo/ --exclude .metro-cache/ --exclude .gradle/ --exclude .venv/
+    --exclude venv/ --exclude __pycache__/ --exclude '*.pyc'
+    --exclude .cxx/ --exclude Pods/ --exclude build/ --exclude dist/
+    --exclude backend/media/ --exclude backend/config/staticfiles/
+    --exclude /.env --exclude /.dev-sync.lock --exclude /.dev-sync.pid)
+  # Bulk sync runs separately so native apps and assets cannot delay web edits.
+  (
+    while true; do
+      rsync -a --delete "${excludes[@]}" --exclude frontend/web/ --exclude backend/ \
+        "$SOURCE_DIR/" "$WORKSPACE_DIR/" || echo 'Workspace sync failed; retrying.' >&2
+      sleep 2
+    done
+  ) &
+  BULK_PID=$!
+  trap 'kill "$BULK_PID" 2>/dev/null || true' EXIT
+  trap 'exit 0' TERM INT
+  while true; do
+    for part in frontend/web backend; do
+      rsync -a --delete "${excludes[@]}" --exclude media/ --exclude config/staticfiles/ \
+        "$SOURCE_DIR/$part/" "$WORKSPACE_DIR/$part/" || echo "Sync failed for $part; retrying." >&2
+    done
+    sleep 1
+  done
+fi
+
 # Sync is a file operation: skip bootstrap, .env edits, containers and tunnels.
 if [[ "${1:-}" == "sync" ]]; then
   command -v python3 >/dev/null 2>&1 || { echo "Python 3 is required for template sync."; exit 1; }
   exec python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" sync "${@:2}"
 fi
+
+# Project-owned commands run before bootstrap; discovery reads literals only.
+if [[ -n "${1:-}" ]] && command -v python3 >/dev/null 2>&1 &&
+   python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" has-dev-command "$1"; then
+  exec python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" run-dev-command "$@"
+fi
+
 
 
 # Keep the Compose project name available from the first line that may need a
@@ -2497,6 +2540,58 @@ _ensure_local_tls() {
   fi
 }
 
+# Netavark can retain DNAT rules for an old Traefik IP after WSL restarts.
+# Those earlier rules win over the current mapping, even after network reload.
+# Remove only obsolete mappings for Traefik's published ports on its network.
+_repair_traefik_hostports() {
+  [[ "$OS" == "mac" ]] && return 0
+  command -v nft >/dev/null 2>&1 || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - <<'PY' || echo "⚠️  Could not check Traefik host-port rules"
+import json
+import subprocess
+
+def read(*args):
+    return json.loads(subprocess.check_output(args, stderr=subprocess.DEVNULL))
+
+try:
+    container = read('podman', 'inspect', 'traefik')[0]
+    network = container['NetworkSettings']['Networks']['traefik']
+    address = network['IPAddress']
+    if not container['State']['Running'] or not address:
+        raise SystemExit(0)
+    network_id = network['NetworkID'][:8]
+    rules = read('nft', '-j', '-a', 'list', 'table', 'inet', 'netavark')
+except (subprocess.CalledProcessError, KeyError, IndexError, ValueError):
+    raise SystemExit(0)
+
+removed = 0
+for item in rules['nftables']:
+    rule = item.get('rule', {})
+    chain = rule.get('chain', '')
+    if not chain.startswith(f'nv_{network_id}_') or not chain.endswith('_dnat'):
+        continue
+    port = None
+    destination = None
+    for expression in rule.get('expr', []):
+        match = expression.get('match', {})
+        payload = match.get('left', {}).get('payload', {}) if isinstance(match.get('left'), dict) else {}
+        if payload == {'protocol': 'tcp', 'field': 'dport'} and match.get('op') == '==':
+            port = match.get('right')
+        if 'dnat' in expression:
+            destination = expression['dnat']
+    if (port in (80, 443, 8080) and destination
+            and destination.get('port') == port
+            and isinstance(destination.get('addr'), str)
+            and destination['addr'] != address):
+        subprocess.run(['nft', 'delete', 'rule', 'inet', 'netavark', chain,
+                        'handle', str(rule['handle'])], check=True)
+        removed += 1
+if removed:
+    print(f'✅ Repaired {removed} stale Traefik host-port rules')
+PY
+}
+
 _ensure_global_traefik() {
   command -v podman &>/dev/null || return 0
   podman ps >/dev/null 2>&1 || return 0
@@ -2671,6 +2766,7 @@ _ensure_global_traefik() {
       >/dev/null 2>&1 && echo "✅ Global Traefik started → http://traefik.localhost" || echo "⚠️  Global Traefik failed to start (non-fatal)"
   fi
 
+  _repair_traefik_hostports
 }
 
 # ── Ensure Podman machine is running ─────────────────────────────────────────
