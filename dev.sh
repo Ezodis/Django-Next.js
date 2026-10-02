@@ -486,6 +486,9 @@ export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 # consistently resolve without an elevated hosts-file edit.
 PROJECT_HOST="$PROJECT_NAME"
 export PROJECT_HOST
+# Accept the dotted repository name too, while retaining the portable hostname.
+PROJECT_HOST_ALIAS="$(basename "$ROOT_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9.-')"
+export PROJECT_HOST_ALIAS
 
 # ── OS detection ──────────────────────────────────────────────────────────────
 _UNAME="$(uname -s)"
@@ -512,6 +515,11 @@ if [[ -f "$_env_file" ]]; then
     _sed_inplace "s|^COMPOSE_PROJECT_NAME=.*|COMPOSE_PROJECT_NAME=$PROJECT_NAME|" "$_env_file"
   else
     printf 'COMPOSE_PROJECT_NAME=%s\n' "$PROJECT_NAME" >> "$_env_file"
+  fi
+  if grep -q "^PROJECT_HOST_ALIAS=" "$_env_file" 2>/dev/null; then
+    _sed_inplace "s|^PROJECT_HOST_ALIAS=.*|PROJECT_HOST_ALIAS=$PROJECT_HOST_ALIAS|" "$_env_file"
+  else
+    printf 'PROJECT_HOST_ALIAS=%s\n' "$PROJECT_HOST_ALIAS" >> "$_env_file"
   fi
 fi
 unset _env_file
@@ -2473,6 +2481,9 @@ detect_compose() {
   fi
 
   DC_CMD="podman-compose"
+  # Fail before Compose can reuse another checkout's containers or host routes.
+  python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" check-isolation \
+    "$PROJECT_NAME" "${PROJECT_HOST}.localhost" "${PROJECT_HOST_ALIAS}.localhost" || exit 1
   _wire_podman_socket
   export CONTAINER_RUNTIME="podman"
 }

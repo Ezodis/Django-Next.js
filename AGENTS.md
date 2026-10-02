@@ -28,6 +28,11 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - Apply the same boundary to shared Dockerfiles, backend entry points, template
   tools, and the core sections of shared requirements files. Consult
   `SHARED_PATHS` in `backend/config/project_config.py` for the sync boundary.
+- Every project route on the shared proxy must match that project's explicit
+  hostname. Do not add hostless catch-all frontend/API/admin/static/media routes.
+  Tunnel routes must match their assigned hostname too. Keep container, volume,
+  service, router, and middleware names scoped to the project, and preserve the
+  startup collision check before Compose can reuse another checkout's resources.
 
 ## Put project-specific behavior in its existing home
 

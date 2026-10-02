@@ -193,6 +193,30 @@ def merge_requirements(template, project):
     return (remote_top + '\n\n' + PROJECT_MARKER + '\n' + '\n'.join(extras)).rstrip().encode() + b'\n'
 
 
+def check_project_isolation(root, project, hosts):
+    """Reject container namespaces or hostnames already owned by another checkout."""
+    identifiers = subprocess.check_output(['podman', 'ps', '-aq'], text=True).split()
+    if not identifiers:
+        return
+    containers = json.loads(subprocess.check_output(['podman', 'inspect', *identifiers], text=True))
+    root = Path(root).resolve()
+    for container in containers:
+        labels = container.get('Config', {}).get('Labels') or {}
+        owner = labels.get('com.docker.compose.project') or labels.get('io.podman.compose.project')
+        directory = labels.get('com.docker.compose.project.working_dir')
+        if owner == project:
+            if directory and Path(directory).resolve() != root:
+                raise ValueError(f'Project namespace {project!r} already belongs to {directory}. Use a distinct project folder name.')
+            continue
+        for key, rule in labels.items():
+            if key.startswith('traefik.http.routers.') and key.endswith('.rule'):
+                for expression in re.findall(r'Host\(([^)]*)\)', rule):
+                    claimed = re.findall(r'[`"]([^`"]+)[`"]', expression)
+                    overlap = set(claimed) & set(hosts)
+                    if overlap:
+                        raise ValueError(f'Hostname {sorted(overlap)[0]!r} is already routed by {owner or container.get("Name", "another container")}. Use a distinct project folder name.')
+
+
 def configured_repo(root):
     repo = environment_values(root).get('SYNC_TEMPLATE_REPO') or project_option(root, 'SYNC_TEMPLATE_REPO', '')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
@@ -347,6 +371,12 @@ if __name__ == '__main__':
         print('\n'.join(sync_paths(root)))
     elif option == 'sync-repo':
         print(configured_repo(root))
+    elif option == 'check-isolation':
+        try:
+            check_project_isolation(root, sys.argv[3], sys.argv[4:])
+        except (ValueError, OSError, subprocess.CalledProcessError) as error:
+            print(f'Project isolation check failed: {error}', file=sys.stderr)
+            raise SystemExit(1)
     elif option == 'has-dev-command':
         raise SystemExit(0 if sys.argv[3] in project_option(root, 'DEV_COMMANDS', {}) else 1)
     elif option == 'run-dev-command':
