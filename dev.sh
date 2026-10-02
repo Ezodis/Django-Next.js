@@ -4519,12 +4519,12 @@ _draw_status_live() {
 
   # Render rows first so the header reflects exactly the statuses in this frame.
   local _core_rows="${_tmp}.core" _mobile_rows="${_tmp}.mobile"
-  local _section_ready _header_icon _row_indent=""
+  local _section_ready _section_active _section_failed _header_icon _header_color _row_indent=""
   local _projects=("${_other_projects[@]}" "$PROJECT_NAME")
   {
     echo ""
     if [[ ${#_global_containers[@]} -gt 0 ]]; then
-      _section_ready=true
+      _section_ready=true; _section_active=false; _section_failed=false
       local _infra_links=""
       : > "$_core_rows"
       for _gcn in "${_global_containers[@]}"; do
@@ -4532,8 +4532,17 @@ _draw_status_live() {
         [[ "$_gcn" == "traefik" ]] && _infra_links="  $(_hyperlink "http://traefik.localhost" "traefik.localhost")"
         _draw_status_live_row "$_gcn" "$_gcn" "$_lw" "" "$_sf" >> "$_core_rows" || true
       done
-      _header_icon=$'⬡\u0336'; $_section_ready && _header_icon='⬢'
-      printf '  \033[1;35m%s infrastructure\033[0m\033[37m%s\033[0m\n\n' "$_header_icon" "$_infra_links"
+      # Stopped sections stay hollow; failures take priority over startup.
+      _header_icon='⬡'; _header_color=""
+      if $_section_active; then
+        _header_icon='⬢'
+        if $_section_failed; then
+          _header_color=$'\033[31m'
+        elif ! $_section_ready; then
+          _header_color=$'\033[33m'
+        fi
+      fi
+      printf '  \033[1;35m%s%s\033[35m infrastructure\033[0m\033[37m%s\033[0m\n\n' "$_header_color" "$_header_icon" "$_infra_links"
       cat "$_core_rows"
       echo ""
     fi
@@ -4572,7 +4581,7 @@ _draw_status_live() {
         done
       fi
 
-      _section_ready=true
+      _section_ready=true; _section_active=false; _section_failed=false
       local _project_links=""
       : > "$_core_rows"; : > "$_mobile_rows"
       while IFS='|' read -r _label _cn; do
@@ -4590,13 +4599,22 @@ _draw_status_live() {
         _draw_status_live_row "$_label" "$_cn" "$_lw" "" "$_sf" >> "$_destination" || true
       done <<< "$_project_rows"
       _row_indent=""
-      _header_icon=$'⬡\u0336'; $_section_ready && _header_icon='⬢'
+      # Stopped sections stay hollow; failures take priority over startup.
+      _header_icon='⬡'; _header_color=""
+      if $_section_active; then
+        _header_icon='⬢'
+        if $_section_failed; then
+          _header_color=$'\033[31m'
+        elif ! $_section_ready; then
+          _header_color=$'\033[33m'
+        fi
+      fi
       if [[ -s "$_mobile_rows" ]]; then
         local _qr_url
         _qr_url=$(_qr_page_link "$_root" </dev/null) || true
         [[ -n "$_qr_url" ]] && _project_links+="  $(_hyperlink "$_qr_url" "QR")"
       fi
-      printf '  \033[1;34m%s %s\033[0m\033[37m%s\033[0m\n\n' "$_header_icon" "$_display" "$_project_links"
+      printf '  \033[1;34m%s%s\033[34m %s\033[0m\033[37m%s\033[0m\n\n' "$_header_color" "$_header_icon" "$_display" "$_project_links"
       cat "$_core_rows"
       if [[ -s "$_mobile_rows" ]]; then
         echo ""
@@ -4656,8 +4674,19 @@ _draw_status_live_row() {
   fi
 
   # Dynamically scoped by the frame renderer; no extra container probes needed.
+  case "$badge" in
+    unhealthy|stopped|missing|dead) _section_failed=true ;;
+  esac
   if [[ "$badge" != "healthy" && "$badge" != "running" ]]; then
     _section_ready=false
+  fi
+  if $is_restarting; then
+    _section_active=true
+  else
+    case "$state" in
+      missing|exited|stopped|created) ;;
+      *) _section_active=true ;;
+    esac
   fi
 
   uptime=""

@@ -54,7 +54,9 @@ fi
 
 if [ -f manage.py ]; then
     echo "📦 Applying migrations..."
-    python manage.py migrate --noinput || { echo "❌ Migration failed"; exit 1; }
+    # Restored databases may have initial tables without migration records.
+    # Adopt those initial tables; subsequent migrations still run normally.
+    python manage.py migrate --noinput --fake-initial || { echo "❌ Migration failed"; exit 1; }
     echo "✅ Migrations done"
 
     echo "📁 Collecting static files..."
