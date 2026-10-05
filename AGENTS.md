@@ -34,6 +34,12 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   service, router, and middleware names scoped to the project, and preserve the
   startup collision check before Compose can reuse another checkout's resources.
 
+- `frontend/web/next.config.shared.ts` contains shared frontend development
+  infrastructure and is included in template sync. Keep its behavior generic.
+  Each project's existing `frontend/web/next.config.ts` wraps its own options
+  with `withSharedDevConfig`; preserve its routes, plugins, upload limits, and
+  other app settings. Do not sync entire frontend config files across projects.
+
 ## Put project-specific behavior in its existing home
 
 - Use `backend/project.py` for settings overrides, extra installed apps, custom

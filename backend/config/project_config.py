@@ -26,6 +26,7 @@ SHARED_PATHS = (
     'backend/requirements/base.txt', 'backend/requirements/development.txt',
     'backend/requirements/deployment.txt',
     'frontend/web/Dockerfile', 'frontend/web/.dockerignore',
+    'frontend/web/next.config.shared.ts',
     'frontend/mobile/Dockerfile', 'frontend/mobile/.dockerignore',
     'frontend/mobile/.npmrc', 'frontend/mobile/mobile.sh',
     'frontend/mobile/metro.config.base.js',
