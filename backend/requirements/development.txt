@@ -4,6 +4,6 @@
 django-extensions==3.2.3
 pytest==8.2.2
 pytest-django==4.8.0
-pytest-cov==4.1.0
+pytest-cov==7.1.0
 
 # Project-specific integrations
