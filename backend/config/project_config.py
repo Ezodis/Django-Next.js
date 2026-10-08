@@ -31,6 +31,7 @@ SHARED_PATHS = (
     'frontend/web/package.json', 'frontend/web/eslint.config.mjs',
     '.github/dependabot.yml', '.github/workflows/dependency-checks.yml',
     '.github/workflows/template-sync.yml', '.github/workflows/dependency-automerge.yml',
+    '.github/workflows/vercel-deploy.yml',
     'frontend/mobile/Dockerfile', 'frontend/mobile/.dockerignore',
     'frontend/mobile/.npmrc', 'frontend/mobile/mobile.sh',
     'frontend/mobile/metro.config.base.js',
