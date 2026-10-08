@@ -120,7 +120,7 @@ class AdminLoginURLTestCase(TestCase):
 
         # Create a staff user
         staff_user = User.objects.create_user(
-            username='admin',
+            username='config-test-staff',
             password='admin',
             is_staff=True
         )
@@ -128,13 +128,13 @@ class AdminLoginURLTestCase(TestCase):
         # Try to login with staff credentials
         response = self.client.post('/api/admin/login/',
                                    content_type='application/json',
-                                   data='{"username": "admin", "password": "admin"}')
+                                   data='{"username": "config-test-staff", "password": "admin"}')
 
         # Should return 200 OK
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertTrue(data.get('success'))
-        self.assertEqual(data.get('username'), 'admin')
+        self.assertEqual(data.get('username'), 'config-test-staff')
 
 
 
