@@ -80,7 +80,9 @@ jobs:
           PY
 
       # Invoke the monorepo CLI from the repository root.
-      - name: Fetch settings, build and deploy
+      # Build on Vercel so sensitive environment values are available there;
+      # vercel pull replaces those values with [SENSITIVE] for local builds.
+      - name: Fetch settings and deploy
         if: steps.configuration.outputs.enabled == 'true'
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -90,11 +92,9 @@ jobs:
         run: |
           vercel pull --yes --environment="$DEPLOY_ENVIRONMENT" --token="$VERCEL_TOKEN"
           if [ "$DEPLOY_ENVIRONMENT" = 'production' ]; then
-            vercel build --prod --yes --token="$VERCEL_TOKEN"
-            vercel deploy --prebuilt --prod --yes --token="$VERCEL_TOKEN"
+            vercel deploy --prod --yes --token="$VERCEL_TOKEN"
           else
-            vercel build --yes --token="$VERCEL_TOKEN"
-            vercel deploy --prebuilt --yes --token="$VERCEL_TOKEN"
+            vercel deploy --yes --token="$VERCEL_TOKEN"
           fi
 
   diagnostics:
