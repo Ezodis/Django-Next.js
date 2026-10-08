@@ -1,5 +1,8 @@
 name: Merge checked dependency updates
 on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'
   workflow_run:
     workflows: ['Dependency checks']
     types: [completed]
@@ -7,12 +10,16 @@ permissions:
   contents: write
   pull-requests: write
   actions: write
+concurrency:
+  group: dependency-automerge
+  cancel-in-progress: false
 jobs:
   merge:
     if: >-
       vars.DEPENDENCY_AUTO_MERGE == 'true' &&
-      contains(fromJSON('["pull_request","workflow_dispatch"]'), github.event.workflow_run.event) &&
-      github.event.workflow_run.conclusion == 'success'
+      (github.event_name != 'workflow_run' ||
+       (contains(fromJSON('["pull_request","workflow_dispatch"]'), github.event.workflow_run.event) &&
+        github.event.workflow_run.conclusion == 'success'))
     runs-on: ubuntu-latest
     steps:
       # Never check out or execute pull-request code with write permissions.
@@ -20,11 +27,19 @@ jobs:
         with:
           github-token: ${{ secrets.TEMPLATE_SYNC_TOKEN || github.token }}
           script: |
-            const run = context.payload.workflow_run;
+            const triggerRun = context.payload.workflow_run;
             const {owner, repo} = context.repo;
             const prs = await github.paginate(github.rest.pulls.list, {owner, repo, state: 'open'});
             for (const pr of prs) {
-              if (pr.head.sha !== run.head_sha || pr.head.repo?.full_name !== `${owner}/${repo}`) continue;
+              if (pr.head.repo?.full_name !== `${owner}/${repo}`) continue;
+              const candidates = triggerRun ? [triggerRun] : await github.paginate(
+                github.rest.actions.listWorkflowRuns, {owner, repo,
+                  workflow_id: 'dependency-checks.yml', branch: pr.head.ref,
+                  status: 'completed', per_page: 20});
+              const run = candidates.find(candidate => candidate.head_sha === pr.head.sha &&
+                candidate.name === 'Dependency checks' && candidate.conclusion === 'success' &&
+                ['pull_request', 'workflow_dispatch'].includes(candidate.event));
+              if (!run) continue;
               const isDependency = pr.user.login === 'dependabot[bot]';
               const isTemplate = pr.head.ref === 'automation/template-update' &&
                 pr.labels.some(label => label.name === 'template-sync');
