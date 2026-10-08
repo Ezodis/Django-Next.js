@@ -1,5 +1,5 @@
 # Core dependencies shared across all environments
-Django==5.2.18
+Django==6.1.1
 # IANA timezone data for minimal containers and Windows.
 tzdata>=2024.2
 djangorestframework==3.18.3
