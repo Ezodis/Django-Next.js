@@ -101,13 +101,16 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   set `TEMPLATE_READ_TOKEN` with read access. Never store credentials in source
   or the root environment file. The template itself skips self-sync.
 - Require the `frontend` and `backend` jobs from Dependency checks before merging.
+  Enable branch protection where the GitHub account plan supports it.
   Checks cover a clean npm install, lint, TypeScript, production build, Python
   dependency consistency, Django system checks and shared dependency-sync tests.
   Run each project's application regression suite before major framework updates;
   shared checks do not establish full application coverage.
 - To enable checked automatic merging, set repository variable
-  `DEPENDENCY_AUTO_MERGE=true`, enable squash merging, and protect the default
-  branch with required `frontend` and `backend` checks. The merge workflow only
+  `DEPENDENCY_AUTO_MERGE=true` and enable squash merging. The workflow enforces
+  successful `frontend` and `backend` jobs on the current PR commit and requires
+  the current default branch to be included before merging. This also works on
+  private repositories whose plan does not support branch protection. It only
   accepts successful checks on the exact current PR commit. Dependency major
   releases and backend/runtime updates still require review; template-sync PRs
   can merge after the receiving project's checks pass. It never runs PR code

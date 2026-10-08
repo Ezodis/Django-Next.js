@@ -6,7 +6,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  actions: read
+  actions: write
 jobs:
   merge:
     if: >-
@@ -50,15 +50,25 @@ jobs:
                 }
                 if (!compatible) continue;
               }
-              const branch = (await github.rest.repos.getBranch({owner, repo, branch: pr.base.ref})).data;
               const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
                 {owner, repo, run_id: run.id});
-              if (!branch.protected || !['frontend', 'backend'].every(name =>
+              if (!['frontend', 'backend'].every(name =>
                   jobs.some(job => job.name === name && job.conclusion === 'success'))) {
-                core.warning('Automatic merging requires a protected branch and successful frontend/backend jobs.');
+                core.warning('Automatic merging requires successful frontend/backend jobs on the current commit.');
                 continue;
               }
-              // GitHub enforces required reviews/checks; sha also guards new commits.
+              const comparison = (await github.rest.repos.compareCommitsWithBasehead({
+                owner, repo, basehead: `${pr.base.ref}...${run.head_sha}`})).data;
+              if (!['ahead', 'identical'].includes(comparison.status)) {
+                // Recheck after incorporating changes merged since this PR's checks.
+                await github.rest.pulls.updateBranch({owner, repo, pull_number: pr.number,
+                  expected_head_sha: run.head_sha});
+                await github.rest.actions.createWorkflowDispatch({owner, repo,
+                  workflow_id: 'dependency-checks.yml', ref: pr.head.ref});
+                continue;
+              }
+              // Enforce our CI gate even where the account plan lacks branch protection.
+              // GitHub also enforces any configured reviews; SHA guards new commits.
               try {
                 await github.rest.pulls.merge({owner, repo, pull_number: pr.number, sha: run.head_sha, merge_method: 'squash'});
               } catch (error) {
