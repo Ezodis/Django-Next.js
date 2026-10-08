@@ -114,6 +114,9 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   accepts successful checks on the exact current PR commit. Dependency major
   releases and backend/runtime updates still require review; template-sync PRs
   can merge after the receiving project's checks pass. It never runs PR code
-  with write permissions. Without this setup, update PRs remain for review.
+  with write permissions. A scheduled merge sweep also picks up bot-created
+  template PRs whose checks were explicitly dispatched; it verifies the same
+  current-commit checks and base ancestry. Without this setup, update PRs remain
+  for review.
 - Audio/ML dependency restructuring is deferred. Keep its current requirements,
   compatibility constraints and worker layout intact.
