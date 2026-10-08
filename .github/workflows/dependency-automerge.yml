@@ -1,0 +1,99 @@
+name: Merge checked dependency updates
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_run:
+    workflows: ['Dependency checks']
+    types: [completed]
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+concurrency:
+  group: dependency-automerge
+  cancel-in-progress: false
+jobs:
+  merge:
+    if: >-
+      vars.DEPENDENCY_AUTO_MERGE == 'true' &&
+      (github.event_name != 'workflow_run' ||
+       (contains(fromJSON('["pull_request","workflow_dispatch"]'), github.event.workflow_run.event) &&
+        github.event.workflow_run.conclusion == 'success'))
+    runs-on: ubuntu-latest
+    steps:
+      # Never check out or execute pull-request code with write permissions.
+      - uses: actions/github-script@v9.0.0
+        with:
+          github-token: ${{ secrets.TEMPLATE_SYNC_TOKEN || github.token }}
+          script: |
+            const triggerRun = context.payload.workflow_run;
+            const {owner, repo} = context.repo;
+            const prs = await github.paginate(github.rest.pulls.list, {owner, repo, state: 'open'});
+            for (const pr of prs) {
+              if (pr.head.repo?.full_name !== `${owner}/${repo}`) continue;
+              const candidates = triggerRun ? [triggerRun] : await github.paginate(
+                github.rest.actions.listWorkflowRuns, {owner, repo,
+                  workflow_id: 'dependency-checks.yml', branch: pr.head.ref,
+                  status: 'completed', per_page: 20});
+              const run = candidates.find(candidate => candidate.head_sha === pr.head.sha &&
+                candidate.name === 'Dependency checks' && candidate.conclusion === 'success' &&
+                ['pull_request', 'workflow_dispatch'].includes(candidate.event));
+              if (!run) continue;
+              const isDependency = pr.user.login === 'dependabot[bot]';
+              const isTemplate = pr.head.ref === 'automation/template-update' &&
+                pr.labels.some(label => label.name === 'template-sync');
+              if (!isDependency && !isTemplate) continue;
+              if (isDependency) {
+                const files = await github.paginate(github.rest.pulls.listFiles, {owner, repo, pull_number: pr.number});
+                // Major upgrades and container/runtime policy changes need review.
+                if (files.some(file => !['frontend/web/package.json', 'frontend/web/package-lock.json'].includes(file.filename))) continue;
+                const readPackage = async ref => {
+                  const response = await github.rest.repos.getContent({owner, repo, path: 'frontend/web/package.json', ref});
+                  return JSON.parse(Buffer.from(response.data.content, 'base64').toString());
+                };
+                const before = await readPackage(pr.base.sha);
+                const after = await readPackage(pr.head.sha);
+                let compatible = true;
+                for (const section of ['dependencies', 'devDependencies']) {
+                  for (const [name, version] of Object.entries(after[section] || {})) {
+                    const old = before[section]?.[name];
+                    if (!old || old === version) continue;
+                    const major = value => value.match(/^[~^]?(\d+)\./)?.[1];
+                    if (!major(old) || major(old) !== major(version)) compatible = false;
+                  }
+                }
+                if (!compatible) continue;
+              }
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
+                {owner, repo, run_id: run.id});
+              if (!['frontend', 'backend'].every(name =>
+                  jobs.some(job => job.name === name && job.conclusion === 'success'))) {
+                core.warning('Automatic merging requires successful frontend/backend jobs on the current commit.');
+                continue;
+              }
+              const comparison = (await github.rest.repos.compareCommitsWithBasehead({
+                owner, repo, basehead: `${pr.base.ref}...${run.head_sha}`})).data;
+              if (!['ahead', 'identical'].includes(comparison.status)) {
+                // Recheck after incorporating changes merged since this PR's checks.
+                await github.rest.pulls.updateBranch({owner, repo, pull_number: pr.number,
+                  expected_head_sha: run.head_sha});
+                await github.rest.actions.createWorkflowDispatch({owner, repo,
+                  workflow_id: 'dependency-checks.yml', ref: pr.head.ref});
+                continue;
+              }
+              // Enforce our CI gate even where the account plan lacks branch protection.
+              // GitHub also enforces any configured reviews; SHA guards new commits.
+              try {
+                const result = await github.rest.pulls.merge({owner, repo, pull_number: pr.number, sha: run.head_sha, merge_method: 'squash'});
+                if (result.data.merged) {
+                  // Merges made by GITHUB_TOKEN do not trigger push workflows.
+                  await github.rest.actions.createWorkflowDispatch({owner, repo,
+                    workflow_id: 'vercel-deploy.yml', ref: pr.base.ref,
+                    inputs: {environment: 'production'}});
+                }
+              } catch (error) {
+                if (![405, 409].includes(error.status)) throw error;
+                core.notice(`PR #${pr.number} still requires review, current checks, or conflict resolution.`);
+              }
+            }

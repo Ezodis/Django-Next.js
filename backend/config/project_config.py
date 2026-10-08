@@ -15,18 +15,23 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 MOBILE_SKIP = {'shared', 'node_modules', 'scripts', 'packages', 'builds'}
 
 # Shared architecture boundaries. New files inside shared directories are
 # discovered automatically; application source and project.py stay project-owned.
 SHARED_PATHS = (
-    'AGENTS.md', 'dev.sh', 'dev.ps1', 'dev.yml', '.gitattributes', '.dockerignore',
+    'AGENTS.md', 'dev.sh', 'dev.ps1', 'dev.yml', '.gitattributes', '.dockerignore', '.vercelignore',
     'backend/config/*', 'backend/manage.py', 'backend/backup/*.sh',
     'backend/requirements/base.txt', 'backend/requirements/development.txt',
     'backend/requirements/deployment.txt',
     'frontend/web/Dockerfile', 'frontend/web/.dockerignore',
     'frontend/web/next.config.shared.ts',
+    'frontend/web/package.json', 'frontend/web/eslint.config.mjs',
+    '.github/dependabot.yml', '.github/workflows/dependency-checks.yml',
+    '.github/workflows/template-sync.yml', '.github/workflows/dependency-automerge.yml',
+    '.github/workflows/vercel-deploy.yml',
     'frontend/mobile/Dockerfile', 'frontend/mobile/.dockerignore',
     'frontend/mobile/.npmrc', 'frontend/mobile/mobile.sh',
     'frontend/mobile/metro.config.base.js',
@@ -37,6 +42,38 @@ RETIRED_SHARED_PATHS = (
     '.sh/dev_qr_server.py',
 )
 PROJECT_MARKER = '# Project-specific integrations'
+WEB_CORE_DEPENDENCIES = ('next', 'react', 'react-dom')
+WEB_CORE_DEV_DEPENDENCIES = (
+    'eslint', 'eslint-config-next', 'typescript', '@types/node',
+    '@types/react', '@types/react-dom', 'tailwindcss', '@tailwindcss/postcss',
+)
+
+
+def merge_web_package(template, project):
+    """Sync only framework/tool versions; preserve app packages and commands."""
+    remote = json.loads(template)
+    local = json.loads(project) if project is not None else remote.copy()
+    for section, names in [('dependencies', WEB_CORE_DEPENDENCIES),
+                           ('devDependencies', WEB_CORE_DEV_DEPENDENCIES)]:
+        target = local.setdefault(section, {})
+        for name in names:
+            if name in remote.get(section, {}):
+                incoming = remote[section][name]
+                current = target.get(name, '')
+                def version(value):
+                    match = re.fullmatch(r'[~^]?(\d+(?:\.\d+){0,2})', value)
+                    return tuple(int(part) for part in match.group(1).split('.')) if match else None
+                older, newer = version(current), version(incoming)
+                if older is None or newer is None or newer >= older:
+                    target[name] = incoming
+    scripts = local.setdefault('scripts', {})
+    for name in ('dev', 'build', 'lint', 'typecheck'):
+        if name in remote.get('scripts', {}):
+            scripts[name] = remote['scripts'][name]
+    if scripts.get('export') == 'next export':
+        del scripts['export']
+    local.setdefault('engines', {}).update(remote.get('engines', {}))
+    return (json.dumps(local, indent=2, ensure_ascii=False) + '\n').encode()
 
 
 def project_option(root, name, default=None):
@@ -78,6 +115,8 @@ def sync_paths(root):
     root = Path(root)
     paths = [f'backend/{name}/' for name in find_apps(root / 'backend')]
     paths += [f'frontend/mobile/{name}/' for name in mobile_apps(root)]
+    paths += [config['path'].rstrip('/') + '/'
+              for config in project_option(root, 'WATCHOS_APPS', {}).values()]
     paths += project_option(root, 'SYNC_PROJECT_PATHS', [])
     return list(dict.fromkeys(paths))
 
@@ -100,6 +139,23 @@ def environment_values(root):
             values[name] = value
     values.update(os.environ)
     return values
+
+
+def exposure_check_command(root):
+    values = environment_values(root)
+    url = urlsplit(values.get('CLOUDFLARE_TUNNEL_URL', ''))
+    if (url.scheme != 'https' or not url.hostname or url.username or url.password
+            or url.path not in ('', '/') or url.query or url.fragment
+            or url.hostname.endswith(('.trycloudflare.com', '.localhost'))
+            or url.hostname in ('localhost', '127.0.0.1', '::1')):
+        raise ValueError('Set a fixed CLOUDFLARE_TUNNEL_URL=https://your-hostname in the root .env')
+    if not values.get('CLOUDFLARE_TUNNEL_TOKEN'):
+        raise ValueError('A named CLOUDFLARE_TUNNEL_TOKEN is required; expose never uses a quick tunnel')
+    command = project_option(root, 'PUBLIC_EXPOSURE_CHECK_COMMAND', [])
+    if not isinstance(command, list) or not command or any(
+            not isinstance(argument, str) or not argument or '\n' in argument for argument in command):
+        raise ValueError('Declare a literal PUBLIC_EXPOSURE_CHECK_COMMAND list in backend/project.py')
+    return command
 
 
 def mobile_build_environment(root, profile):
@@ -179,6 +235,21 @@ def merge_requirements(template, project):
     remote = template.decode('utf-8-sig').replace('\r\n', '\n')
     local = project.decode('utf-8-sig').replace('\r\n', '\n')
     remote_top = remote.split(PROJECT_MARKER, 1)[0].rstrip()
+    # Never roll back a project patch that arrived before the template update.
+    pinned = re.compile(r'^([A-Za-z0-9_.-]+)==(\d+(?:\.\d+)*)$')
+    local_pins = {}
+    for line in local.split(PROJECT_MARKER, 1)[0].splitlines():
+        match = pinned.fullmatch(line.strip())
+        if match:
+            local_pins[match.group(1).lower()] = (tuple(map(int, match.group(2).split('.'))), line)
+    lines = []
+    for line in remote_top.splitlines():
+        match = pinned.fullmatch(line.strip())
+        previous = local_pins.get(match.group(1).lower()) if match else None
+        if previous and previous[0] > tuple(map(int, match.group(2).split('.'))):
+            line = previous[1]
+        lines.append(line)
+    remote_top = '\n'.join(lines)
     if PROJECT_MARKER in local:
         local_tail = local.split(PROJECT_MARKER, 1)[1]
         return (remote_top + '\n\n' + PROJECT_MARKER + local_tail).rstrip().encode() + b'\n'
@@ -309,6 +380,8 @@ def run_sync(root, arguments):
         if path.startswith('backend/requirements/') and path.endswith('.txt'):
             # On push, only the source core transfers; the template's extras stay local.
             content = merge_requirements(content, previous)
+        if path == 'frontend/web/package.json':
+            content = merge_web_package(content, previous)
         if content != previous:
             actions.append((path, content))
             print(f'  {"update" if previous is not None else "add"}: {path}')
@@ -370,6 +443,14 @@ if __name__ == '__main__':
         print('\n'.join(mobile_apps(root)))
     elif option == 'sync-paths':
         print('\n'.join(sync_paths(root)))
+    elif option == 'exposure-check-command':
+        try:
+            print('\n'.join(exposure_check_command(root)))
+        except ValueError as error:
+            print(f'Exposure refused: {error}', file=sys.stderr)
+            raise SystemExit(1)
+    elif option == 'has-exposure-check':
+        raise SystemExit(0 if project_option(root, 'PUBLIC_EXPOSURE_CHECK_COMMAND', []) else 1)
     elif option == 'sync-repo':
         print(configured_repo(root))
     elif option == 'check-isolation':

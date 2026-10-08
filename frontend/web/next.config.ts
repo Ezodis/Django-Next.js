@@ -1,18 +1,11 @@
+import path from 'node:path';
 import { withSharedDevConfig } from './next.config.shared';
 import type { NextConfig } from 'next';
-import createNextIntlPlugin from 'next-intl/plugin';
 
-const withNextIntl = createNextIntlPlugin('./i18n/request.ts');
 
 const nextConfig: NextConfig = {
-  eslint: {
-    ignoreDuringBuilds: true,
-  },
   images: {
     unoptimized: true,
-  },
-  typescript: {
-    ignoreBuildErrors: true,
   },
   reactStrictMode: false,
 
@@ -40,7 +33,7 @@ const nextConfig: NextConfig = {
     config.resolve = config.resolve || {};
     config.resolve.alias = {
       ...config.resolve.alias,
-      '@shared': require('path').join(__dirname, 'shared'),
+      '@shared': path.join(__dirname, 'shared'),
     };
 
     if (dev) {
@@ -53,4 +46,4 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default withNextIntl(withSharedDevConfig(nextConfig));
+export default withSharedDevConfig(nextConfig);

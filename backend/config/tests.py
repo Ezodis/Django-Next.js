@@ -2,6 +2,133 @@ from django.test import SimpleTestCase, TestCase
 from django.conf import settings
 from django.urls import reverse, resolve
 import os
+import json
+import plistlib
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+from . import watchos
+from .project_config import exposure_check_command, is_shared, mobile_apps, sync_paths
+
+
+class WatchOSLauncherTestCase(unittest.TestCase):
+    def test_exposure_requires_explicit_named_origin_and_project_check(self):
+        from . import project_config
+        command = ['python', 'manage.py', 'project_security_check']
+        with patch.object(project_config, 'project_option', return_value=command):
+            for url, token, valid in [('https://watch.example.test', 'test-token', True),
+                                      ('https://watch.example.test', '', False),
+                                      ('https://temporary.trycloudflare.com', 'test-token', False),
+                                      ('http://watch.example.test', 'test-token', False),
+                                      ('https://user:password@watch.example.test', 'test-token', False)]:
+                values = {'CLOUDFLARE_TUNNEL_URL': url, 'CLOUDFLARE_TUNNEL_TOKEN': token}
+                with patch.object(project_config, 'environment_values', return_value=values):
+                    if valid:
+                        self.assertEqual(exposure_check_command(Path('.')), command)
+                    else:
+                        with self.assertRaises(ValueError):
+                            exposure_check_command(Path('.'))
+
+    def test_launch_installs_matching_bundle_on_watch_simulator(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            application = root / 'frontend/mobile/builds/Native/watchos/development/Build/Products/Debug-watchsimulator/Native.app'
+            application.mkdir(parents=True)
+            with (application / 'Info.plist').open('wb') as output:
+                plistlib.dump({'CFBundleIdentifier': 'test.native'}, output)
+            devices = {'devices': {'com.apple.CoreSimulator.SimRuntime.watchOS-26-0': [
+                {'udid': 'watch', 'isAvailable': True, 'state': 'Shutdown'}]}}
+            args = type('Arguments', (), {'app': 'Native', 'simulator': None, 'device': False})()
+            with patch.object(watchos.subprocess, 'check_output', return_value=json.dumps(devices)), \
+                 patch.object(watchos, 'run') as execute:
+                watchos.launch(root, args, {'scheme': 'Native', 'bundle_id': 'test.native'})
+            self.assertIn(unittest.mock.call('xcrun', 'simctl', 'boot', 'watch'), execute.call_args_list)
+            self.assertIn(unittest.mock.call('xcrun', 'simctl', 'install', 'watch', str(application)), execute.call_args_list)
+            self.assertEqual(execute.call_args_list[-1], unittest.mock.call(
+                'xcrun', 'simctl', 'launch', '--terminate-running-process', 'watch', 'test.native'))
+
+    def test_simulator_selection_uses_watch_runtime_and_prefers_booted(self):
+        devices = {'devices': {
+            'com.apple.CoreSimulator.SimRuntime.iOS-26-0': [
+                {'udid': 'phone', 'isAvailable': True, 'state': 'Booted'}],
+            'com.apple.CoreSimulator.SimRuntime.watchOS-26-0': [
+                {'udid': 'offline', 'isAvailable': False, 'state': 'Booted'},
+                {'udid': 'stopped', 'isAvailable': True, 'state': 'Shutdown'},
+                {'udid': 'watch', 'isAvailable': True, 'state': 'Booted'}],
+        }}
+        self.assertEqual(watchos.simulator_id(devices), 'watch')
+        self.assertEqual(watchos.simulator_id(devices, 'stopped'), 'stopped')
+        with self.assertRaises(ValueError):
+            watchos.simulator_id(devices, 'phone')
+
+    def test_watch_configuration_contains_only_public_origins(self):
+        values = {'CLOUDFLARE_TUNNEL_URL': 'https://dev.example.test/',
+                  'EXPO_PUBLIC_API_URL_PRODUCTION': 'https://app.example.test/api',
+                  'DJANGO_SECRET_KEY': 'private-value'}
+        with patch.object(watchos, 'environment_values', return_value=values):
+            self.assertEqual(watchos.public_configuration(Path('.'), 'development'), {
+                'profile': 'development', 'webURL': 'https://dev.example.test',
+                'apiURL': 'https://dev.example.test/api',
+            })
+            self.assertEqual(watchos.public_configuration(Path('.'), 'production')['apiURL'],
+                             'https://app.example.test/api')
+        for url in ('http://example.test', 'https://user:password@example.test',
+                    'https://example.test/other', 'https://example.test?token=secret'):
+            with patch.object(watchos, 'environment_values', return_value={'WATCH_WEB_URL': url}):
+                with self.assertRaises(ValueError):
+                    watchos.public_configuration(Path('.'), 'development')
+
+    def test_production_never_uses_development_tunnel(self):
+        with patch.object(watchos, 'environment_values', return_value={
+                'CLOUDFLARE_TUNNEL_URL': 'https://dev.example.test'}):
+            with self.assertRaises(ValueError):
+                watchos.public_configuration(Path('.'), 'production')
+
+    def test_native_watch_app_is_not_a_metro_app_and_is_sync_protected(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'backend').mkdir()
+            directory = root / 'frontend/mobile/Native/watchos'
+            directory.mkdir(parents=True)
+            (root / 'backend/project.py').write_text(
+                "WATCHOS_APPS = {'Native': {'path': 'frontend/mobile/Native/watchos', "
+                "'scheme': 'Native', 'bundle_id': 'test.native'}}\n")
+            self.assertEqual(mobile_apps(root), [])
+            self.assertIn('frontend/mobile/Native/watchos/', sync_paths(root))
+            config, found = watchos.app_settings(root, 'native')
+            self.assertEqual(found, directory)
+            self.assertEqual(config['scheme'], 'Native')
+            self.assertFalse(is_shared('frontend/mobile/Native/watchos/project.yml'))
+            self.assertTrue(is_shared('backend/config/watchos.py'))
+            with self.assertRaises(ValueError):
+                watchos.app_settings(root, 'missing')
+            with patch.object(watchos, 'project_option', return_value={
+                    'escape': {'path': '../', 'scheme': 'Escape', 'bundle_id': 'test.escape'}}):
+                with self.assertRaises(ValueError):
+                    watchos.app_settings(root, 'escape')
+
+    def test_build_profiles_select_simulator_or_signed_archive(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / 'frontend/mobile/Native/watchos'
+            directory.mkdir(parents=True)
+            (directory / 'Native.xcodeproj').mkdir()
+            config = {'scheme': 'Native', 'bundle_id': 'test.native'}
+            with patch.object(watchos, 'environment_values', return_value={
+                    'WATCH_WEB_URL': 'https://dev.example.test',
+                    'WATCH_WEB_URL_PRODUCTION': 'https://app.example.test'}), \
+                 patch.object(watchos, 'run') as execute:
+                for profile in ('development', 'production'):
+                    args = type('Arguments', (), {'profile': profile, 'app': 'Native', 'device': False})()
+                    watchos.build(root, args, config, directory)
+                development, production = [call.args for call in execute.call_args_list]
+                self.assertIn('watchsimulator', development)
+                self.assertIn('CODE_SIGNING_ALLOWED=NO', development)
+                self.assertIn('archive', production)
+                self.assertIn('generic/platform=watchOS', production)
+                self.assertNotIn('CODE_SIGNING_ALLOWED=NO', production)
 
 
 class MediaURLConfigurationTestCase(SimpleTestCase):
@@ -58,18 +185,18 @@ class AdminLoginURLTestCase(TestCase):
     """Test cases for admin login URL configuration"""
 
     def test_admin_login_url_resolves_correctly(self):
-        """Test that /admin/login/ resolves to custom admin_login view"""
+        """Test that /api/admin/login/ resolves to custom admin_login view"""
         # Resolve the URL and check it goes to the correct view
-        resolved = resolve('/admin/login/')
+        resolved = resolve('/api/admin/login/')
 
         # The view function should be admin_login, not Django's admin login
         self.assertEqual(resolved.view_name, 'admin-login',
-                        "/admin/login/ should resolve to custom admin-login view")
+                        "/api/admin/login/ should resolve to custom admin-login view")
 
     def test_admin_login_requires_credentials(self):
         """Test that admin_login endpoint requires username and password"""
         # Try to POST without credentials
-        response = self.client.post('/admin/login/',
+        response = self.client.post('/api/admin/login/',
                                    content_type='application/json',
                                    data='{}')
 
@@ -81,7 +208,7 @@ class AdminLoginURLTestCase(TestCase):
     def test_admin_login_rejects_invalid_credentials(self):
         """Test that admin_login rejects invalid credentials"""
         # Try to POST with invalid credentials
-        response = self.client.post('/admin/login/',
+        response = self.client.post('/api/admin/login/',
                                    content_type='application/json',
                                    data='{"username": "invalid", "password": "wrong"}')
 
@@ -103,7 +230,7 @@ class AdminLoginURLTestCase(TestCase):
         )
 
         # Try to login with non-staff user
-        response = self.client.post('/admin/login/',
+        response = self.client.post('/api/admin/login/',
                                    content_type='application/json',
                                    data='{"username": "regular", "password": "testpass123"}')
 
@@ -119,20 +246,55 @@ class AdminLoginURLTestCase(TestCase):
 
         # Create a staff user
         staff_user = User.objects.create_user(
-            username='admin',
+            username='config-test-staff',
             password='admin',
             is_staff=True
         )
 
         # Try to login with staff credentials
-        response = self.client.post('/admin/login/',
+        response = self.client.post('/api/admin/login/',
                                    content_type='application/json',
-                                   data='{"username": "admin", "password": "admin"}')
+                                   data='{"username": "config-test-staff", "password": "admin"}')
 
         # Should return 200 OK
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertTrue(data.get('success'))
-        self.assertEqual(data.get('username'), 'admin')
+        self.assertEqual(data.get('username'), 'config-test-staff')
 
 
+class TemplateSyncTests(SimpleTestCase):
+    def test_web_sync_preserves_project_dependencies_scripts_and_identity(self):
+        from .project_config import merge_web_package
+        template = {'dependencies': {'next': '16.4.0', 'react': '19.3.0'},
+                    'devDependencies': {'typescript': '5.9.3'},
+                    'scripts': {'build': 'next build --webpack', 'typecheck': 'tsc --noEmit'},
+                    'engines': {'node': '>=24 <25'}}
+        project = {'name': 'custom-app', 'dependencies': {'next': '15.0.0', 'stripe': 'custom'},
+                   'scripts': {'postinstall': 'custom-command', 'export': 'next export'},
+                   'devDependencies': {'custom-tool': '1'}}
+        merged = json.loads(merge_web_package(json.dumps(template).encode(), json.dumps(project).encode()))
+        self.assertEqual(merged['name'], 'custom-app')
+        self.assertEqual(merged['dependencies'], {'next': '16.4.0', 'react': '19.3.0', 'stripe': 'custom'})
+        self.assertEqual(merged['scripts']['postinstall'], 'custom-command')
+        self.assertNotIn('export', merged['scripts'])
+        self.assertEqual(merged['devDependencies']['custom-tool'], '1')
+        self.assertEqual(merged['scripts']['build'], 'next build --webpack')
+
+    def test_requirement_sync_preserves_project_integrations(self):
+        from .project_config import merge_requirements
+        template = b'Django==5.2.18\n\n# Project-specific integrations\ntemplate-only==1\n'
+        project = b'Django==4.2.16\n\n# Project-specific integrations\nproject-only==2\n'
+        merged = merge_requirements(template, project)
+        self.assertIn(b'Django==5.2.18', merged)
+        self.assertIn(b'project-only==2', merged)
+        self.assertNotIn(b'template-only', merged)
+
+    def test_sync_does_not_downgrade_newer_project_versions(self):
+        from .project_config import merge_requirements, merge_web_package
+        template = {'dependencies': {'next': '16.4.0'}}
+        project = {'dependencies': {'next': '16.4.1'}}
+        merged = json.loads(merge_web_package(json.dumps(template).encode(), json.dumps(project).encode()))
+        self.assertEqual(merged['dependencies']['next'], '16.4.1')
+        merged_requirements = merge_requirements(b'Django==5.2.18\n', b'Django==5.2.19\n')
+        self.assertIn(b'Django==5.2.19', merged_requirements)

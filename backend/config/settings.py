@@ -26,7 +26,7 @@ def env_bool(name, default):
     return env_value(name, str(default)).lower() == "true"
 
 
-# Core ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# Core
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
@@ -45,17 +45,25 @@ if DEBUG:
 else:
     if DOMAIN:
         ALLOWED_HOSTS.extend([DOMAIN, f"www.{DOMAIN}", f"api.{DOMAIN}"])
-    # Railway auto-generates a *.up.railway.app domain — allow it dynamically
+    # Railway auto-generates a *.up.railway.app domain â€” allow it dynamically
     railway_host = os.getenv("RAILWAY_PUBLIC_DOMAIN")
     if railway_host and railway_host not in ALLOWED_HOSTS:
         ALLOWED_HOSTS.append(railway_host)
     # Any extra hosts (comma-separated) for other platforms
+    # Compose routes include the checkout alias as an explicit local hostname.
+    for option in ("PROJECT_HOST", "PROJECT_HOST_ALIAS"):
+        local_name = os.getenv(option, "").strip()
+        if local_name:
+            local_host = f"{local_name}.localhost"
+            if local_host not in ALLOWED_HOSTS:
+                ALLOWED_HOSTS.append(local_host)
+
     extra = os.getenv("EXTRA_ALLOWED_HOSTS", "")
     if extra:
         ALLOWED_HOSTS.extend([h.strip() for h in extra.split(",") if h.strip()])
 
 
-# Applications ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# Applications
 
 INSTALLED_APPS = [
     'corsheaders',
@@ -109,7 +117,7 @@ WSGI_APPLICATION = 'config.wsgi.application'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 
-# Database ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# Database
 
 if DEBUG:
     DATABASES = {
@@ -132,7 +140,7 @@ else:
     }
 
 
-# Cache ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# Cache
 
 REDIS_URL = os.getenv('REDIS_URL')
 
@@ -166,7 +174,7 @@ if REDIS_URL:
     SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
     SESSION_CACHE_ALIAS = 'default'
 else:
-    # No Redis — use in-memory cache (fine for Railway hobby tier; no persistence)
+    # No Redis â€” use in-memory cache (fine for Railway hobby tier; no persistence)
     CACHES = {
         'default': {
             'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
@@ -176,7 +184,7 @@ else:
     SESSION_ENGINE = 'django.contrib.sessions.backends.db'
 
 
-# Password validation ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# Password validation
 
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
@@ -189,7 +197,7 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 
-# Internationalisation ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# Internationalisation
 
 LANGUAGE_CODE = env_value('LANGUAGE_CODE', 'en-us')
 TIME_ZONE = env_value('TIME_ZONE', 'UTC')
@@ -197,7 +205,7 @@ USE_I18N = True
 USE_TZ = True
 
 
-# Static & media files ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# Static & media files
 
 STATIC_URL = '/static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'config/staticfiles')
@@ -211,7 +219,7 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = env_int('DATA_UPLOAD_MAX_MEMORY_SIZE', 524288000) 
 FILE_UPLOAD_MAX_MEMORY_SIZE = env_int('FILE_UPLOAD_MAX_MEMORY_SIZE', 10485760)   # 10 MB default
 
 
-# REST Framework & JWT ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# REST Framework & JWT
 
 REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.AllowAny'],
@@ -243,14 +251,14 @@ SIMPLE_JWT = {
 }
 
 
-# CORS ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# CORS
 
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = []
 CSRF_TRUSTED_ORIGINS = []
 
 if DEBUG:
-    # CORS: allow everything in dev — mobile apps, emulators, tunnels all need this.
+    # CORS: allow everything in dev â€” mobile apps, emulators, tunnels all need this.
     CORS_ALLOW_ALL_ORIGINS = True
 
     CSRF_TRUSTED_ORIGINS.extend([
@@ -333,7 +341,7 @@ CORS_ALLOW_HEADERS = [
 ]
 
 
-# CSRF & cookies ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# CSRF & cookies
 
 CSRF_COOKIE_HTTPONLY = False   # allow JS to read CSRF token
 CSRF_USE_SESSIONS = False      # use cookies, not sessions, for CSRF
@@ -360,9 +368,8 @@ SESSION_EXPIRE_AT_BROWSER_CLOSE = False
 SESSION_SAVE_EVERY_REQUEST = False  # Only save modified sessions
 
 
-# Security headers ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# Security headers
 
-SECURE_BROWSER_XSS_FILTER = True
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = 'DENY'
 
@@ -374,7 +381,7 @@ if not DEBUG:
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 
-# Email ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# Email
 
 EMAIL_BACKEND = (
     'django.core.mail.backends.smtp.EmailBackend'
@@ -406,9 +413,10 @@ else:
             INSTALLED_APPS = list(dict.fromkeys(INSTALLED_APPS + list(_value)))
         else:
             globals()[_name] = _value
+    MIDDLEWARE = list(dict.fromkeys(MIDDLEWARE + list(getattr(_project, 'EXTRA_MIDDLEWARE', []))))
 
 
-# Dev server autoreloader exclusions ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿
+# Dev server autoreloader exclusions
 # Prevent Django's StatReloader from watching large data dirs.
 # triggers a reload loop that exits the dev server with code 0.
 if DEBUG:
@@ -428,4 +436,4 @@ if DEBUG:
 
         _autoreload.StatReloader.watched_files = _patched_watched_files
     except Exception:
-        pass  # non-fatal — skip if Django internals changed
+        pass  # non-fatal â€” skip if Django internals changed

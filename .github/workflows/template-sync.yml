@@ -1,0 +1,77 @@
+name: Template updates
+on:
+  schedule:
+    - cron: '15 14 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+concurrency:
+  group: template-sync
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # A repository-scoped deploy key can push shared workflow updates.
+          ssh-key: ${{ secrets.TEMPLATE_SYNC_SSH_KEY }}
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+      - name: Discover configured template
+        id: template
+        shell: bash
+        run: |
+          repo=$(python backend/config/project_config.py "$PWD" sync-repo)
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+      - name: Check out template
+        if: steps.template.outputs.repo != github.repository
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ steps.template.outputs.repo }}
+          path: .template-upstream
+          token: ${{ secrets.TEMPLATE_READ_TOKEN || github.token }}
+      - name: Preview and apply shared updates
+        if: steps.template.outputs.repo != github.repository
+        run: |
+          python .template-upstream/backend/config/project_config.py "$PWD" sync --dir .template-upstream --dry-run
+          python .template-upstream/backend/config/project_config.py "$PWD" sync --dir .template-upstream --yes
+          npm install --package-lock-only --ignore-scripts --no-fund --prefix frontend/web
+      - name: Publish update branch and run its checks
+        if: steps.template.outputs.repo != github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPDATE_KEY: ${{ secrets.TEMPLATE_SYNC_SSH_KEY }}
+        run: |
+          if [ -z "$UPDATE_KEY" ]; then
+            echo '::error::Configure the repository-scoped TEMPLATE_SYNC_SSH_KEY deploy key. See AGENTS.md.'
+            exit 1
+          fi
+          git add -A -- . ':!.template-upstream'
+          pr=$(gh pr list --head automation/template-update --state open --json number --jq '.[0].number // empty')
+          if ! git diff --cached --quiet; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git checkout -B automation/template-update
+            git commit -m 'Update shared template and dependency lockfile'
+            git fetch origin +refs/heads/automation/template-update:refs/remotes/origin/automation/template-update || true
+            git push --force-with-lease origin HEAD:refs/heads/automation/template-update
+            if [ -z "$pr" ]; then
+              gh pr create --head automation/template-update --label template-sync \
+                --title 'Update shared template and dependencies' \
+                --body 'Synchronizes shared infrastructure and framework versions while preserving project apps, integrations, routes, environment files and custom scripts. Dependency checks must pass before merging.'
+              pr=$(gh pr list --head automation/template-update --state open --json number --jq '.[0].number // empty')
+            fi
+          fi
+          # Explicit dispatch works with GITHUB_TOKEN and checks the branch SHA.
+          if [ -n "$pr" ]; then
+            gh workflow run dependency-checks.yml --ref automation/template-update
+          fi

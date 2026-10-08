@@ -1,0 +1,9 @@
+# The web build output contains everything needed by prebuilt deployments.
+/backend/
+/frontend/mobile/
+/frontend/web/node_modules/
+/frontend/web/.next/
+/node_modules/
+/.git/
+/.env
+/.vercel/.env*.local
