@@ -42,7 +42,7 @@
 # ║    ./dev.sh build                Build Podman images only                   ║
 # ║    ./dev.sh up                   Start core + mobile services               ║
 # ║    ./dev.sh core                 Start core services only (no mobile)       ║
-# ║    ./dev.sh expose               Check running backend, start named tunnel ║
+# ║    ./dev.sh expose               Prepare access, keep or assign a tunnel  ║
 # ║    ./dev.sh mobile               Start only mobile services                 ║
 # ║    ./dev.sh status               Live status monitor (Ctrl+C to quit)      ║
 # ║    ./dev.sh rebuild [svc]        Rebuild all services or a specific one     ║
@@ -1590,6 +1590,7 @@ METRO_PROXY_EOF
 # This is separate from _ensure_metro_proxies (which manages the rewriting proxy).
 # Both must be running for physical-device Metro access via Cloudflare Tunnel.
 _ensure_metro_tunnels() {
+  grep -Eq '^DISABLE_PUBLIC_TUNNELS=true\r?$' "$ROOT_DIR/.env" && return 0
   discover_apps
   [[ ${#MOBILE_APPS[@]} -eq 0 ]] && return 0
 
@@ -1767,6 +1768,48 @@ _ensure_cloudflare_dns() {
 # Traefik with the correct Host header for this project.
 # This gives every project a completely independent tunnel URL.
 _start_cloudflare_tunnel() {
+  if grep -Eq '^DISABLE_PUBLIC_TUNNELS=true\r?$' "$ROOT_DIR/.env"; then
+    _stop_cloudflare_tunnel
+    return 0
+  fi
+  # Projects own their public-access preparation. The shared launcher only
+  # discovers the command and recreates services it reports as stale.
+  local _prepare_output _prepare_command=() _prepare_services=() _prepare_arg
+  _prepare_output=$(python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" exposure-prepare-command) || return 1
+  if [[ -n "$_prepare_output" ]]; then
+    while IFS= read -r _prepare_arg; do _prepare_command+=("$_prepare_arg"); done <<< "$_prepare_output"
+    if ! _prepare_output=$(bash "$ROOT_DIR/dev.sh" "${_prepare_command[@]}"); then
+      _stop_cloudflare_tunnel
+      echo "Public tunnel disabled: project preparation failed."
+      return 1
+    fi
+    if [[ -n "$_prepare_output" ]]; then
+      while IFS= read -r _prepare_arg; do
+        [[ "$_prepare_arg" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+        _prepare_services+=("$_prepare_arg")
+      done <<< "$_prepare_output"
+      echo "🔧 Applying public-access settings to ${_prepare_services[*]}..."
+      if ! "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" up -d --no-deps --build --force-recreate "${_prepare_services[@]}" >> "/tmp/${PROJECT_NAME}-compose.log" 2>&1; then
+        _stop_cloudflare_tunnel
+        echo "Public tunnel disabled: service update failed. Check /tmp/${PROJECT_NAME}-compose.log"
+        return 1
+      fi
+      # Entry points must finish migrations and account creation before checks.
+      local _ready=false _wait _backend
+      _backend=$(podman ps --filter "label=com.docker.compose.project=${PROJECT_NAME}" --filter "label=com.docker.compose.service=backend" --format '{{.Names}}' | head -1)
+      for _wait in $(seq 1 60); do
+        if [[ -n "$_backend" ]] && [[ "$(podman inspect --format '{{.State.Health.Status}}' "$_backend" 2>/dev/null)" == healthy ]]; then
+          _ready=true; break
+        fi
+        sleep 2
+      done
+      if [[ "$_ready" != true ]]; then
+        _stop_cloudflare_tunnel
+        echo "Public tunnel disabled: backend did not become healthy."
+        return 1
+      fi
+    fi
+  fi
   if python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" has-exposure-check; then
     if ! bash "$ROOT_DIR/dev.sh" _exposure_check_only; then
       _stop_cloudflare_tunnel
@@ -2240,12 +2283,18 @@ _stop_tunnel_proxy() {
 
 # Save webapp tunnel URL to .env
 _save_tunnel_url() {
-  local url="$1"
-  if grep -q "^CLOUDFLARE_TUNNEL_URL=" "$ROOT_DIR/.env" 2>/dev/null; then
-    _sed_inplace "s|^CLOUDFLARE_TUNNEL_URL=.*|CLOUDFLARE_TUNNEL_URL=${url}|" "$ROOT_DIR/.env"
-  else
-    echo "CLOUDFLARE_TUNNEL_URL=${url}" >> "$ROOT_DIR/.env"
+  local url="$1" _target
+  local _targets=("$ROOT_DIR/.env")
+  if [[ -n "${DEV_SOURCE_DIR:-}" && "$DEV_SOURCE_DIR" != "$ROOT_DIR" ]]; then
+    _targets+=("$DEV_SOURCE_DIR/.env")
   fi
+  for _target in "${_targets[@]}"; do
+    if grep -q "^CLOUDFLARE_TUNNEL_URL=" "$_target" 2>/dev/null; then
+      _sed_inplace "s|^CLOUDFLARE_TUNNEL_URL=.*|CLOUDFLARE_TUNNEL_URL=${url}|" "$_target"
+    else
+      echo "CLOUDFLARE_TUNNEL_URL=${url}" >> "$_target"
+    fi
+  done
 }
 
 # Clear all tunnel URLs from .env (used on fallback to localhost)
@@ -5056,6 +5105,7 @@ _follow_logs() {
 # Detached watchdog: preserve live connectors during network/DNS/origin failures.
 # Restart only exited processes or explicitly rejected quick-tunnel identities.
 _start_tunnel_watchdog() {
+  grep -Eq '^DISABLE_PUBLIC_TUNNELS=true\r?$' "$ROOT_DIR/.env" && return 0
   local watchdog_pid_file="/tmp/${PROJECT_NAME}-tunnel-watchdog.pid"
 
   # Keep an existing watchdog. Restarting it on every dev.sh run used to reset
@@ -5071,6 +5121,11 @@ _start_tunnel_watchdog() {
 
   # Don't start watchdog if cloudflared isn't installed
   command -v cloudflared &>/dev/null || return 0
+  # A watchdog cannot repair project configuration; wait for preparation and
+  # the runtime check to pass rather than launching a doomed recovery loop.
+  if python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" has-exposure-check; then
+    bash "$ROOT_DIR/dev.sh" _exposure_check_only >/dev/null 2>&1 || return 0
+  fi
 
   # Capture all variables the watchdog loop needs now, before forking.
   # The double-fork (setsid + subshell) means the child has no parent to
@@ -5560,7 +5615,7 @@ _print_access_urls() {
     echo "      Simulators/emulators use local. Physical devices use tunnel."
   else
     echo ""
-    echo "   ⚠️  Tunnel unavailable (no internet) — local access still works"
+    echo "   ⚠️  Tunnel not active — check the startup messages above. Local access still works."
     echo "      Simulators and same-WiFi devices will work."
   fi
 }
@@ -8116,10 +8171,9 @@ PATCH_PODFILE_EOF
 # ── Commands ──────────────────────────────────────────────────────────────────
 case "$CMD" in
   expose)
-    bash "$ROOT_DIR/dev.sh" _exposure_check_only || exit 1
     _start_cloudflare_tunnel
     _start_tunnel_watchdog
-    echo "Named connector requested. Verify its hostname and origin routing in Cloudflare before using the watch."
+    _print_access_urls
     ;;
 
   init)

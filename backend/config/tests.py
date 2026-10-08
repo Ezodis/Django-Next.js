@@ -87,12 +87,14 @@ class ProjectEnvironmentTestCase(unittest.TestCase):
 
 
 class WatchOSLauncherTestCase(unittest.TestCase):
-    def test_exposure_requires_explicit_named_origin_and_project_check(self):
+    def test_exposure_allows_automatic_quick_tunnel_and_validates_named_origin(self):
         from . import project_config
         command = ['python', 'manage.py', 'project_security_check']
         with patch.object(project_config, 'project_option', return_value=command):
             for url, token, valid in [('https://watch.example.test', 'test-token', True),
-                                      ('https://watch.example.test', '', False),
+                                      ('https://watch.example.test', '', True),
+                                      ('', '', True),
+                                      ('https://temporary.trycloudflare.com', '', True),
                                       ('https://temporary.trycloudflare.com', 'test-token', False),
                                       ('http://watch.example.test', 'test-token', False),
                                       ('https://user:password@watch.example.test', 'test-token', False)]:

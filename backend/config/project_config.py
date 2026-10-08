@@ -229,13 +229,11 @@ def project_environment(root):
 def exposure_check_command(root):
     values = environment_values(root)
     url = urlsplit(values.get('CLOUDFLARE_TUNNEL_URL', ''))
-    if (url.scheme != 'https' or not url.hostname or url.username or url.password
+    if values.get('CLOUDFLARE_TUNNEL_TOKEN') and (url.scheme != 'https' or not url.hostname or url.username or url.password
             or url.path not in ('', '/') or url.query or url.fragment
             or url.hostname.endswith(('.trycloudflare.com', '.localhost'))
             or url.hostname in ('localhost', '127.0.0.1', '::1')):
         raise ValueError('Set a fixed CLOUDFLARE_TUNNEL_URL=https://your-hostname in the root .env')
-    if not values.get('CLOUDFLARE_TUNNEL_TOKEN'):
-        raise ValueError('A named CLOUDFLARE_TUNNEL_TOKEN is required; expose never uses a quick tunnel')
     command = project_option(root, 'PUBLIC_EXPOSURE_CHECK_COMMAND', [])
     if not isinstance(command, list) or not command or any(
             not isinstance(argument, str) or not argument or '\n' in argument for argument in command):
@@ -536,6 +534,11 @@ if __name__ == '__main__':
             raise SystemExit(1)
     elif option == 'has-exposure-check':
         raise SystemExit(0 if project_option(root, 'PUBLIC_EXPOSURE_CHECK_COMMAND', []) else 1)
+    elif option == 'exposure-prepare-command':
+        command = project_option(root, 'PUBLIC_EXPOSURE_PREPARE_COMMAND', [])
+        if not isinstance(command, list) or any(not isinstance(arg, str) or not arg or '\n' in arg for arg in command):
+            raise SystemExit('PUBLIC_EXPOSURE_PREPARE_COMMAND must be a literal argument list')
+        print('\n'.join(command))
     elif option == 'sync-repo':
         print(configured_repo(root))
     elif option == 'check-isolation':

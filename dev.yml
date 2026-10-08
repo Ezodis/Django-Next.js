@@ -192,6 +192,15 @@ services:
       # instead of ws://myapp.localhost:3000/...  (unreachable from browser)
       #
       # .localhost hostname (high priority)
+      # Redirect the whole local site before it loads: secure session cookies
+      # and API requests must share the same HTTPS origin.
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-local-https-redirect.rule=(Host(`${PROJECT_HOST}.localhost`) || Host(`${PROJECT_HOST_ALIAS:-${PROJECT_HOST}}.localhost`))"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-local-https-redirect.entrypoints=web"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-local-https-redirect.priority=1000"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-local-https-redirect.service=noop@internal"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-local-https-redirect.middlewares=${COMPOSE_PROJECT_NAME}-local-https-redirect"
+      - "traefik.http.middlewares.${COMPOSE_PROJECT_NAME}-local-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.${COMPOSE_PROJECT_NAME}-local-https-redirect.redirectscheme.permanent=true"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend.rule=(Host(`${PROJECT_HOST}.localhost`) || Host(`${PROJECT_HOST_ALIAS:-${PROJECT_HOST}}.localhost`))"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend.entrypoints=web"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend.priority=10"
