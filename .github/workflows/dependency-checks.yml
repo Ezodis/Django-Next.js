@@ -66,4 +66,4 @@ jobs:
       - run: pip install -r requirements/development.txt
       - run: pip check
       - run: python manage.py check
-      - run: python manage.py test config.tests.TemplateSyncTests --noinput
+      - run: python manage.py test config.tests --noinput

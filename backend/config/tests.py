@@ -59,18 +59,18 @@ class AdminLoginURLTestCase(TestCase):
     """Test cases for admin login URL configuration"""
 
     def test_admin_login_url_resolves_correctly(self):
-        """Test that /admin/login/ resolves to custom admin_login view"""
+        """Test that /api/admin/login/ resolves to custom admin_login view"""
         # Resolve the URL and check it goes to the correct view
-        resolved = resolve('/admin/login/')
+        resolved = resolve('/api/admin/login/')
 
         # The view function should be admin_login, not Django's admin login
         self.assertEqual(resolved.view_name, 'admin-login',
-                        "/admin/login/ should resolve to custom admin-login view")
+                        "/api/admin/login/ should resolve to custom admin-login view")
 
     def test_admin_login_requires_credentials(self):
         """Test that admin_login endpoint requires username and password"""
         # Try to POST without credentials
-        response = self.client.post('/admin/login/',
+        response = self.client.post('/api/admin/login/',
                                    content_type='application/json',
                                    data='{}')
 
@@ -82,7 +82,7 @@ class AdminLoginURLTestCase(TestCase):
     def test_admin_login_rejects_invalid_credentials(self):
         """Test that admin_login rejects invalid credentials"""
         # Try to POST with invalid credentials
-        response = self.client.post('/admin/login/',
+        response = self.client.post('/api/admin/login/',
                                    content_type='application/json',
                                    data='{"username": "invalid", "password": "wrong"}')
 
@@ -104,7 +104,7 @@ class AdminLoginURLTestCase(TestCase):
         )
 
         # Try to login with non-staff user
-        response = self.client.post('/admin/login/',
+        response = self.client.post('/api/admin/login/',
                                    content_type='application/json',
                                    data='{"username": "regular", "password": "testpass123"}')
 
@@ -126,7 +126,7 @@ class AdminLoginURLTestCase(TestCase):
         )
 
         # Try to login with staff credentials
-        response = self.client.post('/admin/login/',
+        response = self.client.post('/api/admin/login/',
                                    content_type='application/json',
                                    data='{"username": "admin", "password": "admin"}')
 
