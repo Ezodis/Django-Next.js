@@ -20,7 +20,9 @@
 # ║    ./dev.sh eas login            Log in to EAS interactively                ║
 # ║    ./dev.sh eas logout           Log out from EAS                           ║
 # ║                                                                             ║
-# ║    ./dev.sh build <app> [android|ios] [development/production] <local>      ║
+# ║    ./dev.sh build <app> [android|ios|watchos] [development|production] [local]
+# ║    ./dev.sh watchos <app> [--simulator <UDID>]  Install watch simulator app
+# ║      watchos requires local builds on macOS; no Metro runtime or EAS
 # ║    ./dev.sh build-all [android|ios] [development|production] [testflight]   ║
 # ║                                    Build all mobile apps in parallel        ║
 # ║                                    Add 'testflight' to auto-submit to TF    ║
@@ -40,6 +42,7 @@
 # ║    ./dev.sh build                Build Podman images only                   ║
 # ║    ./dev.sh up                   Start core + mobile services               ║
 # ║    ./dev.sh core                 Start core services only (no mobile)       ║
+# ║    ./dev.sh expose               Check running backend, start named tunnel ║
 # ║    ./dev.sh mobile               Start only mobile services                 ║
 # ║    ./dev.sh status               Live status monitor (Ctrl+C to quit)      ║
 # ║    ./dev.sh rebuild [svc]        Rebuild all services or a specific one     ║
@@ -125,7 +128,29 @@ if [[ "${1:-}" == "sync" ]]; then
   exec python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" sync "${@:2}"
 fi
 
+if [[ "${1:-}" == "watchos" || ( "${1:-}" == "build" && "${3:-}" == "watchos" ) ]]; then
+  command -v python3 >/dev/null 2>&1 || { echo "Python 3 is required for watchOS tooling."; exit 1; }
+  exec python3 "$ROOT_DIR/backend/config/watchos.py" "$ROOT_DIR" "$@"
+fi
+
 # Project-owned commands run before bootstrap; discovery reads literals only.
+if [[ "${1:-}" == "_exposure_check_only" ]]; then
+  _exposure_output=$(python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" exposure-check-command) || exit 1
+  _exposure_project=$(basename "$ROOT_DIR" | tr -cd 'a-zA-Z0-9.' | tr '[:upper:]' '[:lower:]' | tr -d '.')
+  [[ -n "$_exposure_project" ]] || _exposure_project="project-$(printf '%s' "$ROOT_DIR" | cksum | awk '{print $1}')"
+  _exposure_backend=$(podman ps --filter "label=com.docker.compose.project=${_exposure_project}" \
+    --filter "label=com.docker.compose.service=backend" --format '{{.Names}}' | head -1) || exit 1
+  [[ -n "$_exposure_backend" ]] || { echo "Exposure refused: start the secured backend first." >&2; exit 1; }
+  _exposure_command=()
+  while IFS= read -r _exposure_arg; do _exposure_command+=("$_exposure_arg"); done <<< "$_exposure_output"
+  exec podman exec "$_exposure_backend" "${_exposure_command[@]}"
+fi
+
+if [[ "${1:-}" == "expose" ]]; then
+  command -v python3 >/dev/null 2>&1 || { echo "Python 3 is required for exposure checks."; exit 1; }
+  python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" exposure-check-command >/dev/null || exit 1
+fi
+
 if [[ -n "${1:-}" ]] && command -v python3 >/dev/null 2>&1 &&
    python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" has-dev-command "$1"; then
   exec python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" run-dev-command "$@"
@@ -1201,6 +1226,32 @@ run_setup() {
       ;;
   esac
 
+  if ! command -v mkcert &>/dev/null || ! command -v openssl &>/dev/null \
+    || { [[ "$OS" == "linux" || "$OS" == "wsl" ]] && ! command -v certutil &>/dev/null; }; then
+    echo "Installing local HTTPS dependencies..."
+    case "$OS" in
+      mac)
+        brew install mkcert nss openssl || return 1
+        ;;
+      linux|wsl)
+        if command -v apt-get &>/dev/null; then
+          sudo apt-get update && sudo apt-get install -y mkcert libnss3-tools openssl ca-certificates || return 1
+        elif command -v dnf &>/dev/null; then
+          sudo dnf install -y mkcert nss-tools openssl ca-certificates || return 1
+        elif command -v pacman &>/dev/null; then
+          sudo pacman -Sy --noconfirm mkcert nss openssl ca-certificates || return 1
+        else
+          echo "Cannot install local HTTPS dependencies: no supported package manager found." >&2
+          return 1
+        fi
+        ;;
+    esac
+  fi
+  if ! command -v mkcert &>/dev/null || ! command -v openssl &>/dev/null; then
+    echo "Local HTTPS dependencies are unavailable; setup did not complete." >&2
+    return 1
+  fi
+
   # ── Install anything listed in setup.txt that isn't already present ────────
   local dev_reqs="$ROOT_DIR/backend/requirements/setup.txt"
   if [[ -f "$dev_reqs" ]] && command -v brew &>/dev/null; then
@@ -1890,6 +1941,13 @@ _ensure_cloudflare_dns() {
 # Traefik with the correct Host header for this project.
 # This gives every project a completely independent tunnel URL.
 _start_cloudflare_tunnel() {
+  if python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" has-exposure-check; then
+    if ! bash "$ROOT_DIR/dev.sh" _exposure_check_only; then
+      _stop_cloudflare_tunnel
+      echo "Public tunnel disabled: project security checks did not pass."
+      return 0
+    fi
+  fi
   # Auto-install cloudflared if missing — no manual step required
   if ! command -v cloudflared &>/dev/null; then
     echo "📦 Installing cloudflared (Cloudflare Tunnel)..."
@@ -2901,7 +2959,7 @@ fi
 # Commands that don't need dependency checks or app discovery preamble
 _SKIP_SETUP=false
 case "$CMD" in
-  status|logs|down|stop|rebuild|disk|_status_only|_metro_tunnels_only|service-logs|sync) _SKIP_SETUP=true ;;
+  status|logs|down|stop|rebuild|disk|_status_only|_metro_tunnels_only|service-logs|sync|expose) _SKIP_SETUP=true ;;
   # ios/android only need Xcode/ADB/Node — no Podman, no Docker deps
   ios|android) _SKIP_SETUP=true ;;
 esac
@@ -2926,6 +2984,11 @@ _deps_installed() {
   command -v git            &>/dev/null || return 1
   command -v python3 &>/dev/null || command -v python &>/dev/null || return 1
   command -v cloudflared    &>/dev/null || return 1
+  command -v mkcert         &>/dev/null || return 1
+  command -v openssl        &>/dev/null || return 1
+  if [[ "$OS" == "linux" || "$OS" == "wsl" ]]; then
+    command -v certutil     &>/dev/null || return 1
+  fi
   return 0
 }
 
@@ -5352,6 +5415,9 @@ DNS_CHECK
 
 _tw_restart() {
   local _reason="$1"
+  if python3 "$_rdir/backend/config/project_config.py" "$_rdir" has-exposure-check; then
+    bash "$_rdir/dev.sh" _exposure_check_only || return 1
+  fi
 
   # Quick-tunnel 429 responses are account/IP scoped. Preserve the cooldown
   # across launcher and watchdog restarts instead of requesting more tunnels.
@@ -5447,6 +5513,15 @@ _last_reg_attempt=0
 
 while true; do
   sleep 20  # Check every 20s (down from 30s for faster recovery)
+
+  if python3 "$_rdir/backend/config/project_config.py" "$_rdir" has-exposure-check; then
+    if ! bash "$_rdir/dev.sh" _exposure_check_only; then
+      _unsafe_pid=$(cat "$_tpid" 2>/dev/null || true)
+      [[ "$_unsafe_pid" =~ ^[0-9]+$ ]] && kill "$_unsafe_pid" 2>/dev/null || true
+      echo "Public connector stopped: project security check failed."
+      exit 1
+    fi
+  fi
 
   # Skip if project containers aren't running
   _any=$(podman ps --filter "label=io.podman.compose.project=${_pname}" -q 2>/dev/null | head -1 || true)
@@ -8196,6 +8271,13 @@ PATCH_PODFILE_EOF
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 case "$CMD" in
+  expose)
+    bash "$ROOT_DIR/dev.sh" _exposure_check_only || exit 1
+    _start_cloudflare_tunnel
+    _start_tunnel_watchdog
+    echo "Named connector requested. Verify its hostname and origin routing in Cloudflare before using the watch."
+    ;;
+
   init)
     echo "🔧 Initializing frontend..."
     "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" --profile init run --rm frontend-init
