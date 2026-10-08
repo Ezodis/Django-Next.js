@@ -36,6 +36,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($DevArgs.Count -gt 0 -and ($DevArgs[0] -eq 'watchos' -or
+    ($DevArgs.Count -gt 2 -and $DevArgs[0] -eq 'build' -and $DevArgs[2] -eq 'watchos'))) {
+    Write-Error 'watchOS builds and simulators require macOS and full Xcode. Run these commands on your Mac.'
+    exit 1
+}
 $ROOT_DIR = $PSScriptRoot
 if (-not $ROOT_DIR -or $ROOT_DIR -eq '') {
     $ROOT_DIR = Split-Path -Parent (Resolve-Path $MyInvocation.MyCommand.Path)
@@ -660,7 +665,7 @@ sync_workspace() {
 }
 
 sync_workspace
-# Normalize before launching the detached worker from the launcher itself.
+# Normalize before starting the persistent Windows-owned WSL worker.
 sed -i 's/\r//' "`$WORKSPACE_DIR/dev.sh"
 # Stop the old launcher-bound worker when upgrading to the detached worker.
 if [[ -f "`$SYNC_PID_FILE" ]]; then
@@ -670,25 +675,24 @@ if [[ -f "`$SYNC_PID_FILE" ]]; then
     kill "`$OLD_PID" 2>/dev/null || true
   fi
 fi
-# flock in the worker prevents duplicate loops on repeated launcher commands.
-nohup setsid bash "`$WORKSPACE_DIR/dev.sh" _workspace-sync "`$SOURCE_DIR" "`$WORKSPACE_DIR" \
-  </dev/null >>"/tmp/devtools-sync-$workspaceLeaf.log" 2>&1 &
-SYNC_START_PID="`$!"
-disown
-# Wait for the worker to detach before the short-lived WSL invocation exits.
-for attempt in {1..20}; do
-  [[ -f "`$WORKSPACE_DIR/.dev-sync.pid" ]] && kill -0 "`$(cat "`$WORKSPACE_DIR/.dev-sync.pid")" 2>/dev/null && break
-  sleep 0.1
-done
-
 cd "`$WORKSPACE_DIR"
 sed -i 's/\r//' dev.sh
+[[ "`${1:-}" == "_sync-only" ]] && exit 0
 exec bash dev.sh $argStr
 "@
 # Convert CRLF to LF before writing
 $bashContentUnix = $bashContent -replace "`r`n", "`n" -replace "`r", "`n"
 [System.IO.File]::WriteAllText($tmpScriptWin, $bashContentUnix, (New-Object System.Text.UTF8Encoding $false))
 wsl.exe -d Ubuntu -- chmod +x $tmpScript
+# A Linux-detached worker can outlive its wsl.exe bridge and retain a broken
+# Windows drive mount (EIO). Keep its own Windows WSL invocation alive instead.
+# The worker's flock prevents duplicates when the launcher is run again.
+wsl.exe -d Ubuntu -- bash $tmpScript _sync-only
+if ($LASTEXITCODE -ne 0) { throw 'Could not refresh the WSL development workspace.' }
+Start-Process -FilePath (Get-Command wsl.exe).Source -WindowStyle Hidden -ArgumentList @(
+    '-d', 'Ubuntu', '--', 'bash', "`"$wslWorkspace/dev.sh`"", '_workspace-sync',
+    "`"$wslRoot`"", "`"$wslWorkspace`""
+) | Out-Null
 wsl.exe -d Ubuntu -- bash $tmpScript
 $devShExitCode = $LASTEXITCODE
 wsl.exe -d Ubuntu -- rm -f $tmpScript 2>$null | Out-Null
