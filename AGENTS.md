@@ -45,6 +45,9 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - Use `backend/project.py` for settings overrides, extra installed apps, custom
   URL prefixes, integration configuration, optional `COMPOSE_SERVICES`, mobile
   ordering and metadata, and additional `SYNC_PROJECT_PATHS`.
+- Declare optional environment inputs for new checkouts in a literal `ENV_DEFAULTS`
+  mapping in `backend/project.py`. Do not place secrets in this mapping. Bootstrap
+  scans active code only; existing root `.env` files are never template-synced.
 - Keep bootstrap options consumed by `project_config.py` as literal strings,
   lists, or dictionaries. Do not make dev tooling execute project integrations
   just to read these options.
