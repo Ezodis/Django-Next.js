@@ -21,7 +21,7 @@ MOBILE_SKIP = {'shared', 'node_modules', 'scripts', 'packages', 'builds'}
 # Shared architecture boundaries. New files inside shared directories are
 # discovered automatically; application source and project.py stay project-owned.
 SHARED_PATHS = (
-    'AGENTS.md', 'dev.sh', 'dev.ps1', 'dev.yml', '.gitattributes', '.dockerignore',
+    'AGENTS.md', 'dev.sh', 'dev.ps1', 'dev.yml', '.gitattributes', '.dockerignore', '.vercelignore',
     'backend/config/*', 'backend/manage.py', 'backend/backup/*.sh',
     'backend/requirements/base.txt', 'backend/requirements/development.txt',
     'backend/requirements/deployment.txt',
