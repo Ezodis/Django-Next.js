@@ -34,7 +34,7 @@ services:
           exec python manage.py runserver 0.0.0.0:8000
         fi
     environment:
-      DJANGO_SECRET_KEY: "${DJANGO_SECRET_KEY:-django-insecure-dev-key-change-in-production}"
+      DJANGO_SECRET_KEY: "${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in the root .env}"
       DJANGO_DEBUG: "${DJANGO_DEBUG:-true}"
       COMPOSE_PROJECT_NAME: "${COMPOSE_PROJECT_NAME}"
       PROJECT_HOST: "${PROJECT_HOST}"

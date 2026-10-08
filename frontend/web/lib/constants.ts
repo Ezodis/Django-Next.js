@@ -15,14 +15,6 @@ export const API_ENDPOINTS = {
 export const APP_CONFIG = {
   // These should be set via environment variables in actual use
   API_URL: process.env.NEXT_PUBLIC_API_URL || process.env.EXPO_PUBLIC_API_URL || '',
-  STRIPE_PUBLISHABLE_KEY: 
-    process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY || 
-    process.env.EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY || 
-    '',
-  GOOGLE_MAPS_API_KEY: 
-    process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || 
-    process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY || 
-    '',
 } as const;
 
 // Error messages

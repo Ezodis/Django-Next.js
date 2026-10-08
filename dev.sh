@@ -313,185 +313,11 @@ _port_listener_info() {
   esac
 }
 
-# ── Bootstrap .env ────────────────────────────────────────────────────────────
-# Scans the project for os.getenv() and docker-compose ${VAR} references and
-# generates a .env with sensible defaults for known keys and empty placeholders
-# for everything else. Only runs when .env doesn't exist yet.
+# Bootstrap reads only this checkout; project defaults belong in project.py.
 _bootstrap_env() {
-  local _env="$ROOT_DIR/.env"
-  [[ -f "$_env" ]] && return 0   # already exists — never overwrite
-
-  echo "📝 Scanning project for required environment variables..."
-
-  # Write the scanner+generator to a temp file (avoids bash 3 limitations:
-  # no associative arrays, no heredocs-inside-functions-with-process-substitution).
-  local _s; _s=$(mktemp /tmp/_bootstrap_env_XXXXXX.py)
-  cat > "$_s" << 'SCANNER_EOF'
-import sys, re, os, time
-
-root      = sys.argv[1]
-proj_name = os.path.basename(root)
-out_path  = os.path.join(root, '.env')
-
-# ── Hardcoded defaults for well-known infrastructure keys ─────────────────
-# These cover keys that every Django/React-Native/Expo project typically needs.
-# Anything NOT in this dict gets an empty value.
-DEFAULTS = {
-    'DJANGO_SECRET_KEY':              'django-insecure-local-dev-key-change-in-production-' + str(int(time.time())),
-    'DJANGO_DEBUG':                   'True',
-    'DOMAIN':                         'localhost',
-    'DJANGO_SUPERUSER_USERNAME':      'admin',
-    'DJANGO_SUPERUSER_PASSWORD':      'admin',
-    'DB_HOST':                        'db',
-    'DB_PORT':                        '5432',
-    'DB_NAME':                        'postgres',
-    'DB_USER':                        'postgres',
-    'DB_PASSWORD':                    'postgres',
-    'REDIS_HOST':                     'redis',
-    'REDIS_PORT':                     '6379',
-    'REDIS_DB':                       '0',
-    'DEFAULT_FROM_EMAIL':             'noreply@localhost',
-    'EXPO_PUBLIC_ENV':                'development',
-    'EXPO_PUBLIC_API_URL':            'http://localhost:8000',
-    'NEXT_PUBLIC_API_URL':            '/api',
-    'REACT_NATIVE_PACKAGER_HOSTNAME': 'localhost',
-}
-
-# ── Hints shown as a comment above known keys ─────────────────────────────
-HINTS = {
-    'DJANGO_SECRET_KEY':              '# Change in production — any long random string',
-    'DJANGO_DEBUG':                   '# Set to False in production',
-    'DOMAIN':                         '# Your domain (e.g. myapp.com)',
-    'DB_HOST':                        '# Docker Compose service name',
-    'EXPO_PUBLIC_API_URL':            '# Backend URL seen by the mobile app in dev',
-    'EXPO_PUBLIC_API_URL_PRODUCTION': '# Backend URL used in production builds',
-    'NEXT_PUBLIC_API_URL':            '# Backend URL seen by the web frontend',
-    'CLOUDFLARE_TUNNEL_URL':          '# Auto-managed by dev.sh — do not edit',
-}
-
-# ── Fixed infrastructure groups — ONLY these sections are pre-defined ─────
-# Everything else the scanner finds goes into "Project-specific".
-# Order matters: keys are emitted in this order within each group.
-INFRA_GROUPS = [
-    ('Django',    ['DJANGO_SECRET_KEY', 'DJANGO_DEBUG', 'DOMAIN',
-                   'DJANGO_SUPERUSER_USERNAME', 'DJANGO_SUPERUSER_PASSWORD']),
-    ('Database',  ['DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASSWORD']),
-    ('Redis',     ['REDIS_HOST', 'REDIS_PORT', 'REDIS_DB']),
-    ('Email',     ['EMAIL_HOST_USER', 'EMAIL_HOST_PASSWORD', 'DEFAULT_FROM_EMAIL']),
-    ('Mobile',    ['EXPO_TOKEN', 'EXPO_PUBLIC_ENV',
-                   'EXPO_PUBLIC_API_URL', 'EXPO_PUBLIC_API_URL_PRODUCTION',
-                   'NEXT_PUBLIC_API_URL', 'NEXT_PUBLIC_API_URL_PRODUCTION',
-                   'REACT_NATIVE_PACKAGER_HOSTNAME', 'LOCAL_NETWORK_IP']),
-]
-
-# Keys managed automatically by dev.sh — always last, never in discovered set
-AUTO = {'CLOUDFLARE_TUNNEL_URL'}
-
-# ── Scan the project ──────────────────────────────────────────────────────
-PY_PAT = [
-    re.compile(r'os\.getenv\s*\(\s*["\']([A-Z][A-Z0-9_]+)["\']'),
-    re.compile(r'os\.environ\.get\s*\(\s*["\']([A-Z][A-Z0-9_]+)["\']'),
-    re.compile(r'os\.environ\s*\[\s*["\']([A-Z][A-Z0-9_]+)["\']'),
-]
-COMPOSE_PAT = re.compile(r'\$\{([A-Z][A-Z0-9_]+)[^}]*\}')
-
-SKIP_DIRS = {'.git', '__pycache__', 'node_modules', '.expo', 'staticfiles',
-             'migrations', 'venv', '.venv', 'dist', 'build', '.next', 'coverage'}
-
-# Keys that are internal to Python/Django/Node and never belong in .env
-SKIP_KEYS = {
-    'HOME', 'PATH', 'USER', 'SHELL', 'PWD', 'TERM', 'LANG', 'LC_ALL',
-    'PYTHONPATH', 'DJANGO_SETTINGS_MODULE', 'DEBUG',
-    'PYTHONDONTWRITEBYTECODE', 'PYTHONUNBUFFERED', 'PIP_NO_CACHE_DIR',
-    'CI', 'VIRTUAL_ENV', 'CONDA_DEFAULT_ENV', 'COMPOSE_PROJECT_NAME',
-    'DOCKER_BUILDKIT', 'DOCKER_CONFIG', 'NODE_OPTIONS',
-    'WATCHPACK_POLLING', 'WATCHPACK_POLLING_INTERVAL',
-    'CHOKIDAR_USEPOLLING', 'CHOKIDAR_INTERVAL',
-    'EXPO_NO_TELEMETRY', 'EXPO_NO_REDIRECT_PAGE', 'EXPO_DEBUG',
-    'METRO_PORT', 'METRO_CACHE', 'EAS_NO_VCS', 'WATCHMAN_DISABLE_RECRAWL',
-    'EXPO_USE_FAST_REFRESH', 'EXPO_USE_METRO_WORKSPACE_ROOT',
-    'EXPO_NO_INSPECTOR_PROXY', 'EXPO_NO_UPDATES_CHECK',
-    'NEXT_TELEMETRY_DISABLED', 'APP_TYPE', 'APP', 'PLATFORM', 'PROFILE',
-    'FULL_BACKUP', 'RESTORE_ARCHIVE', 'APP_NAME',
-}
-
-found = set()
-for dirpath, dirnames, filenames in os.walk(root):
-    dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-    for fname in filenames:
-        fpath = os.path.join(dirpath, fname)
-        if fname.endswith('.py'):
-            try:
-                src = open(fpath, encoding='utf-8', errors='ignore').read()
-                for p in PY_PAT:
-                    for m in p.finditer(src):
-                        found.add(m.group(1))
-            except Exception:
-                pass
-        elif fname in ('dev.yml', 'docker-compose.yml', 'docker-compose.yaml',
-                       'compose.yml', 'compose.yaml'):
-            try:
-                src = open(fpath, encoding='utf-8', errors='ignore').read()
-                for m in COMPOSE_PAT.finditer(src):
-                    found.add(m.group(1))
-            except Exception:
-                pass
-
-found -= SKIP_KEYS
-found -= AUTO
-
-# ── Build output ──────────────────────────────────────────────────────────
-handled = set()
-out = []
-
-out.append('# ╔══════════════════════════════════════════════════════════════╗')
-out.append(f'# ║  {proj_name} — Development Environment Variables')
-out.append('# ║  Auto-generated by dev.sh  •  Safe to edit')
-out.append('# ║  DO NOT commit this file to git.')
-out.append('# ╚══════════════════════════════════════════════════════════════╝')
-
-def emit(k):
-    hint = HINTS.get(k)
-    if hint:
-        out.append(hint)
-    out.append(f'{k}={DEFAULTS.get(k, "")}')
-
-# Emit infra groups — only if the project actually uses those keys
-for gname, keys in INFRA_GROUPS:
-    gkeys = [k for k in keys if k in found]
-    if not gkeys:
-        continue
-    out.append('')
-    dash = '─' * max(1, 60 - len(gname))
-    out.append(f'# ── {gname} {dash}')
-    for k in gkeys:
-        emit(k)
-        handled.add(k)
-
-# Everything else the scanner found — fully dynamic, no hardcoding
-extras = sorted(found - handled)
-if extras:
-    out.append('')
-    out.append('# ── Project-specific ' + '─' * 42)
-    for k in extras:
-        emit(k)
-
-# Auto-managed — always last
-out.append('')
-out.append('# ── Auto-managed by dev.sh (do not edit manually) ' + '─' * 13)
-out.append('CLOUDFLARE_TUNNEL_URL=')
-
-with open(out_path, 'w') as f:
-    f.write('\n'.join(out) + '\n')
-SCANNER_EOF
-
-  python3 "$_s" "$ROOT_DIR" 2>/dev/null
-  rm -f "$_s"
-
-  local _count; _count=$(grep -c '^[A-Z]' "$_env" 2>/dev/null || echo "0")
-  echo "✅ .env created at $ROOT_DIR/.env  (${_count} variables)"
-  echo "   ⚠️  Fill in any keys with empty values before using those features."
-  echo ""
+  [[ -f "$ROOT_DIR/.env" ]] && return 0
+  python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" bootstrap-env
+  echo "✅ Created local .env using this project's defaults."
 }
 
 # Run bootstrap immediately so .env is ready for all subsequent commands
@@ -2578,14 +2404,23 @@ _ensure_hosts_entry() {
 
 _ensure_local_tls() {
   local certdir="/tmp/traefik-dynamic/certs" host="${PROJECT_HOST}.localhost"
+  local alias_host="${PROJECT_HOST_ALIAS:-$PROJECT_HOST}.localhost"
   if ! command -v mkcert >/dev/null; then
     echo "Install mkcert to enable trusted local HTTPS." >&2
     return 1
   fi
   mkdir -p "$certdir"
   mkcert -install >/dev/null 2>&1
-  if [[ ! -s "$certdir/${PROJECT_NAME}.pem" ]] || ! openssl x509 -checkend 86400 -noout -in "$certdir/${PROJECT_NAME}.pem" >/dev/null 2>&1; then
-    mkcert -cert-file "$certdir/${PROJECT_NAME}.pem" -key-file "$certdir/${PROJECT_NAME}-key.pem" "$host"
+  # Every routed local hostname needs certificate coverage, including aliases.
+  # Renew existing certificates when a hostname is added or the local CA changes.
+  if [[ ! -s "$certdir/${PROJECT_NAME}.pem" || ! -s "$certdir/${PROJECT_NAME}-key.pem" ]] \
+    || ! openssl x509 -checkend 86400 -noout -in "$certdir/${PROJECT_NAME}.pem" >/dev/null 2>&1 \
+    || ! openssl x509 -checkhost "$host" -noout -in "$certdir/${PROJECT_NAME}.pem" 2>/dev/null | grep -q 'does match certificate' \
+    || ! openssl x509 -checkhost "$alias_host" -noout -in "$certdir/${PROJECT_NAME}.pem" 2>/dev/null | grep -q 'does match certificate' \
+    || ! openssl verify -CAfile "$(mkcert -CAROOT)/rootCA.pem" "$certdir/${PROJECT_NAME}.pem" >/dev/null 2>&1; then
+    local -a cert_hosts=("$host")
+    [[ "$alias_host" == "$host" ]] || cert_hosts+=("$alias_host")
+    mkcert -cert-file "$certdir/${PROJECT_NAME}.pem" -key-file "$certdir/${PROJECT_NAME}-key.pem" "${cert_hosts[@]}" || return 1
   fi
   # Keep certificates inside the existing shared mount, including on macOS.
   if [[ "$OS" == "mac" ]]; then
@@ -4572,10 +4407,13 @@ _draw_status_live() {
   local _projects_parent; _projects_parent="$(dirname "$ROOT_DIR")"
   _resolve_proj() {
     local _proj="$1" _var_display="$2" _var_root="$3"
-    local _d="$_proj" _r=""
+    local _d="$_proj" _r="" _c _n
     for _c in "$_projects_parent"/*/; do
       _c="${_c%/}"
-      local _n; _n=$(basename "$_c" | tr -cd 'a-zA-Z0-9.' | tr '[:upper:]' '[:lower:]' | tr -d '.')
+      _n=$(basename "$_c")
+      # Stale WSL checkouts can contain CR bytes; never select them for display.
+      [[ "$_n" == *[[:cntrl:]]* ]] && continue
+      _n=$(printf '%s' "$_n" | tr -cd 'a-zA-Z0-9.' | tr '[:upper:]' '[:lower:]' | tr -d '.')
       if [[ "$_n" == "$_proj" ]]; then _d=$(basename "$_c"); _r="$_c"; break; fi
     done
     printf -v "$_var_display" '%s' "$_d"
@@ -4586,7 +4424,10 @@ _draw_status_live() {
   # Usage: _hyperlink "https://..." "label"
   # Falls back to plain URL if the terminal doesn't support OSC 8
   _hyperlink() {
-    local _url="$1" _label="$2"
+    local _url _label
+    # Data must not inject cursor movement or terminate the OSC 8 sequence.
+    _url=$(printf '%s' "$1" | tr -d '[:cntrl:]')
+    _label=$(printf '%s' "$2" | tr -d '[:cntrl:]')
     # OSC 8 is supported by iTerm2, macOS Terminal 3.4+, VS Code, Warp, Hyper, etc.
     printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$_url" "$_label"
   }
@@ -4629,6 +4470,9 @@ _draw_status_live() {
         _resolve_proj "$_proj" _display _root
         _host="$(printf '%s' "$_display" | tr '[:upper:]' '[:lower:]').localhost"
       fi
+      # Keep control bytes in paths/configuration out of terminal headers.
+      _display=$(printf '%s' "$_display" | tr -d '[:cntrl:]')
+      _host=$(printf '%s' "$_host" | tr -d '[:cntrl:]')
       _tunnel=$(sed -n 's/^CLOUDFLARE_TUNNEL_URL=//p' "$_root/.env" 2>/dev/null | tr -d '\r')
       while IFS='|' read -r _cn _p _svc; do
         [[ "$_p" == "$_proj" && -n "$_cn" ]] || continue
@@ -7215,7 +7059,7 @@ smart_launch() {
 #   - app.json (expo config)
 #   - package.json (dependencies)
 #   - frontend/web/public (icons/splash)
-#   - .env (Google Maps API key)
+#   - .env (project environment values)
 #
 # Handles:
 #   1. npm install (if node_modules missing)

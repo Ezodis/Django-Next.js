@@ -17,7 +17,7 @@ ENV NODE_ENV=development \
     HOST=0.0.0.0 \
     NEXT_TELEMETRY_DISABLED=1 \
     PORT=3000 \
-    NEXT_PUBLIC_API_URL=http://localhost/api \
+    NEXT_PUBLIC_API_URL=/api \
     PRIVATE_ASSETS_PATH=/private_assets \
     WATCHPACK_POLLING=true
 
