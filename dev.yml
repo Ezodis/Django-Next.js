@@ -24,6 +24,15 @@ services:
       dockerfile: backend/config/Dockerfile.development
     env_file:
       - .env
+    command:
+      - sh
+      - -c
+      - |
+        if [ "$${PUBLIC_SERVE:-false}" = "true" ]; then
+          exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2
+        else
+          exec python manage.py runserver 0.0.0.0:8000
+        fi
     environment:
       DJANGO_SECRET_KEY: "${DJANGO_SECRET_KEY:-django-insecure-dev-key-change-in-production}"
       DJANGO_DEBUG: "${DJANGO_DEBUG:-true}"
@@ -115,6 +124,20 @@ services:
       dockerfile: frontend/web/Dockerfile
     env_file:
       - .env
+    command:
+      - sh
+      - -c
+      - |
+        if ! sha256sum -c node_modules/.dependency-manifest.sha256 >/dev/null 2>&1; then
+          npm ci --no-fund --loglevel=error || exit 1
+          sha256sum package.json package-lock.json > node_modules/.dependency-manifest.sha256
+        fi
+        if [ "$${PUBLIC_SERVE:-false}" = "true" ]; then
+          export NODE_ENV=production
+          npm run build && exec npm run start -- -H 0.0.0.0
+        else
+          exec npm run dev -- -H 0.0.0.0
+        fi
     environment:
       NODE_ENV: "development"
       NEXT_TELEMETRY_DISABLED: "1"

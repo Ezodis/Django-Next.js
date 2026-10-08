@@ -413,6 +413,7 @@ else:
             INSTALLED_APPS = list(dict.fromkeys(INSTALLED_APPS + list(_value)))
         else:
             globals()[_name] = _value
+    MIDDLEWARE = list(dict.fromkeys(MIDDLEWARE + list(getattr(_project, 'EXTRA_MIDDLEWARE', []))))
 
 
 # Dev server autoreloader exclusions âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿âˆ¿

@@ -36,6 +36,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($DevArgs.Count -gt 0 -and ($DevArgs[0] -eq 'watchos' -or
+    ($DevArgs.Count -gt 2 -and $DevArgs[0] -eq 'build' -and $DevArgs[2] -eq 'watchos'))) {
+    Write-Error 'watchOS builds and simulators require macOS and full Xcode. Run these commands on your Mac.'
+    exit 1
+}
 $ROOT_DIR = $PSScriptRoot
 if (-not $ROOT_DIR -or $ROOT_DIR -eq '') {
     $ROOT_DIR = Split-Path -Parent (Resolve-Path $MyInvocation.MyCommand.Path)
