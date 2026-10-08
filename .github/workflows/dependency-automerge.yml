@@ -85,7 +85,13 @@ jobs:
               // Enforce our CI gate even where the account plan lacks branch protection.
               // GitHub also enforces any configured reviews; SHA guards new commits.
               try {
-                await github.rest.pulls.merge({owner, repo, pull_number: pr.number, sha: run.head_sha, merge_method: 'squash'});
+                const result = await github.rest.pulls.merge({owner, repo, pull_number: pr.number, sha: run.head_sha, merge_method: 'squash'});
+                if (result.data.merged) {
+                  // Merges made by GITHUB_TOKEN do not trigger push workflows.
+                  await github.rest.actions.createWorkflowDispatch({owner, repo,
+                    workflow_id: 'vercel-deploy.yml', ref: pr.base.ref,
+                    inputs: {environment: 'production'}});
+                }
               } catch (error) {
                 if (![405, 409].includes(error.status)) throw error;
                 core.notice(`PR #${pr.number} still requires review, current checks, or conflict resolution.`);
