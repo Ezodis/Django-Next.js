@@ -3,7 +3,7 @@
 # Deploy this separately from the main backend for cost optimization
 
 # ---------- Build Stage ----------
-FROM python:3.12.5-slim-bookworm AS python-build-stage
+FROM python:3.12-slim-bookworm AS python-build-stage
 WORKDIR /backend
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=off
 
@@ -20,7 +20,7 @@ RUN pip install --upgrade pip && \
     pip wheel --wheel-dir /wheels --prefer-binary -r requirements/deployment.txt -r requirements/ml.txt
 
 # ---------- Runtime Stage ----------
-FROM python:3.12.5-slim-bookworm AS python-run-stage
+FROM python:3.12-slim-bookworm AS python-run-stage
 WORKDIR /backend
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/backend PIP_NO_CACHE_DIR=1
 

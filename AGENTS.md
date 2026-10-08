@@ -79,3 +79,41 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - Do not claim a structural update has reached other projects or GitHub unless
   it was actually synchronized or published. Report any remaining propagation
   or runtime verification work.
+
+## Dependency maintenance
+
+- The template owns core backend requirements and the frontend framework/tool
+  versions. Template sync merges these versions into project manifests while
+  retaining project packages, identity, routes, environment files and custom
+  commands. Regenerate the project's web lockfile with `npm install` after a
+  manual sync; lockfiles are never copied across different projects.
+- Dependabot checks npm, Python, container images and Actions weekly. Major
+  upgrades are separate pull requests. Prefer the latest compatible patched
+  versions and supported runtimes; do not override peer dependency conflicts.
+- `.github/workflows/template-sync.yml` opens a weekly project pull request from
+  the configured `SYNC_TEMPLATE_REPO`. This activates after these files are
+  committed and pushed to each repository's default branch.
+- Configure `TEMPLATE_SYNC_SSH_KEY` as a unique write-enabled deploy key for
+  each receiving repository, with its private key stored only in that repository's
+  Actions secret. The key publishes template branches, including shared workflows;
+  the built-in GitHub token opens PRs and explicitly dispatches their checks.
+  Enable Actions permission to create pull requests. For a private template,
+  set `TEMPLATE_READ_TOKEN` with read access. Never store credentials in source
+  or the root environment file. The template itself skips self-sync.
+- Require the `frontend` and `backend` jobs from Dependency checks before merging.
+  Enable branch protection where the GitHub account plan supports it.
+  Checks cover a clean npm install, lint, TypeScript, production build, Python
+  dependency consistency, Django system checks and shared dependency-sync tests.
+  Run each project's application regression suite before major framework updates;
+  shared checks do not establish full application coverage.
+- To enable checked automatic merging, set repository variable
+  `DEPENDENCY_AUTO_MERGE=true` and enable squash merging. The workflow enforces
+  successful `frontend` and `backend` jobs on the current PR commit and requires
+  the current default branch to be included before merging. This also works on
+  private repositories whose plan does not support branch protection. It only
+  accepts successful checks on the exact current PR commit. Dependency major
+  releases and backend/runtime updates still require review; template-sync PRs
+  can merge after the receiving project's checks pass. It never runs PR code
+  with write permissions. Without this setup, update PRs remain for review.
+- Audio/ML dependency restructuring is deferred. Keep its current requirements,
+  compatibility constraints and worker layout intact.
