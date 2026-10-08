@@ -15,6 +15,7 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 MOBILE_SKIP = {'shared', 'node_modules', 'scripts', 'packages', 'builds'}
 
@@ -74,7 +75,6 @@ def merge_web_package(template, project):
     return (json.dumps(local, indent=2, ensure_ascii=False) + '\n').encode()
 
 
-
 def project_option(root, name, default=None):
     source = Path(root) / 'backend' / 'project.py'
     if not source.is_file():
@@ -114,6 +114,8 @@ def sync_paths(root):
     root = Path(root)
     paths = [f'backend/{name}/' for name in find_apps(root / 'backend')]
     paths += [f'frontend/mobile/{name}/' for name in mobile_apps(root)]
+    paths += [config['path'].rstrip('/') + '/'
+              for config in project_option(root, 'WATCHOS_APPS', {}).values()]
     paths += project_option(root, 'SYNC_PROJECT_PATHS', [])
     return list(dict.fromkeys(paths))
 
@@ -136,6 +138,23 @@ def environment_values(root):
             values[name] = value
     values.update(os.environ)
     return values
+
+
+def exposure_check_command(root):
+    values = environment_values(root)
+    url = urlsplit(values.get('CLOUDFLARE_TUNNEL_URL', ''))
+    if (url.scheme != 'https' or not url.hostname or url.username or url.password
+            or url.path not in ('', '/') or url.query or url.fragment
+            or url.hostname.endswith(('.trycloudflare.com', '.localhost'))
+            or url.hostname in ('localhost', '127.0.0.1', '::1')):
+        raise ValueError('Set a fixed CLOUDFLARE_TUNNEL_URL=https://your-hostname in the root .env')
+    if not values.get('CLOUDFLARE_TUNNEL_TOKEN'):
+        raise ValueError('A named CLOUDFLARE_TUNNEL_TOKEN is required; expose never uses a quick tunnel')
+    command = project_option(root, 'PUBLIC_EXPOSURE_CHECK_COMMAND', [])
+    if not isinstance(command, list) or not command or any(
+            not isinstance(argument, str) or not argument or '\n' in argument for argument in command):
+        raise ValueError('Declare a literal PUBLIC_EXPOSURE_CHECK_COMMAND list in backend/project.py')
+    return command
 
 
 def mobile_build_environment(root, profile):
@@ -423,6 +442,14 @@ if __name__ == '__main__':
         print('\n'.join(mobile_apps(root)))
     elif option == 'sync-paths':
         print('\n'.join(sync_paths(root)))
+    elif option == 'exposure-check-command':
+        try:
+            print('\n'.join(exposure_check_command(root)))
+        except ValueError as error:
+            print(f'Exposure refused: {error}', file=sys.stderr)
+            raise SystemExit(1)
+    elif option == 'has-exposure-check':
+        raise SystemExit(0 if project_option(root, 'PUBLIC_EXPOSURE_CHECK_COMMAND', []) else 1)
     elif option == 'sync-repo':
         print(configured_repo(root))
     elif option == 'check-isolation':
