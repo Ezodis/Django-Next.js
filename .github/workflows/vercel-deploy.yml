@@ -14,6 +14,7 @@ on:
         options:
           - production
           - preview
+          - diagnostics
 
 # Cancel any in-progress deployment when a new push arrives so runs
 # never pile up and block each other on Vercel's build queue.
@@ -23,48 +24,105 @@ concurrency:
 
 jobs:
   deploy:
+    if: inputs.environment != 'diagnostics'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
 
     steps:
+      - name: Check deployment configuration
+        id: configuration
+        env:
+          TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          PROJECT: ${{ secrets.VERCEL_PROJECT_ID }}
+          TEAM: ${{ secrets.VERCEL_ORG_ID }}
+        run: |
+          if [ -n "$TOKEN" ] && [ -n "$PROJECT" ] && [ -n "$TEAM" ]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          else
+            echo '::notice::No Vercel project credentials configured; deployment skipped.'
+          fi
       - name: Checkout repository
+        if: steps.configuration.outputs.enabled == 'true'
         uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
+        if: steps.configuration.outputs.enabled == 'true'
         uses: actions/setup-node@v7.0.0
         with:
           node-version: '24'
 
       - name: Install Vercel CLI
+        if: steps.configuration.outputs.enabled == 'true'
         run: npm install -g vercel@latest
 
-      # Project config must live next to the Next.js package.json so Vercel
-      # CLI can detect the framework version correctly.
-      - name: Create Vercel project config
-        working-directory: ./frontend/web
+      - name: Configure monorepo root and supported runtime
+        if: steps.configuration.outputs.enabled == 'true'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          TEAM_ID: ${{ secrets.VERCEL_ORG_ID }}
         run: |
-          mkdir -p .vercel
-          cat > .vercel/project.json << EOF
-          {
-            "orgId": "${{ secrets.VERCEL_ORG_ID }}",
-            "projectId": "${{ secrets.VERCEL_PROJECT_ID }}"
-          }
-          EOF
+          python - <<'PY'
+          import json, os, urllib.request, urllib.parse, urllib.error
+          query = urllib.parse.urlencode({'teamId': os.environ['TEAM_ID']})
+          settings = {'rootDirectory': 'frontend/web', 'framework': 'nextjs',
+                      'nodeVersion': '24.x', 'installCommand': 'npm ci --no-fund',
+                      'buildCommand': 'npm run build', 'outputDirectory': '.next'}
+          req = urllib.request.Request('https://api.vercel.com/v9/projects/'+os.environ['PROJECT_ID']+'?'+query,
+              data=json.dumps(settings).encode(), method='PATCH',
+              headers={'Authorization': 'Bearer '+os.environ['VERCEL_TOKEN'], 'Content-Type': 'application/json'})
+          try:
+              urllib.request.urlopen(req).close()
+          except urllib.error.HTTPError as error:
+              raise SystemExit(f'::error::Vercel configuration failed (HTTP {error.code}). Check token team access and project/team IDs.')
+          PY
 
-      # Build the app locally in CI so failures are immediately visible
-      # and we are not waiting for Vercel's remote build queue.
-      - name: Build with Vercel
-        working-directory: ./frontend/web
+      # Invoke the monorepo CLI from the repository root.
+      - name: Fetch settings, build and deploy
+        if: steps.configuration.outputs.enabled == 'true'
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-        run: vercel build --prod --yes --token=$VERCEL_TOKEN
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment || 'production' }}
+        run: |
+          vercel pull --yes --environment="$DEPLOY_ENVIRONMENT" --token="$VERCEL_TOKEN"
+          if [ "$DEPLOY_ENVIRONMENT" = 'production' ]; then
+            vercel build --prod --yes --token="$VERCEL_TOKEN"
+            vercel deploy --prebuilt --prod --yes --token="$VERCEL_TOKEN"
+          else
+            vercel build --yes --token="$VERCEL_TOKEN"
+            vercel deploy --prebuilt --yes --token="$VERCEL_TOKEN"
+          fi
 
-      # Upload the pre-built output — this is a fast file transfer, not a
-      # remote build, so it completes in seconds and cannot hang.
-      - name: Deploy prebuilt to Vercel
-        working-directory: ./frontend/web
+  diagnostics:
+    if: github.event_name == 'workflow_dispatch' && inputs.environment == 'diagnostics'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Read project configuration and failed build logs
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-        run: vercel deploy --prebuilt --prod --yes --token=$VERCEL_TOKEN
+          PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          TEAM_ID: ${{ secrets.VERCEL_ORG_ID }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request, urllib.parse
+          query = urllib.parse.urlencode({'teamId': os.environ['TEAM_ID']})
+          def get(path):
+              req = urllib.request.Request('https://api.vercel.com'+path, headers={'Authorization': 'Bearer '+os.environ['VERCEL_TOKEN']})
+              return json.load(urllib.request.urlopen(req))
+          project = get('/v9/projects/'+os.environ['PROJECT_ID']+'?'+query)
+          print(json.dumps({key: project.get(key) for key in ['name','rootDirectory','nodeVersion','framework','buildCommand','installCommand','outputDirectory']}, indent=2))
+          deployments = get('/v6/deployments?'+query+'&projectId='+os.environ['PROJECT_ID']+'&state=ERROR&limit=1')['deployments']
+          for deployment in deployments:
+              details = get('/v13/deployments/'+deployment['uid']+'?'+query)
+              print(json.dumps({key: details.get(key) for key in ['id','readyState','errorCode','errorMessage']}, indent=2))
+              events = get('/v3/deployments/'+deployment['uid']+'/events?'+query+'&limit=100')
+              for event in events:
+                  text = event.get('payload',{}).get('text')
+                  if text: print(text[:1500])
+          PY
