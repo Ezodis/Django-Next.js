@@ -27,8 +27,6 @@ node_modules/
 frontend/web/.next/
 frontend/web/out/
 frontend/web/node_modules/
-# Bookcovers are large static files — mounted as volume at runtime, not needed in image
-frontend/web/public/bookcovers/
 frontend/mobile/node_modules/
 frontend/mobile/**/android/
 frontend/mobile/**/ios/

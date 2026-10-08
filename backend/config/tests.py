@@ -13,13 +13,88 @@ from . import watchos
 from .project_config import exposure_check_command, is_shared, mobile_apps, sync_paths
 
 
+class ProjectEnvironmentTestCase(unittest.TestCase):
+    def test_project_commands_do_not_inherit_missing_application_secrets(self):
+        from .project_config import project_environment
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'backend').mkdir()
+            (root / 'backend/project.py').write_text("import os\nKEY = os.getenv('INTEGRATION_SECRET')\n")
+            (root / '.env').write_text('DOMAIN=selected.example\n')
+            with patch.dict(os.environ, {'INTEGRATION_SECRET': 'other-project-secret',
+                                         'EXPO_PUBLIC_FOREIGN_KEY': 'foreign',
+                                         'NEXT_PUBLIC_FOREIGN_KEY': 'foreign',
+                                         'PATH': 'host-tools'}):
+                environment = project_environment(root)
+            self.assertNotIn('INTEGRATION_SECRET', environment)
+            self.assertNotIn('EXPO_PUBLIC_FOREIGN_KEY', environment)
+            self.assertNotIn('NEXT_PUBLIC_FOREIGN_KEY', environment)
+            self.assertEqual(environment['PATH'], 'host-tools')
+            self.assertEqual(environment['DOMAIN'], 'selected.example')
+
+    def test_selected_checkout_does_not_inherit_another_projects_values(self):
+        from .project_config import environment_values, mobile_build_environment
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / '.env').write_text('EXPO_PUBLIC_API_URL=https://selected.example/api\nDB_NAME=selected\n')
+            with patch.dict(os.environ, {'EXPO_PUBLIC_API_URL': 'https://other.example/api',
+                                         'EXPO_PUBLIC_FOREIGN_KEY': 'foreign', 'DB_NAME': 'other'}):
+                values = environment_values(root)
+                self.assertEqual(values['DB_NAME'], 'selected')
+                self.assertEqual(environment_values(root, include_environment=True)['DB_NAME'], 'selected')
+                public = mobile_build_environment(root, 'development')
+            self.assertEqual(public['EXPO_PUBLIC_API_URL'], 'https://selected.example/api')
+            self.assertNotIn('EXPO_PUBLIC_FOREIGN_KEY', public)
+
+    def test_discovery_ignores_comments_tests_and_sibling_projects(self):
+        from .project_config import environment_keys
+        with TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = parent / 'selected'
+            (root / 'backend').mkdir(parents=True)
+            (root / 'frontend').mkdir()
+            (root / 'backend/project.py').write_text(
+                "# os.getenv('COMMENTED_INTEGRATION')\nimport os\nACTIVE = os.getenv('ACTIVE_KEY')\n")
+            (root / 'backend/tests.py').write_text("import os\nKEY = os.getenv('TEST_KEY')\n")
+            (root / 'frontend/app.ts').write_text(
+                "// process.env.COMMENTED_PUBLIC_KEY\nconst url = 'https://example.test';\n"
+                "const key = process.env.NEXT_PUBLIC_ACTIVE_KEY;\n")
+            (parent / 'other.py').write_text("import os\nKEY = os.getenv('OTHER_PROJECT_KEY')\n")
+            self.assertEqual(environment_keys(root), {'ACTIVE_KEY', 'NEXT_PUBLIC_ACTIVE_KEY'})
+
+    def test_bootstrap_uses_project_defaults_and_distinct_keys_without_overwriting(self):
+        from .project_config import bootstrap_environment, environment_values
+        with TemporaryDirectory() as temporary:
+            roots = [Path(temporary) / name for name in ('first', 'second')]
+            for root in roots:
+                (root / 'backend').mkdir(parents=True)
+                (root / 'backend/project.py').write_text(
+                    "import os\nSECRET_KEY = os.getenv('DJANGO_SECRET_KEY')\n"
+                    "ENV_DEFAULTS = {'PROJECT_INTEGRATION_KEY': ''}\n")
+                bootstrap_environment(root)
+            first, second = map(environment_values, roots)
+            self.assertNotEqual(first['DJANGO_SECRET_KEY'], second['DJANGO_SECRET_KEY'])
+            self.assertIn('PROJECT_INTEGRATION_KEY', first)
+            source = roots[0] / '.env'
+            source.write_text('DJANGO_SECRET_KEY=keep-existing\n')
+            bootstrap_environment(roots[0])
+            self.assertEqual(source.read_text(), 'DJANGO_SECRET_KEY=keep-existing\n')
+
+    def test_project_environment_and_settings_are_never_template_synced(self):
+        self.assertFalse(is_shared('.env'))
+        self.assertFalse(is_shared('frontend/web/.env.local'))
+        self.assertFalse(is_shared('backend/project.py'))
+
+
 class WatchOSLauncherTestCase(unittest.TestCase):
-    def test_exposure_requires_explicit_named_origin_and_project_check(self):
+    def test_exposure_allows_automatic_quick_tunnel_and_validates_named_origin(self):
         from . import project_config
         command = ['python', 'manage.py', 'project_security_check']
         with patch.object(project_config, 'project_option', return_value=command):
             for url, token, valid in [('https://watch.example.test', 'test-token', True),
-                                      ('https://watch.example.test', '', False),
+                                      ('https://watch.example.test', '', True),
+                                      ('', '', True),
+                                      ('https://temporary.trycloudflare.com', '', True),
                                       ('https://temporary.trycloudflare.com', 'test-token', False),
                                       ('http://watch.example.test', 'test-token', False),
                                       ('https://user:password@watch.example.test', 'test-token', False)]:

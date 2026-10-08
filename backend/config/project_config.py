@@ -9,6 +9,7 @@ import fnmatch
 import json
 import os
 import re
+import secrets
 import runpy
 import subprocess
 import sys
@@ -121,9 +122,85 @@ def sync_paths(root):
     return list(dict.fromkeys(paths))
 
 
-def environment_values(root):
+def environment_keys(root):
+    """Discover active inputs in this checkout without importing project code."""
+    root = Path(root)
+    found = set(project_option(root, 'ENV_DEFAULTS', {}))
+    skip = {'.git', '.venv', 'venv', 'node_modules', '.next', '.expo',
+            '__pycache__', 'staticfiles', 'migrations', 'build', 'dist', 'media'}
+    internal = {'DJANGO_SETTINGS_MODULE', 'PYTHONPATH', 'NODE_ENV', 'CI',
+                'HOME', 'PATH', 'USER', 'PORT', 'PYTHONDONTWRITEBYTECODE',
+                'PYTHONUNBUFFERED', 'PIP_NO_CACHE_DIR'}
+    for directory in (root / 'backend', root / 'frontend'):
+        for parent, directories, files in os.walk(directory):
+            directories[:] = [name for name in directories if name not in skip]
+            for name in files:
+                path = Path(parent) / name
+                if name.startswith(('test', '.')) or 'tests' in path.parts:
+                    continue
+                if path.name in {'project_config.py', 'watchos.py'}:
+                    continue  # tooling options are optional, not application inputs
+                if path.suffix == '.py':
+                    tree = ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Call) and node.args:
+                            function = ast.unparse(node.func)
+                            if function in {'os.getenv', 'os.environ.get', 'env_value', 'env_int', 'env_bool'}:
+                                key = node.args[0]
+                                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                                    found.add(key.value)
+                        elif isinstance(node, ast.Subscript) and ast.unparse(node.value) == 'os.environ':
+                            if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+                                found.add(node.slice.value)
+                elif path.suffix == '.sh':
+                    source = '\n'.join(line for line in path.read_text(encoding='utf-8-sig').splitlines()
+                                       if not line.lstrip().startswith('#'))
+                    found.update(re.findall(r'\$(?:\{)?([A-Z][A-Z0-9_]*)', source))
+                    found.update(re.findall(r'''os\.getenv\(['"]([A-Z][A-Z0-9_]*)['"]''', source))
+                elif path.suffix in {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}:
+                    source = path.read_text(encoding='utf-8-sig')
+                    # Keep strings intact while discarding JS comments (URLs contain //).
+                    tokens = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|//[^\n]*|/\*[\s\S]*?\*/''')
+                    source = tokens.sub(lambda match: '' if match.group().startswith(('//', '/*')) else match.group(), source)
+                    found.update(re.findall(r'process\.env\.([A-Z][A-Z0-9_]*)', source))
+                    found.update(re.findall(r'''process\.env\[['"]([A-Z][A-Z0-9_]*)['"]\]''', source))
+    # Project service extensions may have inputs referenced only by Compose.
+    services = project_option(root, 'COMPOSE_SERVICES', '')
+    services = '\n'.join(line for line in services.splitlines() if not line.lstrip().startswith('#'))
+    found.update(re.findall(r'\$\{([A-Z][A-Z0-9_]*)', services))
+    return found - internal
+
+
+def bootstrap_environment(root):
+    """Create a minimal local environment; existing values are never copied."""
+    root = Path(root)
+    target = root / '.env'
+    if target.exists():
+        return
+    defaults = {'DJANGO_SECRET_KEY': secrets.token_urlsafe(48), 'DJANGO_DEBUG': 'True',
+                'DOMAIN': 'localhost', 'DB_HOST': 'db', 'DB_PORT': '5432',
+                'DB_NAME': 'postgres', 'DB_USER': 'postgres', 'DB_PASSWORD': 'postgres'}
+    # Projects explicitly declare optional integrations/defaults here, as literals.
+    defaults.update(project_option(root, 'ENV_DEFAULTS', {}))
+    if mobile_apps(root):
+        defaults.setdefault('EXPO_PUBLIC_API_URL', 'http://localhost:8000')
+    keys = environment_keys(root)
+    lines = ['# Local environment. Do not commit secrets.',
+             '# Optional settings use code defaults; project defaults live in backend/project.py.']
+    for key, value in defaults.items():
+        if key not in keys:
+            continue
+        if not re.fullmatch(r'[A-Z][A-Z0-9_]*', key) or '\n' in str(value) or '\r' in str(value):
+            raise ValueError('ENV_DEFAULTS must contain dotenv names and single-line values')
+        lines.append(f'{key}={value}')
+    target.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+
+def environment_values(root, include_environment=False):
     """Read simple dotenv assignments as data, preserving embedded '=' signs."""
-    values = {}
+    # Host tools read the selected checkout. Inherited project credentials and
+    # public build variables must not leak from a previously launched project.
+    values = dict(os.environ) if include_environment else {}
     source = Path(root) / '.env'
     if source.is_file():
         for line in source.read_text(encoding='utf-8-sig').splitlines():
@@ -137,20 +214,26 @@ def environment_values(root):
             else:
                 value = re.sub(r'\s+#.*$', '', value).rstrip()
             values[name] = value
-    values.update(os.environ)
+    return values
+
+
+def project_environment(root):
+    """Keep host tooling paths, replacing application inputs with this .env."""
+    keys = environment_keys(root) - {'DEV_SOURCE_DIR'}
+    values = {key: value for key, value in os.environ.items()
+              if key not in keys and not key.startswith(('EXPO_PUBLIC_', 'NEXT_PUBLIC_'))}
+    values.update(environment_values(root))
     return values
 
 
 def exposure_check_command(root):
     values = environment_values(root)
     url = urlsplit(values.get('CLOUDFLARE_TUNNEL_URL', ''))
-    if (url.scheme != 'https' or not url.hostname or url.username or url.password
+    if values.get('CLOUDFLARE_TUNNEL_TOKEN') and (url.scheme != 'https' or not url.hostname or url.username or url.password
             or url.path not in ('', '/') or url.query or url.fragment
             or url.hostname.endswith(('.trycloudflare.com', '.localhost'))
             or url.hostname in ('localhost', '127.0.0.1', '::1')):
         raise ValueError('Set a fixed CLOUDFLARE_TUNNEL_URL=https://your-hostname in the root .env')
-    if not values.get('CLOUDFLARE_TUNNEL_TOKEN'):
-        raise ValueError('A named CLOUDFLARE_TUNNEL_TOKEN is required; expose never uses a quick tunnel')
     command = project_option(root, 'PUBLIC_EXPOSURE_CHECK_COMMAND', [])
     if not isinstance(command, list) or not command or any(
             not isinstance(argument, str) or not argument or '\n' in argument for argument in command):
@@ -451,6 +534,11 @@ if __name__ == '__main__':
             raise SystemExit(1)
     elif option == 'has-exposure-check':
         raise SystemExit(0 if project_option(root, 'PUBLIC_EXPOSURE_CHECK_COMMAND', []) else 1)
+    elif option == 'exposure-prepare-command':
+        command = project_option(root, 'PUBLIC_EXPOSURE_PREPARE_COMMAND', [])
+        if not isinstance(command, list) or any(not isinstance(arg, str) or not arg or '\n' in arg for arg in command):
+            raise SystemExit('PUBLIC_EXPOSURE_PREPARE_COMMAND must be a literal argument list')
+        print('\n'.join(command))
     elif option == 'sync-repo':
         print(configured_repo(root))
     elif option == 'check-isolation':
@@ -465,7 +553,9 @@ if __name__ == '__main__':
         command = project_option(root, 'DEV_COMMANDS', {}).get(sys.argv[3])
         if not command:
             raise SystemExit(f'Unknown project command: {sys.argv[3]}')
-        os.environ.update(environment_values(root))
+        environment = project_environment(root)
+        os.environ.clear()
+        os.environ.update(environment)
         sys.path.insert(0, str(Path(root).resolve() / 'backend'))
         namespace = runpy.run_path(str(Path(root).resolve() / 'backend/project.py'))
         handler = namespace.get(command)
@@ -484,7 +574,10 @@ if __name__ == '__main__':
     elif option == 'mobile-api-url':
         print(mobile_build_environment(root, sys.argv[3]).get('EXPO_PUBLIC_API_URL') or sys.argv[4])
     elif option == 'run-build':
-        env = dict(os.environ, **mobile_build_environment(root, sys.argv[3]))
+        env = project_environment(root)
+        env.update(mobile_build_environment(root, sys.argv[3]))
         raise SystemExit(subprocess.call(sys.argv[4:], env=env))
+    elif option == 'bootstrap-env':
+        bootstrap_environment(root)
     else:
         raise SystemExit(f'Unknown project option: {option}')

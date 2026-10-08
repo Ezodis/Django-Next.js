@@ -10,24 +10,6 @@ const nextConfig: NextConfig = {
   reactStrictMode: false,
 
 
-  async headers() {
-    return [
-      {
-        source: '/nancy',
-        headers: [
-          { key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate' },
-          { key: 'Pragma', value: 'no-cache' },
-        ],
-      },
-      {
-        source: '/resources/:path*',
-        headers: [
-          { key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate' },
-        ],
-      },
-    ];
-  },
-
   webpack: (config, { dev }) => {
     // Add path alias for shared mobile code
     config.resolve = config.resolve || {};
@@ -39,7 +21,7 @@ const nextConfig: NextConfig = {
     if (dev) {
       config.watchOptions = {
         ...config.watchOptions,
-        ignored: ['**/node_modules/**', '**/.next/**', '**/public/bookcovers/**'],
+        ignored: ['**/node_modules/**', '**/.next/**'],
       };
     }
     return config;

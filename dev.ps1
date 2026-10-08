@@ -149,11 +149,13 @@ function Ensure-WSLPortForwarding {
                 # Remove any existing rule first
                 netsh interface portproxy delete v4tov4 listenport=80 listenaddress=0.0.0.0 2>$null | Out-Null
                 # Add the new rule
-                netsh interface portproxy add v4tov4 listenport=80 listenaddress=0.0.0.0 connectport=80 connectaddress=$wslIP 2>$null | Out-Null
+                netsh interface portproxy delete v4tov4 listenport=80 listenaddress=127.0.0.1 2>$null | Out-Null
+                netsh interface portproxy add v4tov4 listenport=80 listenaddress=127.0.0.1 connectport=80 connectaddress=$wslIP 2>$null | Out-Null
 
                 # Also add port 443 for HTTPS
                 netsh interface portproxy delete v4tov4 listenport=443 listenaddress=0.0.0.0 2>$null | Out-Null
-                netsh interface portproxy add v4tov4 listenport=443 listenaddress=0.0.0.0 connectport=443 connectaddress=$wslIP 2>$null | Out-Null
+                netsh interface portproxy delete v4tov4 listenport=443 listenaddress=127.0.0.1 2>$null | Out-Null
+                netsh interface portproxy add v4tov4 listenport=443 listenaddress=127.0.0.1 connectport=443 connectaddress=$wslIP 2>$null | Out-Null
             }
         } catch { }
     } else {
@@ -615,6 +617,7 @@ set -e
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:`$HOME/.local/bin"
 SOURCE_DIR='$wslRoot'
 WORKSPACE_DIR='$wslWorkspace'
+export DEV_SOURCE_DIR="`$SOURCE_DIR"
 SYNC_PID_FILE="/tmp/devtools-sync-$workspaceLeaf.pid"
 mkdir -p "`$WORKSPACE_DIR"
 
