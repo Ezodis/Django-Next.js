@@ -1,0 +1,46 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /frontend/web
+    schedule:
+      interval: weekly
+    groups:
+      frontend:
+        patterns: ['*']
+        update-types: [minor, patch]
+      frontend-security:
+        applies-to: security-updates
+        patterns: ['*']
+  - package-ecosystem: pip
+    directory: /backend/requirements
+    schedule:
+      interval: weekly
+    groups:
+      backend:
+        patterns: ['*']
+        update-types: [minor, patch]
+    # Audio/ML maintenance is deferred; leave its compatibility constraints alone.
+    ignore:
+      - dependency-name: torch
+      - dependency-name: torchaudio
+      - dependency-name: demucs
+      - dependency-name: openai-whisper
+      - dependency-name: numpy
+      - dependency-name: scipy
+      - dependency-name: librosa
+      - dependency-name: soundfile
+      - dependency-name: pretty_midi
+      - dependency-name: music21
+      - dependency-name: mido
+      - dependency-name: setuptools
+  - package-ecosystem: docker
+    directories: [/frontend/web, /backend/config]
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']

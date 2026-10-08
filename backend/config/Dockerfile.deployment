@@ -8,7 +8,7 @@
 # and add only what that app needs. See backend/project.py (COMPOSE_SERVICES) for the build overwrite (backend-base service + backend override).
 
 # ---------- Build Stage ----------
-FROM python:3.12.5-slim-bookworm AS python-build-stage
+FROM python:3.12-slim-bookworm AS python-build-stage
 WORKDIR /backend
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=off
 
@@ -20,7 +20,7 @@ RUN pip install --upgrade pip && \
     pip wheel --wheel-dir /wheels --prefer-binary -r requirements/deployment.txt
 
 # ---------- Runtime Stage ----------
-FROM python:3.12.5-slim-bookworm AS python-run-stage
+FROM python:3.12-slim-bookworm AS python-run-stage
 WORKDIR /backend
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/backend PIP_NO_CACHE_DIR=1
 
@@ -33,9 +33,9 @@ RUN apt-get update && \
     gzip \
     cpio \
     wget \
-    gnupg && \
-    wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - && \
-    echo "deb http://apt.postgresql.org/pub/repos/apt/ bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
+    gnupg ca-certificates && \
+    mkdir -p /etc/apt/keyrings && wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/keyrings/postgresql.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt/ bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends postgresql-client-17 && \
     rm -rf /var/lib/apt/lists/*

@@ -23,6 +23,7 @@ export function withSharedDevConfig(projectConfig: NextConfig): NextConfig {
   const projectWebpack = projectConfig.webpack;
   return {
     ...projectConfig,
+    outputFileTracingRoot: projectConfig.outputFileTracingRoot ?? process.cwd(),
     allowedDevOrigins: [...new Set([
       ...buildAllowedDevOrigins(),
       ...(projectConfig.allowedDevOrigins ?? []),

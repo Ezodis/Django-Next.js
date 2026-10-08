@@ -2,6 +2,7 @@ from django.test import SimpleTestCase, TestCase
 from django.conf import settings
 from django.urls import reverse, resolve
 import os
+import json
 
 
 class MediaURLConfigurationTestCase(SimpleTestCase):
@@ -136,3 +137,40 @@ class AdminLoginURLTestCase(TestCase):
         self.assertEqual(data.get('username'), 'admin')
 
 
+
+
+class TemplateSyncTests(SimpleTestCase):
+    def test_web_sync_preserves_project_dependencies_scripts_and_identity(self):
+        from .project_config import merge_web_package
+        template = {'dependencies': {'next': '16.4.0', 'react': '19.3.0'},
+                    'devDependencies': {'typescript': '5.9.3'},
+                    'scripts': {'build': 'next build --webpack', 'typecheck': 'tsc --noEmit'},
+                    'engines': {'node': '>=24 <25'}}
+        project = {'name': 'custom-app', 'dependencies': {'next': '15.0.0', 'stripe': 'custom'},
+                   'scripts': {'postinstall': 'custom-command', 'export': 'next export'},
+                   'devDependencies': {'custom-tool': '1'}}
+        merged = json.loads(merge_web_package(json.dumps(template).encode(), json.dumps(project).encode()))
+        self.assertEqual(merged['name'], 'custom-app')
+        self.assertEqual(merged['dependencies'], {'next': '16.4.0', 'react': '19.3.0', 'stripe': 'custom'})
+        self.assertEqual(merged['scripts']['postinstall'], 'custom-command')
+        self.assertNotIn('export', merged['scripts'])
+        self.assertEqual(merged['devDependencies']['custom-tool'], '1')
+        self.assertEqual(merged['scripts']['build'], 'next build --webpack')
+
+    def test_requirement_sync_preserves_project_integrations(self):
+        from .project_config import merge_requirements
+        template = b'Django==5.2.18\n\n# Project-specific integrations\ntemplate-only==1\n'
+        project = b'Django==4.2.16\n\n# Project-specific integrations\nproject-only==2\n'
+        merged = merge_requirements(template, project)
+        self.assertIn(b'Django==5.2.18', merged)
+        self.assertIn(b'project-only==2', merged)
+        self.assertNotIn(b'template-only', merged)
+
+    def test_sync_does_not_downgrade_newer_project_versions(self):
+        from .project_config import merge_requirements, merge_web_package
+        template = {'dependencies': {'next': '16.4.0'}}
+        project = {'dependencies': {'next': '16.4.1'}}
+        merged = json.loads(merge_web_package(json.dumps(template).encode(), json.dumps(project).encode()))
+        self.assertEqual(merged['dependencies']['next'], '16.4.1')
+        merged_requirements = merge_requirements(b'Django==5.2.18\n', b'Django==5.2.19\n')
+        self.assertIn(b'Django==5.2.19', merged_requirements)
