@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-echo "🚀 Starting Django development container"
+echo "🚀 Starting Django container"
 
 # Parse DATABASE_URL to extract connection parameters
 if [ -n "$DATABASE_URL" ]; then
@@ -46,17 +46,11 @@ if [ $attempt -eq $max_attempts ]; then
     exit 1
 fi
 
-# Auto-restore from backup if present
-if [ -f /backend/backup/backup.sh ]; then
-    # The backup utility owns restore eligibility and its completion marker.
-    /backend/backup/backup.sh auto-restore || true
-fi
-
 if [ -f manage.py ]; then
     echo "📦 Applying migrations..."
     # Restored databases may have initial tables without migration records.
     # Adopt those initial tables; subsequent migrations still run normally.
-    python manage.py migrate --noinput --fake-initial || { echo "❌ Migration failed"; exit 1; }
+    DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-config.settings}" python -c 'from config.project_config import migrate_database; migrate_database()' || { echo "❌ Migration failed"; exit 1; }
     echo "✅ Migrations done"
 
     echo "📁 Collecting static files..."
