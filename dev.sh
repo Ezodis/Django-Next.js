@@ -1372,7 +1372,8 @@ _start_healthcheck_runner() {
   # dev.sh itself here before it could open live_monitor.
   if [[ -f "$_pid_file" ]]; then
     local _epid; _epid=$(cat "$_pid_file" 2>/dev/null || true)
-    if [[ "$_epid" =~ ^[0-9]+$ ]] && kill -0 "$_epid" 2>/dev/null; then
+    if [[ "$_epid" =~ ^[0-9]+$ ]] && kill -0 "$_epid" 2>/dev/null \
+      && [[ "$(ps -p "$_epid" -o args= 2>/dev/null)" == *"_project-healthchecks $PROJECT_NAME"* ]]; then
       return 0
     fi
     rm -f "$_pid_file"
@@ -1381,16 +1382,22 @@ _start_healthcheck_runner() {
   # Spawn detached runner:
   #  - Phase 1: 15 rapid rounds at 2s intervals to satisfy retries=10 fast
   #  - Phase 2: steady 5s poll forever
-  (
+  # Ignore terminal hangups and detach all standard streams. disown alone does
+  # not protect a background subshell when its WSL launcher closes.
+  nohup bash -c '
+    PROJECT_NAME="$1"
+    _log_file="$2"
     _run_checks() {
       while IFS= read -r _cname; do
         [[ -z "$_cname" ]] && continue
+        # Workers and other services can legitimately omit a health check.
+        [[ "$(podman inspect --format "{{if .Config.Healthcheck}}yes{{end}}" "$_cname" 2>/dev/null)" == yes ]] || continue
         # podman may read from stdin. Without /dev/null it consumes the process
         # substitution feeding this loop, so only the first container is checked.
         podman healthcheck run "$_cname" </dev/null >> "$_log_file" 2>&1 || true
       done < <(podman ps \
         --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
-        --format '{{.Names}}' 2>/dev/null)
+        --format "{{.Names}}" 2>/dev/null)
     }
     # Phase 1 — burst: 15 rounds × 2s = 30s to flip all containers healthy
     for _i in $(seq 1 15); do
@@ -1402,7 +1409,7 @@ _start_healthcheck_runner() {
       _run_checks
       sleep 5
     done
-  ) >> "$_log_file" 2>&1 &
+  ' _project-healthchecks "$PROJECT_NAME" "$_log_file" </dev/null >> "$_log_file" 2>&1 &
   local _runner_pid=$!
   echo "$_runner_pid" > "$_pid_file"
   disown "$_runner_pid" 2>/dev/null || true
