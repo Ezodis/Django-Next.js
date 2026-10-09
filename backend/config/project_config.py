@@ -355,12 +355,18 @@ def check_project_isolation(root, project, hosts):
         return
     containers = json.loads(subprocess.check_output(['podman', 'inspect', *identifiers], text=True))
     root = Path(root).resolve()
+    # Windows launches run from a native WSL mirror of the same checkout.
+    # Containers created before mirroring still carry the source directory.
+    checkout_directories = {root}
+    source_directory = os.environ.get('DEV_SOURCE_DIR')
+    if source_directory:
+        checkout_directories.add(Path(source_directory).resolve())
     for container in containers:
         labels = container.get('Config', {}).get('Labels') or {}
         owner = labels.get('com.docker.compose.project') or labels.get('io.podman.compose.project')
         directory = labels.get('com.docker.compose.project.working_dir')
         if owner == project:
-            if directory and Path(directory).resolve() != root:
+            if directory and Path(directory).resolve() not in checkout_directories:
                 raise ValueError(f'Project namespace {project!r} already belongs to {directory}. Use a distinct project folder name.')
             continue
         for key, rule in labels.items():
