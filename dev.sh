@@ -4019,7 +4019,8 @@ _cname_from_cache() {
 # Skips profile-gated services (backup, init, eas, etc.)
 # Respects container_name overrides and ${VAR:-default} port syntax.
 _parse_compose_services() {
-  [[ -f "$COMPOSE_FILE" ]] || return
+  local _base_file="${1:-$COMPOSE_FILE}"
+  [[ -f "$_base_file" ]] || return
   local _s; _s=$(mktemp /tmp/_parse_compose_XXXXXX.py)
   printf '%s\n' \
     'import sys, re' \
@@ -4095,8 +4096,8 @@ _parse_compose_services() {
   # Project-specific Compose snippets are separate files and therefore are not
   # visible to the dev.yml parser above. Include their always-on services so
   # ordered startup, health reporting, and rebuild commands can manage them.
-  local _i _extra_file _service_files=("$COMPOSE_FILE")
-  for ((_i=0; _i<${#COMPOSE_F[@]}; _i++)); do
+  local _i _extra_file _service_files=("$_base_file")
+  for ((_i=0; $# == 0 && _i<${#COMPOSE_F[@]}; _i++)); do
     [[ "${COMPOSE_F[$_i]}" == "-f" ]] || continue
     _extra_file="${COMPOSE_F[$((_i + 1))]:-}"
     [[ -f "$_extra_file" && "$_extra_file" != "$COMPOSE_FILE" ]] || continue
@@ -4472,7 +4473,8 @@ _draw_status_live() {
   }
 
   # Render rows first so the header reflects exactly the statuses in this frame.
-  local _core_rows="${_tmp}.core" _mobile_rows="${_tmp}.mobile"
+  local _core_rows="${_tmp}.core" _project_service_rows="${_tmp}.project" _mobile_rows="${_tmp}.mobile"
+  local _row_group="core"
   local _section_ready _section_active _section_failed _header_icon _header_color _row_indent=""
   local _projects=("${_other_projects[@]}" "$PROJECT_NAME")
   {
@@ -4540,10 +4542,15 @@ _draw_status_live() {
 
       _section_ready=true; _section_active=false; _section_failed=false
       local _project_links=""
-      : > "$_core_rows"; : > "$_mobile_rows"
+      local _core_labels="|" _core_svc _core_port _core_override
+      while read -r _core_svc _core_port _core_override; do
+        [[ -n "$_core_svc" ]] && _core_labels+="${_core_svc}|"
+      done < <(_parse_compose_services "$_root/dev.yml")
+      : > "$_core_rows"; : > "$_project_service_rows"; : > "$_mobile_rows"
       while IFS='|' read -r _label _cn; do
         [[ -n "$_cn" ]] || continue
         local _destination="$_core_rows"
+        _row_group="core"
         _row_indent=""
         if [[ "$_label" == "frontend" ]]; then
           _project_links="  $(_hyperlink "http://${_host}" "${_host}")"
@@ -4551,10 +4558,16 @@ _draw_status_live() {
         fi
         if [[ "$_label" == mobile-* ]]; then
           _destination="$_mobile_rows"
+        else
+          case "$_core_labels" in
+            *"|${_label}|"*) ;;
+            *) _destination="$_project_service_rows"; _row_group="project" ;;
+          esac
         fi
         printf '%s|%s\n' "$_label" "$_cn" >> "$_rows_file"
         _draw_status_live_row "$_label" "$_cn" "$_lw" "" "$_sf" >> "$_destination" || true
       done <<< "$_project_rows"
+      _row_group="core"
       _row_indent=""
       # Stopped sections stay hollow; failures take priority over startup.
       _header_icon='⬡'; _header_color=""
@@ -4573,6 +4586,10 @@ _draw_status_live() {
       fi
       printf '  \033[1;34m%s%s\033[34m %s\033[0m\033[37m%s\033[0m\n\n' "$_header_color" "$_header_icon" "$_display" "$_project_links"
       cat "$_core_rows"
+      if [[ -s "$_project_service_rows" ]]; then
+        printf '\n  \033[2m── Project services ──\033[0m\n\n'
+        cat "$_project_service_rows"
+      fi
       if [[ -s "$_mobile_rows" ]]; then
         echo ""
         cat "$_mobile_rows"
@@ -4582,7 +4599,7 @@ _draw_status_live() {
     printf "  \033[2mCtrl+C to quit\033[0m\n\n"
   } > "$_tmp" 2>/dev/null
   cat "$_tmp"
-  rm -f "$_tmp" "$_sf" "$_core_rows" "$_mobile_rows"
+  rm -f "$_tmp" "$_sf" "$_core_rows" "$_project_service_rows" "$_mobile_rows"
 }
 
 _draw_status_live_row() {
@@ -4674,6 +4691,12 @@ _draw_status_live_row() {
   fi
   # Keep service identifiers intact for actions; simplify only the display name.
   local lbl="${label#mobile-}"
+  if [[ "${_row_group:-core}" == "project" ]]; then
+    case "$badge" in
+      healthy|running|unhealthy|stopped) dot='■' ;;
+      *) dot='□' ;;
+    esac
+  fi
   if [[ "$label" == mobile-* ]]; then
     case "$badge" in
       healthy|running) dot='◆' color=$'\033[32m' ;;
