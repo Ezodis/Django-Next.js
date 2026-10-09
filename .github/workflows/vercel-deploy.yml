@@ -91,10 +91,14 @@ jobs:
           DEPLOY_ENVIRONMENT: ${{ inputs.environment || 'production' }}
           BACKEND_URL: ${{ vars.BACKEND_URL }}
           PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL }}
+          REALTIME_URL: ${{ vars.REALTIME_URL }}
         run: |
           vercel pull --yes --environment="$DEPLOY_ENVIRONMENT" --token="$VERCEL_TOKEN"
           # Repository variables override only this project's deployment settings.
           api_args=()
+          if [ -n "$REALTIME_URL" ]; then
+            api_args+=(--build-env "REALTIME_URL=$REALTIME_URL" --env "REALTIME_URL=$REALTIME_URL")
+          fi
           if [ -n "$BACKEND_URL" ]; then
             api_args+=(--build-env "BACKEND_URL=$BACKEND_URL" --env "BACKEND_URL=$BACKEND_URL")
           fi
