@@ -4587,7 +4587,7 @@ _draw_status_live() {
       printf '  \033[1;34m%s%s\033[34m %s\033[0m\033[37m%s\033[0m\n\n' "$_header_color" "$_header_icon" "$_display" "$_project_links"
       cat "$_core_rows"
       if [[ -s "$_project_service_rows" ]]; then
-        printf '\n  \033[2m── Project services ──\033[0m\n\n'
+        echo ""
         cat "$_project_service_rows"
       fi
       if [[ -s "$_mobile_rows" ]]; then
