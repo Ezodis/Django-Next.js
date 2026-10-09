@@ -89,12 +89,26 @@ jobs:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           DEPLOY_ENVIRONMENT: ${{ inputs.environment || 'production' }}
+          BACKEND_URL: ${{ vars.BACKEND_URL }}
+          PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL }}
+          REALTIME_URL: ${{ vars.REALTIME_URL }}
         run: |
           vercel pull --yes --environment="$DEPLOY_ENVIRONMENT" --token="$VERCEL_TOKEN"
+          # Repository variables override only this project's deployment settings.
+          api_args=()
+          if [ -n "$REALTIME_URL" ]; then
+            api_args+=(--build-env "REALTIME_URL=$REALTIME_URL" --env "REALTIME_URL=$REALTIME_URL")
+          fi
+          if [ -n "$BACKEND_URL" ]; then
+            api_args+=(--build-env "BACKEND_URL=$BACKEND_URL" --env "BACKEND_URL=$BACKEND_URL")
+          fi
+          if [ -n "$PUBLIC_API_URL" ]; then
+            api_args+=(--build-env "NEXT_PUBLIC_API_URL=$PUBLIC_API_URL" --env "NEXT_PUBLIC_API_URL=$PUBLIC_API_URL")
+          fi
           if [ "$DEPLOY_ENVIRONMENT" = 'production' ]; then
-            vercel deploy --prod --yes --token="$VERCEL_TOKEN"
+            vercel deploy --prod --yes --token="$VERCEL_TOKEN" "${api_args[@]}"
           else
-            vercel deploy --yes --token="$VERCEL_TOKEN"
+            vercel deploy --yes --token="$VERCEL_TOKEN" "${api_args[@]}"
           fi
 
   diagnostics:
