@@ -189,34 +189,16 @@ rm -f "$_extra_yml"  # Never reuse overrides removed from project.py.
 # Extract the COMPOSE_SERVICES string from project.py and write to a temp file.
 # Uses Python to parse the literal string safely (handles triple-quotes, escapes).
 if [[ -f "$_project_py" ]]; then
-  python3 - "$_project_py" "$_extra_yml" <<'EXTRACT_COMPOSE_EOF'
-import ast, sys, os
-
-src_path, dest_path = sys.argv[1], sys.argv[2]
-try:
-    tree = ast.parse(open(src_path, encoding="utf-8-sig").read())
-except SyntaxError as error:
-    raise SystemExit(f"Invalid project configuration: {error}")
-
-for node in ast.walk(tree):
-    if isinstance(node, ast.Assign):
-        for target in node.targets:
-            if isinstance(target, ast.Name) and target.id == "COMPOSE_SERVICES":
-                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                    content = node.value.value
-                    # Only write if there's at least one real (non-comment) line
-                    real_lines = [l for l in content.splitlines()
-                                  if l.strip() and not l.strip().startswith('#')]
-                    if real_lines:
-                        with open(dest_path, 'w') as f:
-                            # Project snippets contain service entries indented
-                            # beneath Compose's required top-level `services:`.
-                            # Also accept a complete Compose fragment.
-                            if any(l.strip() == 'services:' for l in content.splitlines()):
-                                f.write(content)
-                            else:
-                                f.write('services:\n' + content)
-                    sys.exit(0)
+  python3 - "$_project_py" "$_extra_yml" <<'EXTRACT_COMPOSE_EOF' || exit 1
+import sys
+from pathlib import Path
+src_path, dest_path = map(Path, sys.argv[1:])
+root = src_path.parent.parent
+sys.path.insert(0, str(root / 'backend'))
+from config.project_config import compose_services
+content = compose_services(root)
+if content:
+    dest_path.write_text(content)
 EXTRACT_COMPOSE_EOF
 
   # Include the extracted services file if it has real content

@@ -230,6 +230,34 @@ def environment_keys(root):
     return found - internal
 
 
+def compose_services(root):
+    """Render literal project services, tolerating explicitly optional drives."""
+    root = Path(root).resolve()
+    content = project_option(root, 'COMPOSE_SERVICES', '')
+    values = environment_values(root, include_environment=False)
+    for key, default in project_option(root, 'OPTIONAL_BIND_MOUNTS', {}).items():
+        if not re.fullmatch(r'[A-Z][A-Z0-9_]*', key):
+            raise ValueError('Optional mount names must be environment keys')
+        fallback = (root / default).resolve()
+        if not fallback.is_relative_to(root):
+            raise ValueError('Optional mount fallbacks must stay inside this checkout')
+        source = Path(values.get(key) or fallback)
+        if not source.is_absolute():
+            source = root / source
+        try:
+            available = source.is_dir()
+        except OSError:
+            available = False
+        if not available:
+            fallback.mkdir(parents=True, exist_ok=True)
+            content = re.sub(r'\$\{' + re.escape(key) + r'(?::-[^}]*)?\}',
+                             lambda _: str(fallback), content)
+            print(f'Optional folder {key} is unavailable; using its local fallback mount.', file=sys.stderr)
+    if not any(line.strip() and not line.lstrip().startswith('#') for line in content.splitlines()):
+        return ''
+    return content if any(line == 'services:' for line in content.splitlines()) else 'services:\n' + content
+
+
 def bootstrap_environment(root):
     """Create a minimal local environment; existing values are never copied."""
     root = Path(root)
