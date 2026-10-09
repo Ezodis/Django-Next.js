@@ -64,4 +64,4 @@ USER django
 ENTRYPOINT ["/entrypoint.sh"]
 # Note: Using shell form for CMD to support ${PORT:-8000} environment variable expansion
 # Railway and other PaaS providers set PORT dynamically
-CMD ["sh", "-c", "gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 3"]
+CMD ["gunicorn", "--config", "config/gunicorn.conf.py", "config.wsgi:application"]

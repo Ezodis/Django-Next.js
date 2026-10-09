@@ -53,8 +53,10 @@ if [ -f manage.py ]; then
     DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-config.settings}" python -c 'from config.project_config import migrate_database; migrate_database()' || { echo "❌ Migration failed"; exit 1; }
     echo "✅ Migrations done"
 
-    echo "📁 Collecting static files..."
-    python manage.py collectstatic --noinput --clear 2>/dev/null || true
+    if [ "${STARTUP_COLLECTSTATIC:-true}" = "true" ]; then
+        echo "📁 Collecting static files..."
+        python manage.py collectstatic --noinput --clear
+    fi
 
     # Create superuser
     if [ -n "$DJANGO_SUPERUSER_USERNAME" ] && [ -n "$DJANGO_SUPERUSER_PASSWORD" ] && [ -n "$DOMAIN" ]; then
@@ -75,8 +77,10 @@ END
 
     # Run app entrypoint hooks in background.
     # Any installed app can provide a `manage.py entrypoint` command — Django discovers it automatically.
-    echo "🔧 Running app entrypoint hooks in background..."
-    (python manage.py entrypoint >> /tmp/entrypoint_hooks.log 2>&1) &
+    if [ "${STARTUP_APP_HOOKS:-true}" = "true" ]; then
+        echo "🔧 Running app entrypoint hooks in background..."
+        (python manage.py entrypoint >> /tmp/entrypoint_hooks.log 2>&1) &
+    fi
 fi
 
 exec "$@"

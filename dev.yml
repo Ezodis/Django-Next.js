@@ -29,7 +29,7 @@ services:
       - -c
       - |
         if [ "$${PUBLIC_SERVE:-false}" = "true" ]; then
-          exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2
+          exec gunicorn --config config/gunicorn.conf.py config.wsgi:application
         else
           exec python manage.py runserver 0.0.0.0:8000
         fi
@@ -144,10 +144,10 @@ services:
       # Polling is REQUIRED on macOS (Podman VM) and Windows (WSL2) — inotify/
       # FSEvents don't fire across the host→VM→container volume-mount boundary.
       # WATCHPACK_POLLING must be a NUMBER in ms ("true" silently uses 5007ms).
-      WATCHPACK_POLLING: "500"
-      WATCHPACK_POLLING_INTERVAL: "500"
-      CHOKIDAR_USEPOLLING: "true"
-      CHOKIDAR_INTERVAL: "500"
+      WATCHPACK_POLLING: "${WATCHPACK_POLLING:-1000}"
+      WATCHPACK_POLLING_INTERVAL: "${WATCHPACK_POLLING_INTERVAL:-1000}"
+      CHOKIDAR_USEPOLLING: "${CHOKIDAR_USEPOLLING:-true}"
+      CHOKIDAR_INTERVAL: "${CHOKIDAR_INTERVAL:-1000}"
       NEXT_PUBLIC_URL: "https://${PROJECT_HOST}.localhost"
       NEXT_PUBLIC_API_URL: "/api"
     volumes:

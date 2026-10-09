@@ -4041,9 +4041,10 @@ _parse_compose_services() {
   local _s; _s=$(mktemp /tmp/_parse_compose_XXXXXX.py)
   printf '%s\n' \
     'import sys, re' \
-    'path = sys.argv[1]' \
-    'with open(path, encoding="utf-8", errors="replace") as f:' \
-    '    lines = f.readlines()' \
+    'lines = []' \
+    'for path in sys.argv[1:]:' \
+    '    with open(path, encoding="utf-8", errors="replace") as f:' \
+    '        lines.extend(f.readlines())' \
     'services = {}' \
     'current_svc = None' \
     'in_services = False' \
@@ -4109,18 +4110,18 @@ _parse_compose_services() {
     '    cname = info["container_name"] or ""' \
     '    print(f"{svc} {port} {cname}")' \
     > "$_s"
-  python3 "$_s" "$COMPOSE_FILE"
-
   # Project-specific Compose snippets are separate files and therefore are not
   # visible to the dev.yml parser above. Include their always-on services so
   # ordered startup, health reporting, and rebuild commands can manage them.
-  local _i _extra_file
+  local _i _extra_file _service_files=("$COMPOSE_FILE")
   for ((_i=0; _i<${#COMPOSE_F[@]}; _i++)); do
     [[ "${COMPOSE_F[$_i]}" == "-f" ]] || continue
     _extra_file="${COMPOSE_F[$((_i + 1))]:-}"
     [[ -f "$_extra_file" && "$_extra_file" != "$COMPOSE_FILE" ]] || continue
-    python3 "$_s" "$_extra_file"
+    _service_files+=("$_extra_file")
   done
+  # Merge discovery before printing so an overridden service appears once.
+  python3 "$_s" "${_service_files[@]}"
   rm -f "$_s"
 }
 
