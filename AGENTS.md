@@ -103,8 +103,11 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   Enable Actions permission to create pull requests. For a private template,
   set `TEMPLATE_READ_TOKEN` with read access. Never store credentials in source
   or the root environment file. The template itself skips self-sync.
-- Require the `frontend` and `backend` jobs from Dependency checks before merging.
-  Enable branch protection where the GitHub account plan supports it.
+- Direct pushes to the default branch are allowed by the workspace owner.
+  Keep Dependency checks running after pushes, but do not configure required
+  status checks or PR-only protection unless the owner explicitly requests it.
+  Automatic dependency/template PR merges still require successful `frontend`
+  and `backend` jobs on the current PR commit.
   Checks cover a clean npm install, lint, TypeScript, production build, Python
   dependency consistency, Django system checks and shared dependency-sync tests.
   Run each project's application regression suite before major framework updates;

@@ -175,7 +175,7 @@ perform_backup() {
     # Parse database connection
     parse_database_url
     wait_for_database
-    
+
     # Generate backup filename with timestamp
     local timestamp=$(date +%Y%m%d_%H%M%S)
     local backup_file="${BACKUP_DIR}/backup_${timestamp}.sql"
@@ -888,6 +888,22 @@ auto_restore() {
     parse_database_url
     wait_for_database
     
+    # An image-local marker disappears on redeployment. Migration history lives
+    # in the database: never replay a bundled snapshot over an initialized DB.
+    local initialized
+    initialized=$(cd /backend && DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-config.settings}" python -c '
+import django
+django.setup()
+from django.db import connection
+from django.db.migrations.recorder import MigrationRecorder
+recorder = MigrationRecorder(connection)
+print(int(bool(recorder.has_table() and recorder.applied_migrations())))
+') || return 1
+    if [ "$initialized" = "1" ]; then
+        log "Database has migration history; preserving existing data and skipping automatic restore"
+        return 0
+    fi
+
     # Debug: List all files in start directory
     log "Debug: Contents of start directory:"
     if ls -la "${START_DIR}/" >> "${LOG_FILE}" 2>&1; then

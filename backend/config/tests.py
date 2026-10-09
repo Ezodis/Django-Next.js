@@ -13,6 +13,44 @@ from . import watchos
 from .project_config import exposure_check_command, is_shared, mobile_apps, sync_paths
 
 
+class RestoredSequenceTestCase(TestCase):
+    def test_restored_ids_are_repaired_without_rewinding_ahead_sequences(self):
+        from django.contrib.auth import get_user_model
+        from django.db import connection
+        from .project_config import repair_database_sequences
+        if connection.vendor != 'postgresql':
+            self.skipTest('PostgreSQL sequence repair')
+        User = get_user_model()
+        table = User._meta.db_table
+        User.objects.create(username='restored-sequence-user', pk=50000)
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT pg_get_serial_sequence(%s, %s)', [table, User._meta.pk.column])
+            sequence = cursor.fetchone()[0]
+            cursor.execute('SELECT setval(%s::regclass, 1, true)', [sequence])
+        repair_database_sequences(connection)
+        created = User.objects.create(username='after-restored-sequence')
+        self.assertGreater(created.pk, 50000)
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT setval(%s::regclass, 70000, true)', [sequence])
+        repair_database_sequences(connection)
+        self.assertGreater(User.objects.create(username='after-ahead-sequence').pk, 70000)
+
+    def test_unrelated_tables_in_shared_database_are_untouched(self):
+        from django.db import connection
+        from .project_config import repair_database_sequences
+        if connection.vendor != 'postgresql':
+            self.skipTest('PostgreSQL sequence repair')
+        with connection.cursor() as cursor:
+            cursor.execute('CREATE TABLE config_foreign_sequence_probe (id bigserial PRIMARY KEY)')
+            cursor.execute('INSERT INTO config_foreign_sequence_probe (id) VALUES (50000)')
+            cursor.execute('SELECT last_value FROM config_foreign_sequence_probe_id_seq')
+            previous = cursor.fetchone()[0]
+        repair_database_sequences(connection)
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT last_value FROM config_foreign_sequence_probe_id_seq')
+            self.assertEqual(cursor.fetchone()[0], previous)
+
+
 class ProjectEnvironmentTestCase(unittest.TestCase):
     def test_project_commands_do_not_inherit_missing_application_secrets(self):
         from .project_config import project_environment

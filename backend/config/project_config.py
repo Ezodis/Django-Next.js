@@ -20,6 +20,65 @@ from urllib.parse import urlsplit
 
 MOBILE_SKIP = {'shared', 'node_modules', 'scripts', 'packages', 'builds'}
 
+
+def repair_database_sequences(connection):
+    """Advance restored PostgreSQL counters for this project's models only."""
+    if connection.vendor != 'postgresql':
+        return 0
+    from django.apps import apps
+    from django.db import transaction
+    from django.db.migrations.recorder import MigrationRecorder
+
+    tables = {model._meta.db_table for model in apps.get_models(include_auto_created=True)
+              if model._meta.managed and not model._meta.proxy}
+    tables.add(MigrationRecorder.Migration._meta.db_table)
+    repaired = 0
+    with transaction.atomic(using=connection.alias), connection.cursor() as cursor:
+        existing = set(connection.introspection.table_names(cursor))
+        for table in sorted(tables & existing):
+            sequences = connection.introspection.get_sequences(cursor, table)
+            if not sequences:
+                continue
+            quoted_table = connection.ops.quote_name(table)
+            # Block inserts while comparing each counter to its existing rows.
+            cursor.execute(f'LOCK TABLE {quoted_table} IN SHARE ROW EXCLUSIVE MODE')
+            for sequence in sequences:
+                column = sequence.get('column')
+                if not column:
+                    continue
+                cursor.execute('SELECT pg_get_serial_sequence(%s, %s)', [table, column])
+                sequence_name = cursor.fetchone()[0]
+                if not sequence_name:
+                    continue
+                # PostgreSQL returns an already quoted, schema-qualified name.
+                cursor.execute(f'SELECT last_value, is_called FROM {sequence_name}')
+                last_value, is_called = cursor.fetchone()
+                cursor.execute(f'SELECT MAX({connection.ops.quote_name(column)}) FROM {quoted_table}')
+                maximum = cursor.fetchone()[0]
+                if maximum is not None and (maximum > last_value or (maximum == last_value and not is_called)):
+                    cursor.execute('SELECT setval(%s::regclass, %s, true)', [sequence_name, maximum])
+                    repaired += 1
+    return repaired
+
+
+def migrate_database():
+    """Serialize startup migrations and repair restored counters before inserts."""
+    import django
+    from django.core.management import call_command
+    from django.db import connection
+    django.setup()
+    with connection.cursor() as cursor:
+        if connection.vendor == 'postgresql':
+            cursor.execute("SELECT pg_advisory_lock(hashtext(current_database()), hashtext(current_schema() || ':django-startup'))")
+        try:
+            subprocess.check_call(['/backend/backup/backup.sh', 'auto-restore'])
+            print(f'Repaired {repair_database_sequences(connection)} restored database sequences.', flush=True)
+            call_command('migrate', interactive=False, fake_initial=True)
+            repair_database_sequences(connection)
+        finally:
+            if connection.vendor == 'postgresql':
+                cursor.execute("SELECT pg_advisory_unlock(hashtext(current_database()), hashtext(current_schema() || ':django-startup'))")
+
 # Shared architecture boundaries. New files inside shared directories are
 # discovered automatically; application source and project.py stay project-owned.
 SHARED_PATHS = (
@@ -355,12 +414,18 @@ def check_project_isolation(root, project, hosts):
         return
     containers = json.loads(subprocess.check_output(['podman', 'inspect', *identifiers], text=True))
     root = Path(root).resolve()
+    # Windows launches run from a native WSL mirror of the same checkout.
+    # Containers created before mirroring still carry the source directory.
+    checkout_directories = {root}
+    source_directory = os.environ.get('DEV_SOURCE_DIR')
+    if source_directory:
+        checkout_directories.add(Path(source_directory).resolve())
     for container in containers:
         labels = container.get('Config', {}).get('Labels') or {}
         owner = labels.get('com.docker.compose.project') or labels.get('io.podman.compose.project')
         directory = labels.get('com.docker.compose.project.working_dir')
         if owner == project:
-            if directory and Path(directory).resolve() != root:
+            if directory and Path(directory).resolve() not in checkout_directories:
                 raise ValueError(f'Project namespace {project!r} already belongs to {directory}. Use a distinct project folder name.')
             continue
         for key, rule in labels.items():
