@@ -189,34 +189,16 @@ rm -f "$_extra_yml"  # Never reuse overrides removed from project.py.
 # Extract the COMPOSE_SERVICES string from project.py and write to a temp file.
 # Uses Python to parse the literal string safely (handles triple-quotes, escapes).
 if [[ -f "$_project_py" ]]; then
-  python3 - "$_project_py" "$_extra_yml" <<'EXTRACT_COMPOSE_EOF'
-import ast, sys, os
-
-src_path, dest_path = sys.argv[1], sys.argv[2]
-try:
-    tree = ast.parse(open(src_path, encoding="utf-8-sig").read())
-except SyntaxError as error:
-    raise SystemExit(f"Invalid project configuration: {error}")
-
-for node in ast.walk(tree):
-    if isinstance(node, ast.Assign):
-        for target in node.targets:
-            if isinstance(target, ast.Name) and target.id == "COMPOSE_SERVICES":
-                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                    content = node.value.value
-                    # Only write if there's at least one real (non-comment) line
-                    real_lines = [l for l in content.splitlines()
-                                  if l.strip() and not l.strip().startswith('#')]
-                    if real_lines:
-                        with open(dest_path, 'w') as f:
-                            # Project snippets contain service entries indented
-                            # beneath Compose's required top-level `services:`.
-                            # Also accept a complete Compose fragment.
-                            if any(l.strip() == 'services:' for l in content.splitlines()):
-                                f.write(content)
-                            else:
-                                f.write('services:\n' + content)
-                    sys.exit(0)
+  python3 - "$_project_py" "$_extra_yml" <<'EXTRACT_COMPOSE_EOF' || exit 1
+import sys
+from pathlib import Path
+src_path, dest_path = map(Path, sys.argv[1:])
+root = src_path.parent.parent
+sys.path.insert(0, str(root / 'backend'))
+from config.project_config import compose_services
+content = compose_services(root)
+if content:
+    dest_path.write_text(content)
 EXTRACT_COMPOSE_EOF
 
   # Include the extracted services file if it has real content
@@ -1914,11 +1896,16 @@ _start_cloudflare_tunnel() {
   fi
   _saved_pid=$(cat "$tunnel_pid_file" 2>/dev/null || true)
   if [[ -z "$_tunnel_token" ]] && { [[ ! "$_saved_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$_saved_pid" 2>/dev/null; }; then
-    _saved_pid=$(pgrep -f "cloudflared tunnel.*--http-host-header ${_local_host}" 2>/dev/null | head -1 || true)
+    _saved_pid=$(pgrep -f "cloudflared tunnel.*--pidfile ${tunnel_pid_file}" 2>/dev/null | head -1 || true)
   fi
   if [[ "$_saved_pid" =~ ^[0-9]+$ ]] && kill -0 "$_saved_pid" 2>/dev/null &&
       ps -p "$_saved_pid" -o args= | grep -q '[c]loudflared tunnel'; then
-    if [[ -n "$_tunnel_token" ]] || ! tail -20 "$tunnel_log" 2>/dev/null | grep -q 'Unauthorized: Tunnel not found'; then
+    # Older connectors rewrote the public hostname to localhost and triggered
+    # local HTTPS redirects. Replace that incompatible configuration once.
+    if [[ -n "$_tunnel_token" ]] || {
+      ! ps -p "$_saved_pid" -o args= | grep -q -- '--http-host-header' &&
+      ! tail -20 "$tunnel_log" 2>/dev/null | grep -q 'Unauthorized: Tunnel not found';
+    }; then
       echo "$_saved_pid" > "$tunnel_pid_file"
       if [[ -z "$_tunnel_token" ]]; then
         # The live connector owns its URL; .env may have been copied from an
@@ -1954,9 +1941,9 @@ _start_cloudflare_tunnel() {
   fi
   sleep 0.3
 
-  # ── Start cloudflared with native host-header rewriting ─────────────────────
+  # ── Start cloudflared with the public hostname preserved ────────────────────
   # --url          points cloudflared at Traefik's port 80 on the host
-  # --http-host-header  rewrites Host header so Traefik routes to the right project
+  # Preserve the public Host header so hostname-scoped tunnel routers match.
   # --protocol http2   forces TCP/HTTP2 — QUIC (the default) causes persistent
   #   "control stream failure" reconnection loops on some network configurations.
   # --proxy-connect-timeout  keeps it from giving up on a slow Traefik start
@@ -1982,8 +1969,8 @@ _start_cloudflare_tunnel() {
     _run_detached "$tunnel_log" "$tunnel_pid_file" \
       cloudflared tunnel \
         --protocol http2 \
+        --pidfile "$tunnel_pid_file" \
         --url "http://localhost:80" \
-        --http-host-header "${_local_host}" \
         --proxy-connect-timeout 30s
   fi
   sleep 0.3
@@ -2198,12 +2185,15 @@ http:
       rule: "Host(\`${tunnel_host}\`)"
       entryPoints: [web]
       priority: 1
+      middlewares: [${_proj}-tunnel-forwarded]
       service: ${_proj}-tunnel-frontend-svc
     ${_proj}-tunnel-api:
       rule: "Host(\`${tunnel_host}\`) && PathPrefix(\`/api\`)"
       entryPoints: [web]
       priority: 100
       middlewares:
+        - ${_proj}-tunnel-forwarded
+        - ${_proj}-tunnel-origin
         - ${_proj}-tunnel-strip-api
         - ${_proj}-compress
       service: ${_proj}-tunnel-backend-svc
@@ -2212,19 +2202,32 @@ http:
       entryPoints: [web]
       priority: 100
       middlewares:
+        - ${_proj}-tunnel-forwarded
+        - ${_proj}-tunnel-origin
         - ${_proj}-compress
       service: ${_proj}-tunnel-backend-svc
     ${_proj}-tunnel-static:
       rule: "Host(\`${tunnel_host}\`) && PathPrefix(\`/static\`)"
       entryPoints: [web]
       priority: 100
+      middlewares: [${_proj}-tunnel-forwarded, ${_proj}-tunnel-origin]
       service: ${_proj}-tunnel-backend-svc
     ${_proj}-tunnel-media:
       rule: "Host(\`${tunnel_host}\`) && PathPrefix(\`/media\`)"
       entryPoints: [web]
       priority: 100
+      middlewares: [${_proj}-tunnel-forwarded, ${_proj}-tunnel-origin]
       service: ${_proj}-tunnel-backend-svc
   middlewares:
+    ${_proj}-tunnel-forwarded:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
+          X-Forwarded-Host: "${tunnel_host}"
+    ${_proj}-tunnel-origin:
+      headers:
+        customRequestHeaders:
+          Host: "${PROJECT_HOST}.localhost"
     ${_proj}-tunnel-strip-api:
       stripPrefix:
         prefixes: ["/api"]
@@ -4037,13 +4040,15 @@ _cname_from_cache() {
 # Skips profile-gated services (backup, init, eas, etc.)
 # Respects container_name overrides and ${VAR:-default} port syntax.
 _parse_compose_services() {
-  [[ -f "$COMPOSE_FILE" ]] || return
+  local _base_file="${1:-$COMPOSE_FILE}"
+  [[ -f "$_base_file" ]] || return
   local _s; _s=$(mktemp /tmp/_parse_compose_XXXXXX.py)
   printf '%s\n' \
     'import sys, re' \
-    'path = sys.argv[1]' \
-    'with open(path, encoding="utf-8", errors="replace") as f:' \
-    '    lines = f.readlines()' \
+    'lines = []' \
+    'for path in sys.argv[1:]:' \
+    '    with open(path, encoding="utf-8", errors="replace") as f:' \
+    '        lines.extend(f.readlines())' \
     'services = {}' \
     'current_svc = None' \
     'in_services = False' \
@@ -4109,18 +4114,18 @@ _parse_compose_services() {
     '    cname = info["container_name"] or ""' \
     '    print(f"{svc} {port} {cname}")' \
     > "$_s"
-  python3 "$_s" "$COMPOSE_FILE"
-
   # Project-specific Compose snippets are separate files and therefore are not
   # visible to the dev.yml parser above. Include their always-on services so
   # ordered startup, health reporting, and rebuild commands can manage them.
-  local _i _extra_file
-  for ((_i=0; _i<${#COMPOSE_F[@]}; _i++)); do
+  local _i _extra_file _service_files=("$_base_file")
+  for ((_i=0; $# == 0 && _i<${#COMPOSE_F[@]}; _i++)); do
     [[ "${COMPOSE_F[$_i]}" == "-f" ]] || continue
     _extra_file="${COMPOSE_F[$((_i + 1))]:-}"
     [[ -f "$_extra_file" && "$_extra_file" != "$COMPOSE_FILE" ]] || continue
-    python3 "$_s" "$_extra_file"
+    _service_files+=("$_extra_file")
   done
+  # Merge discovery before printing so an overridden service appears once.
+  python3 "$_s" "${_service_files[@]}"
   rm -f "$_s"
 }
 
@@ -4489,7 +4494,8 @@ _draw_status_live() {
   }
 
   # Render rows first so the header reflects exactly the statuses in this frame.
-  local _core_rows="${_tmp}.core" _mobile_rows="${_tmp}.mobile"
+  local _core_rows="${_tmp}.core" _project_service_rows="${_tmp}.project" _mobile_rows="${_tmp}.mobile"
+  local _row_group="core"
   local _section_ready _section_active _section_failed _header_icon _header_color _row_indent=""
   local _projects=("${_other_projects[@]}" "$PROJECT_NAME")
   {
@@ -4557,10 +4563,15 @@ _draw_status_live() {
 
       _section_ready=true; _section_active=false; _section_failed=false
       local _project_links=""
-      : > "$_core_rows"; : > "$_mobile_rows"
+      local _core_labels="|" _core_svc _core_port _core_override
+      while read -r _core_svc _core_port _core_override; do
+        [[ -n "$_core_svc" ]] && _core_labels+="${_core_svc}|"
+      done < <(_parse_compose_services "$_root/dev.yml")
+      : > "$_core_rows"; : > "$_project_service_rows"; : > "$_mobile_rows"
       while IFS='|' read -r _label _cn; do
         [[ -n "$_cn" ]] || continue
         local _destination="$_core_rows"
+        _row_group="core"
         _row_indent=""
         if [[ "$_label" == "frontend" ]]; then
           _project_links="  $(_hyperlink "http://${_host}" "${_host}")"
@@ -4568,10 +4579,16 @@ _draw_status_live() {
         fi
         if [[ "$_label" == mobile-* ]]; then
           _destination="$_mobile_rows"
+        else
+          case "$_core_labels" in
+            *"|${_label}|"*) ;;
+            *) _destination="$_project_service_rows"; _row_group="project" ;;
+          esac
         fi
         printf '%s|%s\n' "$_label" "$_cn" >> "$_rows_file"
         _draw_status_live_row "$_label" "$_cn" "$_lw" "" "$_sf" >> "$_destination" || true
       done <<< "$_project_rows"
+      _row_group="core"
       _row_indent=""
       # Stopped sections stay hollow; failures take priority over startup.
       _header_icon='⬡'; _header_color=""
@@ -4590,6 +4607,10 @@ _draw_status_live() {
       fi
       printf '  \033[1;34m%s%s\033[34m %s\033[0m\033[37m%s\033[0m\n\n' "$_header_color" "$_header_icon" "$_display" "$_project_links"
       cat "$_core_rows"
+      if [[ -s "$_project_service_rows" ]]; then
+        echo ""
+        cat "$_project_service_rows"
+      fi
       if [[ -s "$_mobile_rows" ]]; then
         echo ""
         cat "$_mobile_rows"
@@ -4599,7 +4620,7 @@ _draw_status_live() {
     printf "  \033[2mCtrl+C to quit\033[0m\n\n"
   } > "$_tmp" 2>/dev/null
   cat "$_tmp"
-  rm -f "$_tmp" "$_sf" "$_core_rows" "$_mobile_rows"
+  rm -f "$_tmp" "$_sf" "$_core_rows" "$_project_service_rows" "$_mobile_rows"
 }
 
 _draw_status_live_row() {
@@ -4691,6 +4712,12 @@ _draw_status_live_row() {
   fi
   # Keep service identifiers intact for actions; simplify only the display name.
   local lbl="${label#mobile-}"
+  if [[ "${_row_group:-core}" == "project" ]]; then
+    case "$badge" in
+      healthy|running|unhealthy|stopped) dot='■' ;;
+      *) dot='□' ;;
+    esac
+  fi
   if [[ "$label" == mobile-* ]]; then
     case "$badge" in
       healthy|running) dot='◆' color=$'\033[32m' ;;
@@ -5120,7 +5147,7 @@ _start_tunnel_watchdog() {
   if [[ -f "$watchdog_pid_file" ]]; then
     local old_pid; old_pid=$(cat "$watchdog_pid_file" 2>/dev/null || true)
     if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
-      if grep -q "preserve-identity-v5" "/tmp/${PROJECT_NAME}-tunnel-watchdog.sh" 2>/dev/null; then return 0; fi
+      if grep -q "preserve-identity-v7" "/tmp/${PROJECT_NAME}-tunnel-watchdog.sh" 2>/dev/null; then return 0; fi
       kill "$old_pid" 2>/dev/null || true
     fi
     rm -f "$watchdog_pid_file"
@@ -5128,17 +5155,15 @@ _start_tunnel_watchdog() {
 
   # Don't start watchdog if cloudflared isn't installed
   command -v cloudflared &>/dev/null || return 0
-  # A watchdog cannot repair project configuration; wait for preparation and
-  # the runtime check to pass rather than launching a doomed recovery loop.
-  if python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" has-exposure-check; then
-    bash "$ROOT_DIR/dev.sh" _exposure_check_only >/dev/null 2>&1 || return 0
-  fi
+  # Runtime checks in the loop gate exposure while allowing recovery after a
+  # temporary backend restart or database outage.
 
   # Capture all variables the watchdog loop needs now, before forking.
   # The double-fork (setsid + subshell) means the child has no parent to
   # inherit from at runtime — everything must be embedded at launch time.
   local _pname="$PROJECT_NAME"
   local _rdir="$ROOT_DIR"
+  local _sdir="${DEV_SOURCE_DIR:-$ROOT_DIR}"
   local _lhost="${PROJECT_HOST}.localhost"
   local _tlog="/tmp/${PROJECT_NAME}-tunnel.log"
   local _tpid="/tmp/${PROJECT_NAME}-tunnel.pid"
@@ -5154,9 +5179,11 @@ _start_tunnel_watchdog() {
   local _wscript="/tmp/${PROJECT_NAME}-tunnel-watchdog.sh"
   cat > "$_wscript" <<'WATCHDOG_SCRIPT_EOF'
 #!/bin/bash
-# preserve-identity-v5
-# Args: pname rdir lhost tlog tpid wpid [tunnel_token]
+# preserve-identity-v7
+# Args: pname rdir lhost tlog tpid wpid [tunnel_token] [source_dir]
 _pname="$1"; _rdir="$2"; _lhost="$3"; _tlog="$4"; _tpid="$5"; _wpid="$6"; _tok="${7:-}"
+_sdir="${8:-$_rdir}"
+export DEV_SOURCE_DIR="$_sdir"
 _retry_file="/tmp/${_pname}-tunnel-retry-after"
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 
@@ -5208,12 +5235,15 @@ _tw_register_traefik() {
     "      rule: \"Host(\`${_host}\`)\"" \
     "      entryPoints: [web]" \
     "      priority: 1" \
+    "      middlewares: [${_pname}-tunnel-forwarded]" \
     "      service: ${_pname}-tunnel-frontend-svc" \
     "    ${_pname}-tunnel-api:" \
     "      rule: \"Host(\`${_host}\`) && PathPrefix(\`/api\`)\"" \
     "      entryPoints: [web]" \
     "      priority: 100" \
     "      middlewares:" \
+    "        - ${_pname}-tunnel-forwarded" \
+    "        - ${_pname}-tunnel-origin" \
     "        - ${_pname}-tunnel-strip-api" \
     "        - ${_pname}-compress" \
     "      service: ${_pname}-tunnel-backend-svc" \
@@ -5222,19 +5252,32 @@ _tw_register_traefik() {
     "      entryPoints: [web]" \
     "      priority: 100" \
     "      middlewares:" \
+    "        - ${_pname}-tunnel-forwarded" \
+    "        - ${_pname}-tunnel-origin" \
     "        - ${_pname}-compress" \
     "      service: ${_pname}-tunnel-backend-svc" \
     "    ${_pname}-tunnel-static:" \
     "      rule: \"Host(\`${_host}\`) && PathPrefix(\`/static\`)\"" \
     "      entryPoints: [web]" \
     "      priority: 100" \
+    "      middlewares: [${_pname}-tunnel-forwarded, ${_pname}-tunnel-origin]" \
     "      service: ${_pname}-tunnel-backend-svc" \
     "    ${_pname}-tunnel-media:" \
     "      rule: \"Host(\`${_host}\`) && PathPrefix(\`/media\`)\"" \
     "      entryPoints: [web]" \
     "      priority: 100" \
+    "      middlewares: [${_pname}-tunnel-forwarded, ${_pname}-tunnel-origin]" \
     "      service: ${_pname}-tunnel-backend-svc" \
     "  middlewares:" \
+    "    ${_pname}-tunnel-forwarded:" \
+    "      headers:" \
+    "        customRequestHeaders:" \
+    "          X-Forwarded-Proto: https" \
+    "          X-Forwarded-Host: ${_host}" \
+    "    ${_pname}-tunnel-origin:" \
+    "      headers:" \
+    "        customRequestHeaders:" \
+    "          Host: ${_lhost}" \
     "    ${_pname}-tunnel-strip-api:" \
     "      stripPrefix:" \
     "        prefixes: [\"/api\"]" \
@@ -5270,13 +5313,21 @@ _tw_register_traefik() {
 
 # Save URL to .env — works on both macOS (sed -i '') and Linux (sed -i)
 _tw_save_url() {
-  local _url="$1"
-  if grep -q "^CLOUDFLARE_TUNNEL_URL=" "$_rdir/.env" 2>/dev/null; then
-    sed -i '' "s|^CLOUDFLARE_TUNNEL_URL=.*|CLOUDFLARE_TUNNEL_URL=${_url}|" "$_rdir/.env" 2>/dev/null \
-      || sed -i "s|^CLOUDFLARE_TUNNEL_URL=.*|CLOUDFLARE_TUNNEL_URL=${_url}|" "$_rdir/.env" 2>/dev/null || true
-  else
-    echo "CLOUDFLARE_TUNNEL_URL=${_url}" >> "$_rdir/.env"
-  fi
+  local _url="$1" _target _current
+  local _targets=("$_rdir/.env")
+  [[ "$_sdir" != "$_rdir" ]] && _targets+=("$_sdir/.env")
+  for _target in "${_targets[@]}"; do
+    [[ -f "$_target" ]] || continue
+    _current=$(sed -n 's/^CLOUDFLARE_TUNNEL_URL=//p' "$_target" | tr -d '\r')
+    [[ "$_current" == "$_url" ]] && continue
+    if grep -q "^CLOUDFLARE_TUNNEL_URL=" "$_target"; then
+      sed -i '' "s|^CLOUDFLARE_TUNNEL_URL=.*|CLOUDFLARE_TUNNEL_URL=${_url}|" "$_target" 2>/dev/null \
+        || sed -i "s|^CLOUDFLARE_TUNNEL_URL=.*|CLOUDFLARE_TUNNEL_URL=${_url}|" "$_target" || return 1
+    else
+      echo "CLOUDFLARE_TUNNEL_URL=${_url}" >> "$_target"
+    fi
+  done
+  return 0
 }
 
 # Check that the tunnel URL resolves AND returns a non-5xx response from our app.
@@ -5291,12 +5342,10 @@ _tw_url_healthy() {
   if ! python3 -c 'import socket,sys; socket.getaddrinfo(sys.argv[1], 443)' "$_host" 2>/dev/null; then
     return 1  # DNS failure — tunnel lease expired
   fi
-  # Second check: HTTP response. Anything except connection refused / timeout is
-  # considered "up" — a 502/503 means Traefik is routing but the app isn't ready,
-  # which is a transient condition, not a dead tunnel.
+  # Server errors need routing recovery, without replacing the live connector.
   local _code
   _code=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "$_url" 2>/dev/null || true)
-  [[ -n "$_code" && "$_code" != "000" ]]
+  [[ "$_code" =~ ^[234][0-9][0-9]$ ]]
 }
 
 # Confirm missing public DNS independently of the machine's DNS cache. Timeouts,
@@ -5357,8 +5406,8 @@ _tw_restart() {
   else
     nohup cloudflared tunnel \
       --protocol http2 \
+      --pidfile "$_tpid" \
       --url "http://localhost:80" \
-      --http-host-header "$_lhost" \
       --proxy-connect-timeout 30s \
       >> "$_tlog" 2>&1 &
   fi
@@ -5424,13 +5473,13 @@ while true; do
     if ! bash "$_rdir/dev.sh" _exposure_check_only; then
       _unsafe_pid=$(cat "$_tpid" 2>/dev/null || true)
       [[ "$_unsafe_pid" =~ ^[0-9]+$ ]] && kill "$_unsafe_pid" 2>/dev/null || true
-      echo "Public connector stopped: project security check failed."
-      exit 1
+      echo "Public connector stopped: project security check failed; retrying when the backend is ready."
+      continue
     fi
   fi
 
   # Skip if project containers aren't running
-  _any=$(podman ps --filter "label=io.podman.compose.project=${_pname}" -q 2>/dev/null | head -1 || true)
+  _any=$(podman ps --filter "label=com.docker.compose.project=${_pname}" -q 2>/dev/null | head -1 || true)
   [[ -z "$_any" ]] && _crash_streak=0 && _bad_streak=0 && continue
 
   # Skip if no internet
@@ -5475,6 +5524,7 @@ while true; do
     fi
   fi
   if [[ -n "$_saved" ]]; then
+    _tw_save_url "$_saved"
     if _tw_url_healthy "$_saved"; then
       # URL is healthy — make sure Traefik config is still in place
       # Re-register if enough time has passed since last attempt (every ~5min)
@@ -5522,7 +5572,7 @@ WATCHDOG_SCRIPT_EOF
   # Use the same waited double-fork as the tunnel processes; the launch must
   # finish detaching before a short-lived WSL invocation exits.
   _run_detached "$_wlog" "$_wpid" bash "$_wscript" \
-    "$_pname" "$_rdir" "$_lhost" "$_tlog" "$_tpid" "$_wpid" "$_wtok"
+    "$_pname" "$_rdir" "$_lhost" "$_tlog" "$_tpid" "$_wpid" "$_wtok" "$_sdir"
 }
 _open_safari() {
   # Determine the URL to open: tunnel if available, otherwise project localhost
@@ -8450,6 +8500,13 @@ try {
     # cooldown expires. It does not rebuild or recreate app containers.
     _ensure_metro_proxies 2>/dev/null || true
     _ensure_metro_tunnels
+    ;;
+
+  _tunnels_only)
+    # Refresh connectors and their recovery loop without reopening the monitor.
+    # The same project preparation and runtime gates apply as normal startup.
+    _start_cloudflare_tunnel
+    _start_tunnel_watchdog
     ;;
 
   service-logs)

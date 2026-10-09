@@ -134,7 +134,8 @@ else:
     DATABASES = {
         "default": dj_database_url.config(
             default="postgres://user:password@host:5432/dbname",
-            conn_max_age=600,
+            conn_max_age=env_int('DB_CONN_MAX_AGE', 600),
+            conn_health_checks=True,
             ssl_require=env_bool("DB_SSL_REQUIRE", True),
         )
     }
