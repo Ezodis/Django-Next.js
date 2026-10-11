@@ -129,6 +129,9 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   Preserve these generic files and the `/ui-localization` endpoint during sync.
 - Keep `frontend/web/messages/automatic-source.json` project-owned. Never copy
   interface catalogs, manual language preferences or source phrases between apps.
+- Root layouts await `getInitialLocalization()` and pass its snapshot to the client
+  provider. Generate project-owned `messages/automatic/*.json` before production
+  builds; never replace first-render localization with post-mount translation.
 - Keep existing manual selectors and reviewed dictionaries. Pass their selected
   language and reviewed messages to `AutomaticTranslationProvider`; projects
   without a selector follow device language automatically.

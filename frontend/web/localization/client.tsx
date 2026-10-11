@@ -1,96 +1,79 @@
 'use client';
-import {Fragment, createContext, createElement, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode} from 'react';
+import {Fragment, createContext, createElement, useCallback, useContext, useEffect, useMemo, useState, useSyncExternalStore, type ReactNode} from 'react';
 import {detectLocale, direction, matchLocale, textKey} from './core.cjs';
 import sources from '../messages/automatic-source.json';
 
 type Catalog = Record<string, string>;
-type TranslationContext = {language: string; catalog: Catalog; register: (source: string) => void};
-const Context = createContext<TranslationContext>({language: 'en', catalog: {}, register: () => {}});
+export type LocalizationSnapshot = {language: string; catalog: Catalog; manual?: boolean};
+type TranslationContext = {language: string; catalog: Catalog};
 const EMPTY: Catalog = {};
+const Context = createContext<TranslationContext>({language: 'en', catalog: EMPTY});
+const loaded = new Map<string, Catalog>();
+const inflight = new Map<string, Promise<Catalog>>();
 const subscribeDevice = (notify: () => void) => {window.addEventListener('languagechange', notify); return () => window.removeEventListener('languagechange', notify);};
 const deviceLanguage = () => detectLocale(navigator.languages?.length ? navigator.languages : [navigator.language]);
 
-// The root provider covers every route, including client navigation and newly added pages.
-export function AutomaticTranslationProvider({children, language, reviewed = EMPTY}: {children: ReactNode; language?: string; reviewed?: Catalog}) {
-  const device = useSyncExternalStore(subscribeDevice, deviceLanguage, () => 'en');
-  const locale = matchLocale(language) ?? device;
-  const [remote, setRemote] = useState<{language: string; messages: Catalog}>({language: '', messages: EMPTY});
-  const catalog = useMemo(() => ({...(remote.language === locale ? remote.messages : EMPTY), ...reviewed}), [remote, locale, reviewed]);
-  const pending = useRef(new Set<string>());
-  const known = useRef<Catalog>({});
-  const knownLanguage = useRef('');
-  const controller = useRef<AbortController | null>(null);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const flush = useRef<() => Promise<void>>(async () => {});
-  const active = useRef(false);
-  const failures = useRef(new Map<string, number>());
-  const attempts = useRef(new Map<string, number>());
+export function preloadInterfaceLanguage(language: string): Promise<Catalog> {
+  const locale = matchLocale(language);
+  if (!locale) return Promise.reject(Error('Unsupported language'));
+  if (loaded.has(locale)) return Promise.resolve(loaded.get(locale)!);
+  if (inflight.has(locale)) return inflight.get(locale)!;
+  const task = fetch('/ui-localization?language=' + encodeURIComponent(locale), {headers: {Accept: 'application/json'}})
+    .then(async response => {
+      if (!response.ok) throw Error('Interface dictionary unavailable');
+      const data = await response.json() as {language: string; translations: Catalog};
+      if (data.language !== locale || !data.translations) throw Error('Invalid interface dictionary');
+      loaded.set(locale, data.translations);
+      return data.translations;
+    }).finally(() => inflight.delete(locale));
+  inflight.set(locale, task);
+  return task;
+}
 
+export function AutomaticTranslationProvider({children, initial, language, reviewed = EMPTY}: {children: ReactNode; initial?: LocalizationSnapshot; language?: string; reviewed?: Catalog}) {
+  const serverLanguage = initial?.language ?? matchLocale(language) ?? 'en';
+  const device = useSyncExternalStore(subscribeDevice, deviceLanguage, () => serverLanguage);
+  const desired = matchLocale(language) ?? (initial?.manual ? serverLanguage : device);
+  const [snapshot, setSnapshot] = useState<LocalizationSnapshot>(() => {
+    if (typeof window !== 'undefined' && initial) loaded.set(initial.language, initial.catalog);
+    return initial ?? {language: serverLanguage, catalog: EMPTY};
+  });
+  // Keep the last complete language current when returning to the server snapshot.
+  if (initial?.language === desired && snapshot !== initial) setSnapshot(initial);
+  const base = initial?.language === desired ? initial : snapshot;
+  const ready = base.language !== desired && typeof window !== 'undefined' && loaded.has(desired)
+    ? {language: desired, catalog: loaded.get(desired)!} : base;
   useEffect(() => {
-    document.documentElement.lang = locale;
-    document.documentElement.dir = direction(locale);
-    controller.current?.abort(); controller.current = new AbortController();
-    known.current = reviewed; knownLanguage.current = locale; failures.current.clear(); attempts.current.clear();
-    active.current = false;
-    const signal = controller.current.signal;
-    flush.current = async () => {
-      if (active.current || signal.aborted) return;
-      active.current = true;
-      try {
-        while (pending.current.size && !signal.aborted) {
-          const ids = [...pending.current].slice(0, 35);
-          ids.forEach(id => pending.current.delete(id));
-          try {
-            const response = await fetch('/ui-localization', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({language: locale, ids}), signal});
-            if (!response.ok) throw Error('Translation unavailable');
-            const data = await response.json() as {translations?: Catalog};
-            if (signal.aborted) return;
-            const additions = data.translations ?? {};
-            known.current = {...known.current, ...additions};
-            setRemote(current => ({language: locale, messages: {...(current.language === locale ? current.messages : EMPTY), ...additions}}));
-          } catch {
-            if (signal.aborted) return;
-            ids.forEach(id => failures.current.set(id, Date.now()));
-            const retryIds = ids.filter(id => (attempts.current.get(id) ?? 0) < 2);
-            retryIds.forEach(id => attempts.current.set(id, (attempts.current.get(id) ?? 0) + 1));
-            if (retryIds.length) {
-              const retry = setTimeout(() => {if (!signal.aborted) {retryIds.forEach(id => pending.current.add(id)); void flush.current();}}, 30000);
-              signal.addEventListener('abort', () => clearTimeout(retry), {once: true});
-            }
-          }
-        }
-      } finally {if (!signal.aborted) active.current = false;}
-    };
-    return () => {controller.current?.abort(); if (timer.current) clearTimeout(timer.current);};
-  }, [locale, reviewed]);
-
-  const register = useCallback((source: string) => {
-    const id = textKey(source);
-    if (!Object.hasOwn(sources, id)) return;
-    if (Object.hasOwn(catalog, id) || knownLanguage.current === locale && (Object.hasOwn(known.current, id) || Date.now() - (failures.current.get(id) ?? 0) < 30000)) return;
-    pending.current.add(id);
-    if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => {void flush.current();}, 30);
-  }, [catalog, locale]);
-  const value = useMemo(() => ({language: locale, catalog, register}), [locale, catalog, register]);
+    if (initial) loaded.set(initial.language, initial.catalog);
+  }, [initial]);
+  useEffect(() => {
+    if (base.language === desired) return;
+    let active = true;
+    preloadInterfaceLanguage(desired).then(catalog => {if (active) setSnapshot({language: desired, catalog});}).catch(() => {});
+    return () => {active = false;};
+  }, [desired, base.language]);
+  const catalog = useMemo(() => ({...ready.catalog, ...(ready.language === desired ? reviewed : EMPTY)}), [ready.catalog, ready.language, desired, reviewed]);
+  useEffect(() => {
+    document.documentElement.lang = ready.language;
+    document.documentElement.dir = direction(ready.language);
+  }, [ready.language]);
+  const value = useMemo(() => ({language: ready.language, catalog}), [ready.language, catalog]);
   return <Context.Provider value={value}>{children}</Context.Provider>;
 }
 
+function translatedText(catalog: Catalog, language: string, source: string): string {
+  const translated = catalog[textKey(source)];
+  // Known authored text never flashes in the source language while a new dictionary loads.
+  return translated ?? (language === 'en' || !Object.hasOwn(sources, textKey(source)) ? source : '');
+}
 export function useAutomaticTranslation(source: string): string {
-  const {language, catalog, register} = useContext(Context);
-  useEffect(() => {register(source);}, [source, language, catalog, register]);
-  return catalog[textKey(source)] ?? source;
+  const {language, catalog} = useContext(Context);
+  return translatedText(catalog, language, source);
 }
-
-// Existing dictionary APIs can reuse the same cache without changing their selectors.
 export function useInterfaceTranslator() {
-  const {catalog, register} = useContext(Context);
-  return useCallback((source: string) => {
-    if (typeof window !== 'undefined' && !Object.hasOwn(catalog, textKey(source))) register(source);
-    return catalog[textKey(source)] ?? source;
-  }, [catalog, register]);
+  const {language, catalog} = useContext(Context);
+  return useCallback((source: string) => translatedText(catalog, language, source), [language, catalog]);
 }
-
 export function AutoText({source, values}: {source: string; values?: ReactNode[]}) {
   const translated = useAutomaticTranslation(source);
   if (!values) return translated;
@@ -99,13 +82,9 @@ export function AutoText({source, values}: {source: string; values?: ReactNode[]
     return <Fragment key={index}>{match ? values[Number(match[1])] : part}</Fragment>;
   });
 }
-
 export function AutoElement({as, translationAttributes, ...props}: {as: string; translationAttributes: string[]; [key: string]: unknown}) {
-  const {language, catalog, register} = useContext(Context);
-  const sources = translationAttributes.map(key => typeof props[key] === 'string' ? props[key] as string : '');
-  const signature = JSON.stringify(sources);
-  useEffect(() => {for (const source of JSON.parse(signature) as string[]) if (source) register(source);}, [signature, language, catalog, register]);
+  const {language, catalog} = useContext(Context);
   const localized = {...props};
-  translationAttributes.forEach((key, index) => {if (sources[index]) localized[key] = catalog[textKey(sources[index])] ?? sources[index];});
+  translationAttributes.forEach(key => {if (typeof props[key] === 'string') localized[key] = translatedText(catalog, language, props[key]);});
   return createElement(as, localized);
 }

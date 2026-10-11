@@ -27,6 +27,7 @@ export function withSharedDevConfig(projectConfig: NextConfig): NextConfig {
   return {
     ...projectConfig,
     outputFileTracingRoot: projectConfig.outputFileTracingRoot ?? process.cwd(),
+    outputFileTracingIncludes: {...projectConfig.outputFileTracingIncludes, '/*': [...(projectConfig.outputFileTracingIncludes?.['/*'] ?? []), './messages/automatic/*.json']},
     allowedDevOrigins: [...new Set([
       ...buildAllowedDevOrigins(),
       ...(projectConfig.allowedDevOrigins ?? []),

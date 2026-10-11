@@ -24,20 +24,32 @@ Code, scripts, SVG/math content, textareas and editable content are not transfor
 Canvas text, imperative alerts, dynamic backend errors and application data need
 the application's existing localization API or explicit `AutoText` integration.
 
-Clients request only manifest IDs and the selected language through `/ui-localization`.
-The endpoint validates IDs against compiled application source. It cannot accept
-arbitrary text, names, passwords, form values or messages for translation.
-Interpolation values stay in the browser; only authored static phrase fragments
-are eligible for translation. Unknown/private values are never sent to the provider.
+The root server layout selects language from the request's weighted Accept-Language
+header or a project's manual preference cookie. It awaits the complete dictionary
+and passes the same snapshot into the client provider. The initial HTML and
+hydration therefore use the same translated text, including accessibility labels.
+Existing reviewed dictionaries still take priority.
 
-The server batches missing phrases, shares in-flight work, uses Next's persistent
-data cache, and bounds the in-process cache. Existing reviewed translations win.
-Cold uncached text initially displays its original wording; cached responses are
-reused across pages. Provider failures retain original text and trigger bounded
-retries. The default endpoint matches the existing catalog generation tooling;
-set `TRANSLATION_BUILD_ENDPOINT` in the root environment to use a compatible
-managed endpoint. A redeployment/platform cache reset can require translations
-to be fetched again. Machine wording remains subject to language review.
+Production builds generate all supported dictionaries into project-owned
+`messages/automatic/<language>.json`. Each entry records its authored source so
+unchanged translations are reused and only new or changed text needs generation.
+Never template-sync these dictionaries across applications. Next output tracing
+includes them in standalone deployments. Incomplete generation fails the build
+instead of shipping a partial dictionary. Keep these files in version control.
+
+Development scans new authored text and resolves any missing entries on the server
+before rendering. Clients request a complete internal dictionary only when the
+language changes; they keep the previous complete language until it is ready.
+OldBook persists manual choices in a cookie as well as its existing local storage;
+legacy local-storage-only preferences migrate on the first visit. EliteCar retains
+its existing preference cookies and regional settings. EDY stays automatic.
+
+Only authored manifest phrases are eligible for machine translation. Dynamic
+names, passwords, form values, private content and interpolation values never go
+to the provider. `/ui-localization` cannot accept arbitrary text. The default
+provider matches the existing catalog tooling; set `TRANSLATION_BUILD_ENDPOINT`
+in the root environment for a compatible managed endpoint. Published dictionaries
+need no live translation provider. Machine wording still needs language review.
 
 Run `node --test localization/tests.cjs` from `frontend/web`. The shared CI workflow
 runs these tests in every receiving project. Production and development currently

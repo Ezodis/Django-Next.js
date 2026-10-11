@@ -28,5 +28,17 @@ function prepare(root){
  if(!fs.existsSync(file)||fs.readFileSync(file,'utf8')!==content)fs.writeFileSync(file,content);
  return Object.keys(catalog).length;
 }
-module.exports={prepare};
-if(require.main===module)console.log(`${prepare(path.resolve(__dirname,'..'))} automatic interface phrases`);
+async function prepareTranslations(root,languages=require('./core.cjs').locales){
+ prepare(root);
+ const source=JSON.parse(fs.readFileSync(path.join(root,'messages','automatic-source.json'),'utf8'));
+ const {prepareCatalog}=require('./catalog.cjs');
+ const queue=[...languages];
+ const failures=[];
+ await Promise.all(Array.from({length:4},async()=>{while(queue.length){const locale=queue.shift();try{await prepareCatalog(root,locale,source);console.log('Interface dictionary ready: '+locale);}catch(error){failures.push(locale+': '+error.message);}}}));
+ if(failures.length)throw Error(failures.join('\n'));
+}
+module.exports={prepare,prepareTranslations};
+if(require.main===module){
+ const root=path.resolve(__dirname,'..');console.log(`${prepare(root)} automatic interface phrases`);
+ if(process.argv.includes('--translations'))prepareTranslations(root).catch(error=>{console.error(error.message);process.exitCode=1;});
+}

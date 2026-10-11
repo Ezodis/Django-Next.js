@@ -4,6 +4,7 @@ function createService({source,fetch:request=global.fetch,endpoint=process.env.T
  const completed=new Map(),inflight=new Map(),queues=new Map();
  const resolvePhrase=(language,id)=>{
   const text=source[id],key=language+':'+id;
+  if(!/\p{L}/u.test(text.replace(/\{v\d+\}/g,'')))return Promise.resolve(text);
   if(completed.has(key))return Promise.resolve(completed.get(key));
   if(inflight.has(key))return inflight.get(key);
   const translate=()=>new Promise((resolve,reject)=>{
@@ -28,14 +29,19 @@ function createService({source,fetch:request=global.fetch,endpoint=process.env.T
     if(!Array.isArray(data)||data.length!==batch.length)throw Error('Invalid translation batch');
     const validated=await Promise.all(data.map(async(entry,index)=>{
      let text=(typeof entry==='string'?entry:entry?.[0])?.replace(/\{\s*[vV]\s*(\d+)\s*\}/g,'{v$1}');
-     if(typeof text!=='string'||!text.trim())throw Error('Empty translation');
+     if(typeof text!=='string'||!text.trim()){
+      const single=new URL(endpoint);single.search=new URLSearchParams({client:'dict-chrome-ex',sl:'auto',tl:language==='fil'?'tl':language,q:batch[index].text});
+      const retry=await request(single,{signal:AbortSignal.timeout(15000)});
+      if(retry.ok){const result=await retry.json();text=(typeof result?.[0]==='string'?result[0]:result?.[0]?.[0])?.replace(/\{\s*[vV]\s*(\d+)\s*\}/g,'{v$1}');}
+     }
+     if(typeof text!=='string'||!text.trim())throw Error('Empty translation: '+language+'/'+batch[index].id);
      if(tokens(text)!==tokens(batch[index].text)){
       const parts=batch[index].text.split(/(\{v\d+\})/g);
       const fragments=parts.filter(part=>!/^\{v\d+\}$/.test(part)&&/\p{L}/u.test(part));
       const repair=new URL(endpoint);repair.search=new URLSearchParams({client:'dict-chrome-ex',sl:'auto',tl:language==='fil'?'tl':language});
       for(const fragment of fragments)repair.searchParams.append('q',fragment);
       const repairedResponse=await request(repair,{signal:AbortSignal.timeout(15000)});
-      if(!repairedResponse.ok)throw Error('Translation repair unavailable');
+      if(!repairedResponse.ok)throw Error('Translation repair unavailable: '+language+'/'+batch[index].id+' ('+repairedResponse.status+')');
       const repaired=await repairedResponse.json();
       if(!Array.isArray(repaired)||repaired.length!==fragments.length)throw Error('Invalid translation repair');
       let fragmentIndex=0;
