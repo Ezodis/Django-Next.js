@@ -414,6 +414,10 @@ class TemplateSyncTests(SimpleTestCase):
             run_sync(project, ['--dir', str(template), '--yes'])
             self.assertEqual((project / 'application.txt').read_text(), 'work in progress\n')
             self.assertEqual((project / 'dev.sh').read_text(), 'upstream\n')
+            mirror = Path(temporary) / 'runtime-mirror'
+            mirror.mkdir()
+            with patch.dict(os.environ, {'DEV_SOURCE_DIR': str(project)}):
+                self.assertEqual(run_sync(mirror, ['--dir', str(template), '--yes']), 0)
             (project / 'dev.sh').write_text('concurrent shared work\n')
             with self.assertRaisesRegex(ValueError, 'unpublished local edits'):
                 run_sync(project, ['--dir', str(template), '--yes'])

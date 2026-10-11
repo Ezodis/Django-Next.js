@@ -520,6 +520,12 @@ def run_sync(root, arguments):
     parser.add_argument('--yes', '-y', action='store_true')
     args = parser.parse_args(arguments)
     root = Path(root).resolve()
+    if not (root / '.git').exists():
+        source = Path(os.environ.get('DEV_SOURCE_DIR', str(root))).resolve()
+        if not (source / '.git').exists():
+            raise ValueError('Run template sync from the Git source checkout, rather than its runtime mirror.')
+        print(f'Syncing source checkout {source}; the runtime mirror follows its files.')
+        root = source
     repo = configured_repo(root)
     clone = local_template(root, repo, args.dir)
     destination = clone if args.direction == 'push' else root
