@@ -4738,12 +4738,6 @@ _draw_status_live_row() {
   fi
   # Keep service identifiers intact for actions; simplify only the display name.
   local lbl="${label#mobile-}"
-  if [[ "${_row_group:-core}" == "project" ]]; then
-    case "$badge" in
-      healthy|running|unhealthy|stopped) dot='■' ;;
-      *) dot='□' ;;
-    esac
-  fi
   if [[ "$label" == mobile-* ]]; then
     case "$badge" in
       healthy|running) dot='◆' color=$'\033[32m' ;;
@@ -4774,8 +4768,16 @@ _draw_status_live_row() {
     fi
   done
   printf '%s' "${_row_indent:-}"
-  printf "  %s%s\033[0m  %-${lw}s  %s%-9s\033[0m  \033[2m%-5s  %-7s  %-8s  %s\033[0m%s\n" \
-    "$color" "$dot" "$lbl" "$color" "$badge" "$uptime" "$cpu" "$mem" "$port_col" "$_links_str"
+  if [[ "${_row_group:-core}" == "project" && "$label" != mobile-* ]]; then
+    # Branches already identify backend children. Reuse the omitted marker's
+    # four columns as label padding so health and resource columns stay fixed.
+    lw=$((lw + 4))
+    printf " %-${lw}s  " "$lbl"
+  else
+    printf "  %s%s\033[0m  %-${lw}s  " "$color" "$dot" "$lbl"
+  fi
+  printf "%s%-9s\033[0m  \033[2m%-5s  %-7s  %-8s  %s\033[0m%s\n" \
+    "$color" "$badge" "$uptime" "$cpu" "$mem" "$port_col" "$_links_str"
   return 0
 }
 
