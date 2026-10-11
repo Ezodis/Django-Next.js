@@ -121,11 +121,13 @@ function Ensure-WSLPortForwarding {
         }
     } catch { }
 
-    # Keep the existing web alias and the project host.
-    $projectHost = ((Get-Item $ROOT_DIR).Name -replace '[^a-zA-Z0-9]', '').ToLowerInvariant() + '.localhost'
+    # Preserve repository dots in local URLs; keep the compact legacy alias.
+    $projectFolder = (Get-Item $ROOT_DIR).Name
+    $projectHost = ($projectFolder -replace '[^a-zA-Z0-9.-]', '').ToLowerInvariant() + '.localhost'
+    $legacyHost = ($projectFolder -replace '[^a-zA-Z0-9]', '').ToLowerInvariant() + '.localhost'
     $hostsPath = Join-Path $env:WINDIR 'System32\drivers\etc\hosts'
     $hostsContent = Get-Content -LiteralPath $hostsPath -ErrorAction SilentlyContinue
-    $missingHosts = @(@($projectHost) | Select-Object -Unique | Where-Object {
+    $missingHosts = @(@($projectHost, $legacyHost) | Select-Object -Unique | Where-Object {
         $aliasPattern = '^\s*127\.0\.0\.1\s+[^#]*\b' + [regex]::Escape($_) + '(\s|$)'
         -not ($hostsContent -match $aliasPattern)
     })

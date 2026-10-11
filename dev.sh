@@ -313,14 +313,15 @@ export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 # Display name preserves original capitalization and dots for UI/status display
 # PROJECT_DISPLAY_NAME was also declared above for early callers.
 
-# PROJECT_HOST is a single DNS label derived from the project folder.  A
-# single-label `name.localhost` resolves automatically on Windows, macOS, and
-# Linux; keeping dots would create `name.app.localhost`, which Windows does not
-# consistently resolve without an elevated hosts-file edit.
-PROJECT_HOST="$PROJECT_NAME"
+# Local URLs preserve the repository's dots and hyphens. Container/volume
+# namespaces continue using PROJECT_NAME so existing resources are reused.
+_project_host() {
+  basename "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9.-'
+}
+PROJECT_HOST="$(_project_host "$ROOT_DIR")"
 export PROJECT_HOST
-# Accept the dotted repository name too, while retaining the portable hostname.
-PROJECT_HOST_ALIAS="$(basename "$ROOT_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9.-')"
+# Retain the previous compact hostname as a compatibility alias.
+PROJECT_HOST_ALIAS="$PROJECT_NAME"
 export PROJECT_HOST_ALIAS
 
 # ── OS detection ──────────────────────────────────────────────────────────────
@@ -2451,9 +2452,8 @@ _ensure_hosts_entry() {
   # Windows host resolution is handled by dev.ps1; /etc/hosts in WSL would
   # not change the Windows browser's resolver.
   [[ "$OS" == "wsl" ]] && return 0
-  local _local_host _qr_host
-  _qr_host=$(basename "$ROOT_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9.-')
-  for _local_host in "${PROJECT_HOST}.localhost" "${_qr_host}.localhost"; do
+  local _local_host
+  for _local_host in "${PROJECT_HOST}.localhost" "${PROJECT_HOST_ALIAS}.localhost"; do
     grep -qF "$_local_host" /etc/hosts 2>/dev/null && continue
     echo "🔧 Adding ${_local_host} to /etc/hosts so browsers can resolve it..."
     printf '127.0.0.1  %s\n' "$_local_host" | sudo tee -a /etc/hosts >/dev/null \
@@ -4258,7 +4258,7 @@ _qr_page_link() {
   local root="$1" app="${2:-}" project state url host config dest port
   [[ -d "$root/frontend/mobile" ]] || return 1
   project=$(basename "$root" | tr -cd 'a-zA-Z0-9' | tr '[:upper:]' '[:lower:]')
-  host=$(basename "$root" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9.-')
+  host=$(_project_host "$root")
   host="${host}.localhost"
   # The link is stable even while the local QR service is recovering.
   printf 'http://%s/qr' "$host"
@@ -4530,7 +4530,7 @@ _draw_status_live() {
         _display="$PROJECT_DISPLAY_NAME"; _root="$ROOT_DIR"; _host="${PROJECT_HOST}.localhost"
       else
         _resolve_proj "$_proj" _display _root
-        _host="$(printf '%s' "$_display" | tr '[:upper:]' '[:lower:]').localhost"
+        _host="$(_project_host "${_root:-$_display}").localhost"
       fi
       # Keep control bytes in paths/configuration out of terminal headers.
       _display=$(printf '%s' "$_display" | tr -d '[:cntrl:]')
