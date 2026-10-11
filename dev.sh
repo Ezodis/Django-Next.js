@@ -320,9 +320,6 @@ _project_host() {
 }
 PROJECT_HOST="$(_project_host "$ROOT_DIR")"
 export PROJECT_HOST
-# Retain the previous compact hostname as a compatibility alias.
-PROJECT_HOST_ALIAS="$PROJECT_NAME"
-export PROJECT_HOST_ALIAS
 
 # ── OS detection ──────────────────────────────────────────────────────────────
 _UNAME="$(uname -s)"
@@ -350,11 +347,7 @@ if [[ -f "$_env_file" ]]; then
   else
     printf 'COMPOSE_PROJECT_NAME=%s\n' "$PROJECT_NAME" >> "$_env_file"
   fi
-  if grep -q "^PROJECT_HOST_ALIAS=" "$_env_file" 2>/dev/null; then
-    _sed_inplace "s|^PROJECT_HOST_ALIAS=.*|PROJECT_HOST_ALIAS=$PROJECT_HOST_ALIAS|" "$_env_file"
-  else
-    printf 'PROJECT_HOST_ALIAS=%s\n' "$PROJECT_HOST_ALIAS" >> "$_env_file"
-  fi
+  _sed_inplace '/^PROJECT_HOST_ALIAS=/d' "$_env_file"
 fi
 unset _env_file
 
@@ -2427,7 +2420,7 @@ detect_compose() {
   DC_CMD="podman-compose"
   # Fail before Compose can reuse another checkout's containers or host routes.
   python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" check-isolation \
-    "$PROJECT_NAME" "${PROJECT_HOST}.localhost" "${PROJECT_HOST_ALIAS}.localhost" || exit 1
+    "$PROJECT_NAME" "${PROJECT_HOST}.localhost" || exit 1
   _wire_podman_socket
   export CONTAINER_RUNTIME="podman"
 }
@@ -2453,7 +2446,7 @@ _ensure_hosts_entry() {
   # not change the Windows browser's resolver.
   [[ "$OS" == "wsl" ]] && return 0
   local _local_host
-  for _local_host in "${PROJECT_HOST}.localhost" "${PROJECT_HOST_ALIAS}.localhost"; do
+  for _local_host in "${PROJECT_HOST}.localhost"; do
     grep -qF "$_local_host" /etc/hosts 2>/dev/null && continue
     echo "🔧 Adding ${_local_host} to /etc/hosts so browsers can resolve it..."
     printf '127.0.0.1  %s\n' "$_local_host" | sudo tee -a /etc/hosts >/dev/null \
@@ -2463,22 +2456,19 @@ _ensure_hosts_entry() {
 
 _ensure_local_tls() {
   local certdir="/tmp/traefik-dynamic/certs" host="${PROJECT_HOST}.localhost"
-  local alias_host="${PROJECT_HOST_ALIAS:-$PROJECT_HOST}.localhost"
   if ! command -v mkcert >/dev/null; then
     echo "Install mkcert to enable trusted local HTTPS." >&2
     return 1
   fi
   mkdir -p "$certdir"
   mkcert -install >/dev/null 2>&1
-  # Every routed local hostname needs certificate coverage, including aliases.
+  # Only the canonical local hostname is routed.
   # Renew existing certificates when a hostname is added or the local CA changes.
   if [[ ! -s "$certdir/${PROJECT_NAME}.pem" || ! -s "$certdir/${PROJECT_NAME}-key.pem" ]] \
     || ! openssl x509 -checkend 86400 -noout -in "$certdir/${PROJECT_NAME}.pem" >/dev/null 2>&1 \
     || ! openssl x509 -checkhost "$host" -noout -in "$certdir/${PROJECT_NAME}.pem" 2>/dev/null | grep -q 'does match certificate' \
-    || ! openssl x509 -checkhost "$alias_host" -noout -in "$certdir/${PROJECT_NAME}.pem" 2>/dev/null | grep -q 'does match certificate' \
     || ! openssl verify -CAfile "$(mkcert -CAROOT)/rootCA.pem" "$certdir/${PROJECT_NAME}.pem" >/dev/null 2>&1; then
     local -a cert_hosts=("$host")
-    [[ "$alias_host" == "$host" ]] || cert_hosts+=("$alias_host")
     mkcert -cert-file "$certdir/${PROJECT_NAME}.pem" -key-file "$certdir/${PROJECT_NAME}-key.pem" "${cert_hosts[@]}" || return 1
   fi
   # Keep certificates inside the existing shared mount, including on macOS.
@@ -3350,12 +3340,8 @@ if [[ "$CMD" != "status" && "$CMD" != "_status_only" && "$CMD" != "stop" && "$CM
   _ensure_global_traefik
   _ensure_hosts_entry
 fi
-# Start the backend proxy on localhost:8000 → Traefik on every startup.
-# Lets the Android emulator (adb reverse tcp:8000 tcp:8000) and iOS simulator
-# reach the backend at http://localhost:8000/api. Idempotent.
-if [[ "$CMD" != "status" && "$CMD" != "_status_only" && "$CMD" != "stop" && "$CMD" != "down" && "$CMD" != "logs" && "$CMD" != "ios" && "$CMD" != "android" ]]; then
-  _start_backend_proxy 2>/dev/null || true
-fi
+# Simulator-specific commands start their private backend bridge when needed.
+# Normal web startup exposes only the canonical project hostname via Traefik.
 # Ensure Metro rewriting proxies are running (tunnel → rewrites localhost:PORT → tunnel URL).
 if [[ "$CMD" == "" || "$CMD" == "mobile" || "$CMD" == "up" || "$CMD" == "core" ]]; then
   _ensure_metro_proxies 2>/dev/null || true
@@ -4593,7 +4579,7 @@ _draw_status_live() {
         _row_group="core"
         _row_indent=""
         if [[ "$_label" == "frontend" ]]; then
-          _project_links="  $(_hyperlink "http://${_host}" "${_host}")"
+          _project_links="  $(_hyperlink "https://${_host}" "${_host}")"
           [[ -n "$_tunnel" ]] && _project_links+="  $(_hyperlink "$_tunnel" "tunnel")"
         fi
         if [[ "$_label" == mobile-* ]]; then

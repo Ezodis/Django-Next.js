@@ -50,8 +50,8 @@ else:
     if railway_host and railway_host not in ALLOWED_HOSTS:
         ALLOWED_HOSTS.append(railway_host)
     # Any extra hosts (comma-separated) for other platforms
-    # Compose routes include the checkout alias as an explicit local hostname.
-    for option in ("PROJECT_HOST", "PROJECT_HOST_ALIAS"):
+    # Compose exposes only the repository-derived canonical local hostname.
+    for option in ("PROJECT_HOST",):
         local_name = os.getenv(option, "").strip()
         if local_name:
             local_host = f"{local_name}.localhost"

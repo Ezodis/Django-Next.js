@@ -30,6 +30,9 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   `SHARED_PATHS` in `backend/config/project_config.py` for the sync boundary.
 - Every project route on the shared proxy must match that project's explicit
   hostname. Do not add hostless catch-all frontend/API/admin/static/media routes.
+  The sole local web origin is `https://<repository-name>.localhost`, preserving
+  dots and hyphens. Do not add compact spelling aliases or publish frontend/API
+  host ports. Keep simulator bridges and Metro ports limited to their tooling.
   Tunnel routes must match their assigned hostname too. Keep container, volume,
   service, router, and middleware names scoped to the project, and preserve the
   startup collision check before Compose can reuse another checkout's resources.
