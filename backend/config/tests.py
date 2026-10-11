@@ -15,6 +15,91 @@ from .project_config import exposure_check_command, is_shared, mobile_apps, sync
 
 
 class PortableBackupTests(SimpleTestCase):
+    def test_local_upload_encrypts_and_retries_without_replacing_production_tree(self):
+        import base64
+        import hashlib
+        from django.core.files.storage import FileSystemStorage
+        from .backups import create, github_upload, GitHubBackupError
+        with TemporaryDirectory() as directory, patch.dict(os.environ, {'BACKUP_AGE_RECIPIENT': '', 'PROJECT_HOST': 'project'}):
+            root = Path(directory) / 'project'
+            root.mkdir()
+            media = root / 'media'
+            media.mkdir()
+            (media / 'private.txt').write_text('private content')
+            archive = create(root / 'backend/backup', 'media', storage=FileSystemStorage(location=media))
+            calls, published = [], []
+
+            def api(endpoint, data=None, method=None):
+                calls.append((endpoint, data, method))
+                if endpoint == 'git/blobs':
+                    content = base64.b64decode(data['content'])
+                    published.append(content)
+                    return {'sha': hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()}
+                if endpoint == 'git/ref/heads/production-backups':
+                    return {'object': {'sha': 'original' if len([c for c in calls if c[0] == endpoint]) == 1 else 'concurrent'}}
+                if endpoint.startswith('git/commits/'):
+                    return {'tree': {'sha': 'existing-tree'}}
+                if endpoint.startswith('git/trees/'):
+                    return {'tree': [{'path': 'snapshots/production.tar.gz.age', 'type': 'blob', 'sha': 'production'}]}
+                if endpoint == 'git/trees':
+                    self.assertEqual(data['base_tree'], 'existing-tree')
+                    self.assertTrue(all(item['path'].startswith('snapshots/local/') for item in data['tree']))
+                    return {'sha': 'new-tree'}
+                if endpoint == 'git/commits':
+                    return {'sha': 'new-commit'}
+                if endpoint == 'git/refs/heads/production-backups':
+                    self.assertFalse(data['force'])
+                    if len([c for c in calls if c[0] == endpoint]) == 1:
+                        raise GitHubBackupError(422)
+                    return {}
+                raise AssertionError(endpoint)
+
+            def encrypt(command, **kwargs):
+                Path(command[command.index('-o') + 1]).write_bytes(b'age-encryption.org/v1\nencrypted bytes')
+
+            with patch('config.backups.subprocess.run', side_effect=encrypt):
+                result = github_upload(archive, root, api=api, recipient='public-recipient')
+            self.assertTrue(result.endswith('/snapshots/local'))
+            self.assertTrue(archive.exists())
+            self.assertEqual(len(published), 2)
+            self.assertTrue(published[0].startswith(b'age-encryption.org/v1'))
+            self.assertNotIn(b'private content', b''.join(published))
+            self.assertEqual([c[1]['parents'] for c in calls if c[0] == 'git/commits'], [['original'], ['concurrent']])
+
+    def test_local_upload_rejects_other_projects_before_any_remote_request(self):
+        from django.core.files.storage import FileSystemStorage
+        from .backups import create, github_upload
+        with TemporaryDirectory() as directory, patch.dict(os.environ, {'BACKUP_AGE_RECIPIENT': '', 'PROJECT_HOST': 'other'}):
+            root = Path(directory) / 'project'
+            root.mkdir()
+            media = root / 'media'
+            media.mkdir()
+            archive = create(root / 'archives', 'media', storage=FileSystemStorage(location=media))
+            api = unittest.mock.Mock()
+            with self.assertRaisesRegex(ValueError, 'another project'):
+                github_upload(archive, root, api=api)
+            api.assert_not_called()
+
+    def test_download_checks_checksum_before_writing_or_decrypting(self):
+        import base64
+        from .backups import github_download
+        with TemporaryDirectory() as directory:
+            def api(endpoint, data=None, method=None):
+                if endpoint == 'git/ref/heads/production-backups':
+                    return {'object': {'sha': 'head'}}
+                if endpoint.startswith('git/commits/'):
+                    return {'tree': {'sha': 'tree'}}
+                if endpoint.startswith('git/trees/'):
+                    return {'tree': [{'type': 'blob', 'path': 'snapshots/local/snapshot_test.tar.gz.age', 'sha': 'archive'},
+                                     {'type': 'blob', 'path': 'snapshots/local/snapshot_test.tar.gz.age.sha256', 'sha': 'checksum'}]}
+                return {'content': base64.b64encode(b'age-encryption.org/v1\nbytes' if endpoint.endswith('/archive') else b'0' * 64).decode()}
+            destination = Path(directory) / 'download'
+            with patch('config.backups.plaintext_archive') as decrypt:
+                with self.assertRaisesRegex(ValueError, 'checksum'):
+                    github_download(destination, directory, api=api)
+                decrypt.assert_not_called()
+            self.assertFalse(destination.exists())
+
     def test_media_archive_restores_exact_bytes_and_preserves_existing_uploads(self):
         from django.core.files.storage import FileSystemStorage
         from .backups import create, restore

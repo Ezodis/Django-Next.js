@@ -93,6 +93,17 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - `dev.sh backup [full|db|index|media]` creates verified archives in
   `backend/backup/`; it must never delete or automatically replace startup seeds.
   `index` means the complete database, including metadata; it excludes media.
+- Uploads are explicit: `dev.sh backup --upload` creates and publishes, while
+  `dev.sh backup upload [ARCHIVE]` publishes an existing snapshot. Only encrypted
+  archives and checksums go into `snapshots/local` on `production-backups`;
+  Railway exports remain in `snapshots/`. Use the checkout's GitHub origin and
+  existing CLI login, never another project's settings or deployment branch.
+- `dev.sh backup download [local|production]` downloads, checks and decrypts a
+  recovery copy using the private identity outside Git. Downloaded local archives
+  remain ignored. Download/upload never replaces startup seeds or live data;
+  restore explicitly into empty destinations using `dev.sh backup restore`.
+- Profile-gated tools are not always-running monitor services, including tools
+  that inherit profiles through Compose YAML anchors.
 - Restore only trusted archives into empty database/media destinations. Preserve
   legacy SQL/tar startup seeds, but fail on SQL errors rather than accepting a
   partial restore. Existing user tables prevent automatic startup replay.

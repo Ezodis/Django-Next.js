@@ -55,6 +55,9 @@
 # ║  BACKUP / RESTORE                                                           ║
 # ║    ./dev.sh backup               Full snapshot (DB + media) → backup/        ║
 # ║    ./dev.sh backup db            DB-only portable archive → backup/          ║
+# ║    ./dev.sh backup --upload      Create + encrypt + upload local snapshot    ║
+# ║    ./dev.sh backup upload        Upload the latest existing local snapshot   ║
+# ║    ./dev.sh backup download [local|production]   Fetch a recovery snapshot   ║
 # ║      Saved to backend/backup/; startup seed is never replaced        ║
 # ║      Commit that file → production auto-restores on next deploy             ║
 # ║    ./dev.sh backup list          List all backups (start/ and local)        ║
@@ -4040,6 +4043,7 @@ _parse_compose_services() {
     '    with open(path, encoding="utf-8", errors="replace") as f:' \
     '        lines.extend(f.readlines())' \
     'services = {}' \
+    'anchors = {}' \
     'current_svc = None' \
     'in_services = False' \
     'in_ports = False' \
@@ -4064,18 +4068,24 @@ _parse_compose_services() {
     '    if svc_match and indent == indent_services + 2:' \
     '        current_svc = svc_match.group(1)' \
     '        if current_svc not in ("volumes", "networks", "configs", "secrets"):' \
-    '            services.setdefault(current_svc, {"ports": [], "profiles": [], "container_name": None})' \
+    '            services.setdefault(current_svc, {"ports": [], "profiles": [], "profile_defined": False, "container_name": None, "inherits": []})' \
+    '            anchor = re.search(r"&([\w-]+)", stripped)' \
+    '            if anchor: anchors[anchor.group(1)] = current_svc' \
     '        else:' \
     '            current_svc = None' \
     '        in_ports = False; in_profiles = False; continue' \
     '    if current_svc is None:' \
     '        continue' \
+    '    if re.match(r"\s+<<\s*:", stripped) and indent == indent_services + 4:' \
+    '        services[current_svc]["inherits"].extend(re.findall(r"\*([\w-]+)", stripped))' \
+    '        continue' \
     '    pm = re.match(r"\s+profiles\s*:\s*\[([^\]]*)\]", stripped)' \
     '    if pm and indent == indent_services + 4:' \
     '        vals = [v.strip().strip("\"'"'"'") for v in pm.group(1).split(",") if v.strip()]' \
-    '        services[current_svc]["profiles"].extend(vals)' \
+    '        services[current_svc]["profiles"] = vals; services[current_svc]["profile_defined"] = True' \
     '        in_ports = False; in_profiles = False; continue' \
     '    if re.match(r"\s+profiles\s*:", stripped) and indent == indent_services + 4:' \
+    '        services[current_svc]["profiles"] = []; services[current_svc]["profile_defined"] = True' \
     '        in_profiles = True; in_ports = False; continue' \
     '    if re.match(r"\s+ports\s*:", stripped) and indent == indent_services + 4:' \
     '        in_ports = True; in_profiles = False; continue' \
@@ -4097,8 +4107,15 @@ _parse_compose_services() {
     '        continue' \
     '    if indent <= indent_services + 4 and not item:' \
     '        in_ports = False; in_profiles = False' \
+    'def optional(svc, seen=None):' \
+    '    seen = set() if seen is None else seen' \
+    '    if svc in seen: return False' \
+    '    seen.add(svc)' \
+    '    info = services[svc]' \
+    '    if info["profile_defined"]: return bool(info["profiles"])' \
+    '    return bool(info["profiles"]) or any(optional(anchors[a], seen) for a in info["inherits"] if a in anchors)' \
     'for svc, info in services.items():' \
-    '    if info["profiles"]:' \
+    '    if optional(svc):' \
     '        continue' \
     '    port = info["ports"][0] if info["ports"] else 0' \
     '    cname = info["container_name"] or ""' \
@@ -9550,20 +9567,44 @@ try {
   backup)
     # Reuse the application container and its configured database/media storage.
     _backup_command="${2:-full}"
+    [[ "$_backup_command" == "--upload" ]] && _backup_command=full
+    _backup_upload=false
+    for _backup_arg in "${@:2}"; do
+      case "$_backup_arg" in --upload) _backup_upload=true ;; esac
+    done
     case "$_backup_command" in
       full|db|index|media)
-        "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" exec -T backend \
-          python -m config.backups create --scope "$_backup_command"
+        _backup_output=$("$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" exec -T backend \
+          python -m config.backups create --scope "$_backup_command")
+        printf '%s\n' "$_backup_output"
         echo "Backup saved under backend/backup/. Startup seed files were preserved."
+        if [[ "$_backup_upload" == true ]]; then
+          _backup_archive=$(printf '%s\n' "$_backup_output" | tail -n 1)
+          python3 "$ROOT_DIR/backend/config/backups.py" upload "$ROOT_DIR/backend/backup/$(basename "$_backup_archive")" --root "${DEV_SOURCE_DIR:-$ROOT_DIR}" --directory "$ROOT_DIR/backend/backup"
+        fi
+        ;;
+      upload)
+        _backup_args=()
+        [[ -n "${3:-}" ]] && _backup_args+=("$3")
+        python3 "$ROOT_DIR/backend/config/backups.py" upload "${_backup_args[@]}" --root "${DEV_SOURCE_DIR:-$ROOT_DIR}" --directory "$ROOT_DIR/backend/backup"
+        ;;
+      download)
+        python3 "$ROOT_DIR/backend/config/backups.py" download --source "${3:-local}" --root "${DEV_SOURCE_DIR:-$ROOT_DIR}" --directory "$ROOT_DIR/backend/backup"
         ;;
       list)
         "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" exec -T backend /backend/backup/backup.sh list
         ;;
       verify|restore)
+        _backup_path="${3:?Specify the archive path}"
+        if [[ -f "$_backup_path" ]]; then
+          _backup_real=$(realpath "$_backup_path")
+          _backup_mount=$(realpath "$ROOT_DIR/backend/backup")
+          case "$_backup_real" in "$_backup_mount"/*) _backup_path="/backend/backup/${_backup_real#"$_backup_mount"/}" ;; esac
+        fi
         "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" exec -T backend \
-          python -m config.backups "$_backup_command" "${3:?Specify the container archive path}" "${@:4}"
+          python -m config.backups "$_backup_command" "$_backup_path" "${@:4}"
         ;;
-      *) echo 'Usage: ./dev.sh backup [full|db|index|media|list|verify ARCHIVE|restore ARCHIVE]'; exit 1 ;;
+      *) echo 'Usage: ./dev.sh backup [full|db|index|media] [--upload] | upload [ARCHIVE] | download [local|production] | list | verify ARCHIVE | restore ARCHIVE'; exit 1 ;;
     esac
     ;;
 

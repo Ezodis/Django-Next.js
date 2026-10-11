@@ -16,6 +16,11 @@ import tempfile
 from datetime import datetime, timezone
 from urllib.parse import unquote, urlsplit, parse_qs
 import uuid
+from contextlib import contextmanager
+import base64
+import re
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 
 def pg_environment():
@@ -54,6 +59,26 @@ def digest(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
             checksum.update(chunk)
     return checksum.hexdigest()
+
+
+def identity_file():
+    identity = Path(os.getenv('BACKUP_AGE_IDENTITY_FILE') or Path.home() / '.config/project-backups/identity.txt')
+    if not identity.is_file():
+        raise ValueError('Recovery requires the private age identity outside Git')
+    return identity
+
+
+@contextmanager
+def plaintext_archive(path):
+    path = Path(path)
+    if path.name.endswith('.age'):
+        with tempfile.TemporaryDirectory(prefix='backup-decrypt-') as temporary:
+            decrypted = Path(temporary) / 'snapshot.tar.gz'
+            subprocess.run(['age', '-d', '-i', str(identity_file()), '-o', str(decrypted), str(path)],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            yield decrypted
+    else:
+        yield path
 
 
 def safe_name(name):
@@ -206,6 +231,179 @@ def publish(path):
         client.upload_file(str(artifact), bucket, prefix.strip('/') + '/' + artifact.name)
 
 
+class GitHubBackupError(RuntimeError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f'GitHub backup request failed (HTTP {status})')
+
+
+def github_client(root):
+    """Use the current checkout and existing CLI login; never store a token."""
+    result = subprocess.run(['git', '-C', str(root), 'config', '--get', 'remote.origin.url'],
+                            capture_output=True, text=True, check=True)
+    remote = result.stdout.strip().removesuffix('.git')
+    match = re.fullmatch(r'(?:https://github\.com/|git@github\.com:)([\w.-]+/[\w.-]+)', remote)
+    if not match:
+        raise ValueError('Backup upload requires this checkout to have a GitHub origin')
+    repository = match[1]
+    command = shutil.which('gh') or shutil.which('gh.exe')
+    if not command:
+        # The Windows launcher runs Linux containers; reuse its Windows CLI login.
+        powershell = shutil.which('powershell.exe') or '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+        if Path(powershell).is_file():
+            resolved = subprocess.run([powershell, '-NoProfile', '-NonInteractive', '-Command',
+                                      '(Get-Command gh -ErrorAction Stop).Source'], capture_output=True, text=True)
+            if resolved.returncode == 0:
+                command = subprocess.check_output(['wslpath', '-u', resolved.stdout.strip()], text=True).strip()
+    if not command:
+        raise ValueError('Install GitHub CLI and sign in with gh auth login before uploading')
+    login = subprocess.run([command, 'auth', 'token', '--hostname', 'github.com'], capture_output=True, text=True)
+    if login.returncode or not login.stdout.strip():
+        raise ValueError('Sign in to GitHub CLI before uploading a backup')
+    token = login.stdout.strip()
+
+    def api(endpoint, data=None, method=None):
+        request = Request(f'https://api.github.com/repos/{repository}/{endpoint}',
+                          data=json.dumps(data).encode() if data is not None else None,
+                          method=method, headers={'Authorization': 'Bearer ' + token,
+                          'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+        try:
+            with urlopen(request, timeout=60) as response:
+                return json.load(response)
+        except HTTPError as error:
+            raise GitHubBackupError(error.code) from None
+    return repository, api
+
+
+def backup_tree(api):
+    try:
+        head = api('git/ref/heads/production-backups')['object']['sha']
+    except GitHubBackupError as error:
+        if error.status == 404:
+            return None, None, []
+        raise
+    tree = api('git/commits/' + head)['tree']['sha']
+    listing = api('git/trees/' + tree + '?recursive=1')
+    if listing.get('truncated'):
+        raise ValueError('Backup tree is too large; use independent object storage')
+    return head, tree, listing['tree']
+
+
+def github_upload(path, root, api=None, recipient=None):
+    """Publish encrypted local data without switching branches or changing files."""
+    path, root = Path(path).resolve(), Path(root).resolve()
+    if not path.name.startswith('snapshot_') or not path.name.endswith(('.tar.gz', '.tar.gz.age')):
+        raise ValueError('Choose a portable snapshot created by the backup command')
+    manifest = verify(path)
+    try:
+        from .project_config import environment_values
+    except ImportError:
+        from project_config import environment_values
+    values = environment_values(root)
+    expected = values.get('PROJECT_HOST') or root.name.lower()
+    if not manifest.get('project') or manifest['project'] != expected:
+        raise ValueError('Local snapshot belongs to another project or has no project identity')
+    repository, api = github_client(root) if api is None else ('test/repository', api)
+    if not path.name.endswith('.age'):
+        recipient = recipient or values.get('BACKUP_AGE_RECIPIENT') or api('actions/variables/BACKUP_AGE_RECIPIENT')['value']
+        encrypted = path.with_name(path.name + '.age')
+        with tempfile.TemporaryDirectory(prefix='.backup-upload-', dir=path.parent) as temporary:
+            staged = Path(temporary) / encrypted.name
+            subprocess.run(['age', '-r', recipient, '-o', str(staged), str(path)],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            os.replace(staged, encrypted)
+        path = encrypted
+    if path.stat().st_size >= 90 * 1024**2:
+        raise ValueError('GitHub snapshot exceeds 90 MiB; use independent object storage')
+    with path.open('rb') as stream:
+        encrypted_header = stream.read(22)
+    if not encrypted_header.startswith(b'age-encryption.org/v1\n'):
+        raise ValueError('GitHub uploads require a valid age-encrypted snapshot')
+    checksum = path.with_name(path.name + '.sha256')
+    checksum.write_text(digest(path) + '  ' + path.name + '\n', encoding='ascii')
+    updates = []
+    for artifact in (path, checksum):
+        content = artifact.read_bytes()
+        blob = api('git/blobs', {'content': base64.b64encode(content).decode('ascii'), 'encoding': 'base64'})['sha']
+        expected_blob = hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+        if blob != expected_blob:
+            raise RuntimeError('GitHub upload failed integrity verification')
+        updates.append({'path': 'snapshots/local/' + artifact.name, 'mode': '100644', 'type': 'blob', 'sha': blob})
+    for attempt in range(3):
+        head, tree, existing = backup_tree(api)
+        names = {entry['path'] for entry in existing if entry['path'].startswith('snapshots/local/snapshot_')
+                 and entry['path'].endswith('.tar.gz.age')}
+        names.add(updates[0]['path'])
+        deletions = [{'path': name + suffix, 'mode': '100644', 'type': 'blob', 'sha': None}
+                     for name in sorted(names, reverse=True)[7:] for suffix in ('', '.sha256')
+                     if any(entry['path'] == name + suffix for entry in existing)]
+        payload = {'tree': updates + deletions}
+        if tree:
+            payload['base_tree'] = tree
+        new_tree = api('git/trees', payload)['sha']
+        commit = api('git/commits', {'message': 'Store encrypted local snapshot', 'tree': new_tree,
+                                   'parents': [head] if head else []})['sha']
+        try:
+            if head:
+                api('git/refs/heads/production-backups', {'sha': commit, 'force': False}, method='PATCH')
+            else:
+                api('git/refs', {'ref': 'refs/heads/production-backups', 'sha': commit})
+            return f'https://github.com/{repository}/tree/production-backups/snapshots/local'
+        except GitHubBackupError as error:
+            if error.status not in (409, 422) or attempt == 2:
+                raise
+    raise RuntimeError('Concurrent backup uploads prevented publication; local snapshot was preserved')
+
+
+def github_download(destination, root, source='local', api=None):
+    """Download a chosen backup source; verification and restore remain explicit."""
+    if source not in ('local', 'production'):
+        raise ValueError('Choose local or production backups')
+    _, api = github_client(root) if api is None else ('test/repository', api)
+    _, _, tree = backup_tree(api)
+    prefix = 'snapshots/local/' if source == 'local' else 'snapshots/'
+    candidates = [entry for entry in tree if entry['type'] == 'blob' and entry['path'].startswith(prefix)
+                  and '/' not in entry['path'][len(prefix):] and entry['path'][len(prefix):].startswith('snapshot_')
+                  and entry['path'].endswith('.tar.gz.age')]
+    if not candidates:
+        raise ValueError('No snapshot available for the selected source')
+    entry = max(candidates, key=lambda item: item['path'])
+    safe_name(entry['path'])
+    if entry.get('size', 0) >= 90 * 1024**2:
+        raise ValueError('Remote snapshot exceeds the GitHub backup size limit')
+    checksum_entry = next((item for item in tree if item['path'] == entry['path'] + '.sha256'), None)
+    if not checksum_entry:
+        raise ValueError('Remote snapshot has no integrity checksum')
+    checksum = base64.b64decode(api('git/blobs/' + checksum_entry['sha'])['content'])
+    content = base64.b64decode(api('git/blobs/' + entry['sha'])['content'])
+    parts = checksum.decode('ascii').split()
+    if len(content) >= 90 * 1024**2 or not parts or not re.fullmatch(r'[0-9a-f]{64}', parts[0]):
+        raise ValueError('Remote snapshot has an invalid size or checksum')
+    if not content.startswith(b'age-encryption.org/v1\n') or hashlib.sha256(content).hexdigest() != parts[0]:
+        raise ValueError('Remote snapshot checksum mismatch')
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    final = destination / Path(entry['path']).name
+    with tempfile.TemporaryDirectory(prefix='.backup-download-', dir=destination) as temporary:
+        staged = Path(temporary) / final.name
+        staged.write_bytes(content)
+        os.replace(staged, final)
+    final.with_name(final.name + '.sha256').write_bytes(checksum)
+    with plaintext_archive(final) as decrypted:
+        manifest = verify(decrypted)
+        try:
+            from .project_config import environment_values
+        except ImportError:
+            from project_config import environment_values
+        if manifest.get('project') != (environment_values(root).get('PROJECT_HOST') or Path(root).name.lower()):
+            raise ValueError('Downloaded snapshot belongs to another project')
+        plain = final.with_suffix('')
+        staged = plain.with_name('.backup-' + plain.name + '.partial')
+        shutil.copyfile(decrypted, staged)
+        os.replace(staged, plain)
+    return plain
+
+
 def extract(archive_path, target):
     """Validate every member before writing; reject links, devices and duplicates."""
     with tarfile.open(archive_path, 'r:gz') as archive:
@@ -252,8 +450,8 @@ def verify_root(root, allow_legacy=False):
 
 
 def verify(path):
-    with tempfile.TemporaryDirectory(prefix='backup-verify-') as temporary:
-        return verify_root(extract(path, Path(temporary)))
+    with plaintext_archive(path) as plaintext, tempfile.TemporaryDirectory(prefix='backup-verify-') as temporary:
+        return verify_root(extract(plaintext, Path(temporary)))
 
 
 def database_initialized():
@@ -281,7 +479,7 @@ def restore(path, allow_legacy=False):
         target = Path(temporary)
         if path.name.endswith('.age'):
             decrypted = target / 'decrypted.tar.gz'
-            subprocess.run(['age', '-d', '-i', os.environ['BACKUP_AGE_IDENTITY_FILE'],
+            subprocess.run(['age', '-d', '-i', str(identity_file()),
                             '-o', str(decrypted), str(path)], check=True, stderr=subprocess.PIPE)
             path = decrypted
         extracted = target / 'contents'
@@ -337,14 +535,27 @@ def restore(path, allow_legacy=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['create', 'verify', 'restore', 'auto-restore'])
+    parser.add_argument('command', choices=['create', 'verify', 'restore', 'auto-restore', 'upload', 'download'])
     parser.add_argument('path', nargs='?')
     parser.add_argument('--scope', choices=['full', 'db', 'index', 'media'], default='full')
     parser.add_argument('--allow-legacy', action='store_true')
     parser.add_argument('--project-tables', action='store_true')
+    parser.add_argument('--root', default=str(Path(__file__).resolve().parents[2]))
+    parser.add_argument('--directory')
+    parser.add_argument('--source', choices=['local', 'production'], default='local')
     args = parser.parse_args()
-    backup_dir = Path(os.getenv('BACKUP_DIR', '/backend/backup'))
-    if args.command == 'create':
+    backup_dir = Path(args.directory or os.getenv('BACKUP_DIR', '/backend/backup'))
+    if args.command == 'upload':
+        candidates = [p for p in backup_dir.glob('snapshot_*') if p.name.endswith(('.tar.gz', '.tar.gz.age'))]
+        archive = Path(args.path) if args.path else max(candidates, key=lambda p: (p.name.removesuffix('.age'), p.name), default=None)
+        if archive is None:
+            raise ValueError('Create a local snapshot before uploading')
+        print(github_upload(archive, args.root))
+    elif args.command == 'download':
+        archive = github_download(backup_dir, args.root, args.source)
+        print('Downloaded and verified: ' + str(archive))
+        print('Restore this archive explicitly into an empty database/media destination.')
+    elif args.command == 'create':
         print(create(args.path or backup_dir, args.scope,
                      tables=project_tables() if args.project_tables else None))
     elif args.command == 'verify':
