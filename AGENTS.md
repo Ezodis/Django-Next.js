@@ -114,7 +114,9 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - Example recovery: `age -d -i <identity-file> -o snapshot.tar.gz <archive.age>`,
   `python -m config.backups verify snapshot.tar.gz`, then
   `python -m config.backups restore snapshot.tar.gz` in the target backend and run
-  project migrations. Never point a recovery drill at the live production database.
+  project migrations. Use PostgreSQL 18 or newer for the current GitHub exports;
+  custom exporters require compatible client/server versions. Never point a
+  recovery drill at the live production database.
 - PostgreSQL exports are transactionally consistent; database and object storage
   do not share a transaction. Pause uploads/deletes for an exact recovery boundary.
   Redis queues/caches and external integrations are not included in these exports.
