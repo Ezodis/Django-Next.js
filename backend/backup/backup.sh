@@ -19,6 +19,7 @@ case "${1:-}" in
     if [[ $# -eq 1 ]]; then
       python -m config.backups auto-restore
     else
+      [[ -n "$2" ]] || { echo 'Specify a trusted snapshot archive to restore.'; exit 1; }
       python -m config.backups restore "$2" "${@:3}"
     fi ;;
   auto-restore)

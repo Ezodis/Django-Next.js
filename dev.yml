@@ -19,6 +19,7 @@ networks:
 services:
 
   backend:
+    image: ${COMPOSE_PROJECT_NAME}_backend:latest
     build:
       context: .
       dockerfile: backend/config/Dockerfile.development
@@ -321,73 +322,29 @@ services:
     environment:
       - APP_NAME=${APP_NAME:-app}
 
-# Backup Section ------------------
-  backup-snapshot:
+# Backup tools reuse the project's backend image and storage configuration.
+  backup-snapshot: &backup-runtime
     profiles: ["backup"]
-    image: postgres:17
+    image: ${COMPOSE_PROJECT_NAME}_backend:latest
+    env_file:
+      - .env
     environment:
-      DB_HOST: "${DB_HOST:-db}"
-      DB_PORT: "${DB_PORT:-5432}"
-      DB_NAME: "${DB_NAME:-postgres}"
-      DB_USER: "${DB_USER:-postgres}"
-      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
-      DJANGO_DEBUG: "true"
-      FULL_BACKUP: "${FULL_BACKUP:-false}"
+      DB_HOST: db
+      DB_PORT: "5432"
+      FULL_BACKUP: "true"
     volumes:
       - ./backend:/backend
-    working_dir: /backend/backup
+    working_dir: /backend
     depends_on:
       db:
         condition: service_healthy
-    command: >
-      sh -c "
-        echo '📦 Installing required packages...' &&
-        apt-get update -qq &&
-        apt-get install -y -qq postgresql-client gzip tar cpio > /dev/null 2>&1 &&
-        echo '✅ Packages installed' &&
-        FULL_BACKUP=true /backend/backup/backup.sh snapshot
-      "
+    entrypoint: ["bash", "/backend/backup/backup.sh"]
+    command: ["snapshot"]
 
   backup-restore:
-    profiles: ["backup"]
-    image: postgres:17
-    environment:
-      DB_HOST: "${DB_HOST:-db}"
-      DB_PORT: "${DB_PORT:-5432}"
-      DB_NAME: "${DB_NAME:-postgres}"
-      DB_USER: "${DB_USER:-postgres}"
-      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
-      RESTORE_ARCHIVE: "${RESTORE_ARCHIVE:-}"
-      DJANGO_DEBUG: "true"
-    volumes:
-      - ./backend:/backend
-    working_dir: /backend/backup
-    depends_on:
-      db:
-        condition: service_healthy
-    entrypoint: >
-      sh -c '
-        if [ -z "$${RESTORE_ARCHIVE}" ]; then
-          echo "❌ Error: Backup archive path required";
-          echo "Usage: RESTORE_ARCHIVE=/backend/backup/snapshots/<file.tar.gz> podman-compose -f dev.yml --profile backup run --rm backup-restore";
-          echo "";
-          echo "Available backups:";
-          /backend/backup/backup.sh list;
-          exit 1;
-        fi &&
-        echo "📦 Installing required packages..." &&
-        apt-get update -qq &&
-        apt-get install -y -qq postgresql-client gzip tar cpio > /dev/null 2>&1 &&
-        echo "✅ Packages installed" &&
-        /backend/backup/backup.sh restore
-      '
+    <<: *backup-runtime
+    command: ["restore", "${RESTORE_ARCHIVE:-}"]
 
   backup-list:
-    profiles: ["backup"]
-    image: postgres:17
-    volumes:
-      - ./backend:/backend
-    working_dir: /backend/backup
-    environment:
-      DJANGO_DEBUG: "true"
-    command: /backend/backup/backup.sh list
+    <<: *backup-runtime
+    command: ["list"]

@@ -101,6 +101,8 @@ if [[ "${1:-}" == "_workspace-sync" ]]; then
     --exclude venv/ --exclude __pycache__/ --exclude '*.pyc'
     --exclude .cxx/ --exclude Pods/ --exclude build/ --exclude dist/
     --exclude backend/media/ --exclude backend/config/staticfiles/
+    --exclude 'backend/backup/snapshot_*' --exclude 'backend/backup/backup_*'
+    --exclude 'backend/backup/.backup-*' --exclude 'backend/backup/*.log'
     --exclude /.env --exclude /.dev-sync.lock --exclude /.dev-sync.pid)
   # Bulk sync runs separately so native apps and assets cannot delay web edits.
   (
@@ -116,6 +118,8 @@ if [[ "${1:-}" == "_workspace-sync" ]]; then
   while true; do
     for part in frontend/web backend; do
       rsync -a --delete "${excludes[@]}" --exclude media/ --exclude config/staticfiles/ \
+        --exclude 'backup/snapshot_*' --exclude 'backup/backup_*' \
+        --exclude 'backup/.backup-*' --exclude 'backup/*.log' \
         "$SOURCE_DIR/$part/" "$WORKSPACE_DIR/$part/" || echo "Sync failed for $part; retrying." >&2
     done
     sleep 1
