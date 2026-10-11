@@ -5,6 +5,7 @@ Run: python config/project_config.py <project-root> <option>
 """
 import ast
 import argparse
+from contextlib import contextmanager, nullcontext
 import fnmatch
 import json
 import os
@@ -521,6 +522,51 @@ def run_sync(root, arguments):
     root = Path(root).resolve()
     repo = configured_repo(root)
     clone = local_template(root, repo, args.dir)
+    destination = clone if args.direction == 'push' else root
+    if destination is None:
+        raise ValueError('Template checkout not found; clone it beside this project or use sync push --dir')
+    with nullcontext() if args.dry_run else sync_checkout_lock(destination):
+        return apply_sync(root, args, clone, repo)
+
+
+@contextmanager
+def sync_checkout_lock(root):
+    """Serialize template sync writers without blocking unrelated app edits."""
+    git_path = subprocess.check_output(['git', '-C', str(root), 'rev-parse', '--git-path',
+                                        'template-sync.lock'], text=True).strip()
+    path = Path(git_path)
+    if not path.is_absolute():
+        path = root / path
+    with path.open('a+b') as lock:
+        lock.write(b'0') if path.stat().st_size == 0 else None
+        lock.flush()
+        lock.seek(0)
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise ValueError(f'Another template sync is updating {root}; retry after it finishes.') from exc
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            if os.name == 'nt':
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def same_shared_content(left, right):
+    """Git checkouts can use CRLF locally and LF in Actions or the template."""
+    return left == right or (left is not None and right is not None
+                            and left.replace(b'\r\n', b'\n') == right.replace(b'\r\n', b'\n'))
+
+
+def apply_sync(root, args, clone, repo):
     protected = sync_paths(root)
     if args.direction == 'push':
         if clone is None:
@@ -548,18 +594,20 @@ def run_sync(root, arguments):
             paths, read, label = remote_template(repo)
     print(f'Sync {args.direction}: {label} -> {destination}')
     actions = []
+    snapshots = {}
     for path in sorted(paths):
         if not is_shared(path, protected):
             continue
         target = destination / path
         content = read(path)
         previous = target.read_bytes() if target.is_file() else None
+        snapshots[path] = previous
         if path.startswith('backend/requirements/') and path.endswith('.txt'):
             # On push, only the source core transfers; the template's extras stay local.
             content = merge_requirements(content, previous)
         if path == 'frontend/web/package.json':
             content = merge_web_package(content, previous)
-        if content != previous:
+        if not same_shared_content(content, previous):
             actions.append((path, content))
             print(f'  {"update" if previous is not None else "add"}: {path}')
     retired = set(RETIRED_SHARED_PATHS)
@@ -576,8 +624,10 @@ def run_sync(root, arguments):
             # A customized legacy ML Dockerfile must be relocated before removal.
             if path.endswith('Dockerfile.ml-service') and not (destination / 'backend/ml_service/Dockerfile').is_file():
                 actions.append(('backend/ml_service/Dockerfile', (destination / path).read_bytes()))
+                snapshots['backend/ml_service/Dockerfile'] = None
                 print('  move: backend/config/Dockerfile.ml-service -> backend/ml_service/Dockerfile')
             actions.append((path, None))
+            snapshots[path] = (destination / path).read_bytes()
             print(f'  remove retired: {path}')
     if not actions:
         print('Shared architecture is already up to date.')
@@ -585,9 +635,25 @@ def run_sync(root, arguments):
     if args.dry_run:
         print(f'Dry run: {len(actions)} changes; no files written.')
         return 0
+    # App work never blocks shared updates. Shared work must be published back
+    # to the template first so syncing cannot silently erase concurrent edits.
+    changed = subprocess.check_output(['git', '-C', str(destination), 'diff', 'HEAD',
+                                      '--name-only'], text=True).splitlines()
+    changed += subprocess.check_output(['git', '-C', str(destination), 'ls-files',
+                                       '--others', '--exclude-standard'], text=True).splitlines()
+    conflicts = sorted(set(changed) & {path for path, _ in actions})
+    if conflicts:
+        raise ValueError('Shared files have unpublished local edits: ' + ', '.join(conflicts)
+                         + '. Commit/review these edits and sync push before pulling; no files were changed.')
     if not args.yes and input(f'Apply {len(actions)} shared changes? [y/N] ').strip().lower() not in {'y', 'yes'}:
         print('No changes applied.')
         return 0
+    for path, _ in actions:
+        previous = snapshots[path]
+        target = destination / path
+        current = target.read_bytes() if target.is_file() else None
+        if current != previous:
+            raise ValueError(f'{path} changed during sync review; retry. No files were changed.')
     for path, content in actions:
         target = (destination / path).resolve()
         if not target.is_relative_to(destination):

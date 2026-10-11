@@ -5,6 +5,7 @@ import os
 import json
 import plistlib
 import unittest
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -377,6 +378,47 @@ class AdminLoginURLTestCase(TestCase):
 
 
 class TemplateSyncTests(SimpleTestCase):
+    def test_line_endings_do_not_create_shared_updates(self):
+        from .project_config import same_shared_content
+        self.assertTrue(same_shared_content(b'first\r\nsecond\r\n', b'first\nsecond\n'))
+        self.assertFalse(same_shared_content(b'old\n', b'new\n'))
+        self.assertFalse(same_shared_content(None, b''))
+
+    def test_checkout_lock_prevents_parallel_sync_and_releases(self):
+        from .project_config import sync_checkout_lock
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            with sync_checkout_lock(root):
+                with self.assertRaisesRegex(ValueError, 'Another template sync'):
+                    with sync_checkout_lock(root):
+                        pass
+            with sync_checkout_lock(root):
+                pass
+
+    def test_sync_preserves_app_work_and_rejects_conflicting_shared_edits(self):
+        from .project_config import run_sync
+        with TemporaryDirectory() as temporary:
+            template, project = (Path(temporary) / name for name in ('template', 'project'))
+            for root in (template, project):
+                root.mkdir()
+                (root / 'backend').mkdir()
+                (root / 'backend/project.py').write_text("SYNC_TEMPLATE_REPO = 'owner/template'\n")
+                (root / 'dev.sh').write_text('original\n')
+                (root / 'application.txt').write_text('app original\n')
+                for command in (['init', '-q'], ['add', '.'],
+                                ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'initial']):
+                    subprocess.run(['git', '-C', str(root), *command], check=True)
+            (template / 'dev.sh').write_text('upstream\n')
+            (project / 'application.txt').write_text('work in progress\n')
+            run_sync(project, ['--dir', str(template), '--yes'])
+            self.assertEqual((project / 'application.txt').read_text(), 'work in progress\n')
+            self.assertEqual((project / 'dev.sh').read_text(), 'upstream\n')
+            (project / 'dev.sh').write_text('concurrent shared work\n')
+            with self.assertRaisesRegex(ValueError, 'unpublished local edits'):
+                run_sync(project, ['--dir', str(template), '--yes'])
+            self.assertEqual((project / 'dev.sh').read_text(), 'concurrent shared work\n')
+
     def test_web_sync_preserves_project_dependencies_scripts_and_identity(self):
         from .project_config import merge_web_package
         template = {'dependencies': {'next': '16.4.0', 'react': '19.3.0'},

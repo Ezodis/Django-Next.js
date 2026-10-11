@@ -115,9 +115,15 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - Dependabot checks npm, Python, container images and Actions weekly. Major
   upgrades are separate pull requests. Prefer the latest compatible patched
   versions and supported runtimes; do not override peer dependency conflicts.
-- `.github/workflows/template-sync.yml` opens a weekly project pull request from
+- `.github/workflows/template-sync.yml` checks after default-branch pushes and
+  hourly for shared updates, opening a project pull request from
   the configured `SYNC_TEMPLATE_REPO`. This activates after these files are
   committed and pushed to each repository's default branch.
+- Local sync ignores LF/CRLF-only differences and locks each destination checkout
+  during writes. Application edits do not block shared sync; conflicting unpublished
+  shared edits do. Commit and review those changes, then offer them to the template
+  with `sync push` before pulling. Never force-push the default branch to bypass a
+  concurrent remote update; fetch and integrate it while preserving local work.
 - Configure `TEMPLATE_SYNC_SSH_KEY` as a unique write-enabled deploy key for
   each receiving repository, with its private key stored only in that repository's
   Actions secret. The key publishes template branches, including shared workflows;
