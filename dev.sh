@@ -4447,6 +4447,8 @@ _draw_status_live() {
     _display_label="${_width_svc#mobile-}"
     [[ ${#_display_label} -gt $_lw ]] && _lw=${#_display_label}
   done < <(_parse_compose_services)
+  # Reserve four columns for backend child branches while keeping stats aligned.
+  _lw=$((_lw + 4))
 
   # Other compose projects (all except current)
   local _other_projects=()
@@ -4567,6 +4569,23 @@ _draw_status_live() {
       while read -r _core_svc _core_port _core_override; do
         [[ -n "$_core_svc" ]] && _core_labels+="${_core_svc}|"
       done < <(_parse_compose_services "$_root/dev.yml")
+      # Container creation order varies. Display core services consistently,
+      # then backend extensions, then mobile/watch apps, independent of startup.
+      _project_rows=$(printf '%s' "$_project_rows" | awk -F'|' -v core="$_core_labels" '
+        NF >= 2 {
+          rank = 100
+          if ($1 ~ /^mobile-/) rank = 200
+          else if (index(core, "|" $1 "|")) {
+            rank = 40
+            if ($1 == "db") rank = 10
+            else if ($1 == "redis") rank = 20
+            else if ($1 == "frontend") rank = 30
+            else if ($1 == "backend") rank = 90
+          }
+          print rank "|" $0
+        }' | LC_ALL=C sort -t'|' -k1,1n -k2,2 | cut -d'|' -f2-)
+      local _has_backend=false
+      case "$_seen" in *"|backend|"*) _has_backend=true ;; esac
       : > "$_core_rows"; : > "$_project_service_rows"; : > "$_mobile_rows"
       while IFS='|' read -r _label _cn; do
         [[ -n "$_cn" ]] || continue
@@ -4582,7 +4601,10 @@ _draw_status_live() {
         else
           case "$_core_labels" in
             *"|${_label}|"*) ;;
-            *) _destination="$_project_service_rows"; _row_group="project" ;;
+            *)
+              _destination="$_project_service_rows"; _row_group="project"
+              if $_has_backend; then _row_indent="  ├─"; fi
+              ;;
           esac
         fi
         printf '%s|%s\n' "$_label" "$_cn" >> "$_rows_file"
@@ -4608,8 +4630,12 @@ _draw_status_live() {
       printf '  \033[1;34m%s%s\033[34m %s\033[0m\033[37m%s\033[0m\n\n' "$_header_color" "$_header_icon" "$_display" "$_project_links"
       cat "$_core_rows"
       if [[ -s "$_project_service_rows" ]]; then
-        echo ""
-        cat "$_project_service_rows"
+        if $_has_backend; then
+          sed '$s/├─/└─/' "$_project_service_rows"
+        else
+          echo ""
+          cat "$_project_service_rows"
+        fi
       fi
       if [[ -s "$_mobile_rows" ]]; then
         echo ""
@@ -4726,6 +4752,8 @@ _draw_status_live_row() {
     esac
   fi
   [[ ${#lbl} -gt $lw ]] && lw=${#lbl}
+  # The branch prefix replaces label padding, rather than shifting the stats.
+  if [[ -n "${_row_indent:-}" ]]; then lw=$((lw - ${#_row_indent})); fi
   local port_col=""
   [[ -n "$port" && "$port" != "0" ]] && port_col=":${port}"
   # Build optional link badges (appended after stats)
