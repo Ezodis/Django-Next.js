@@ -83,6 +83,28 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   it was actually synchronized or published. Report any remaining propagation
   or runtime verification work.
 
+## Interface translation
+
+- The template's `frontend/web/localization/` compiler and root provider cover
+  authored JSX text and native accessibility/placeholder labels on all web routes.
+  Preserve these generic files and the `/ui-localization` endpoint during sync.
+- Keep `frontend/web/messages/automatic-source.json` project-owned. Never copy
+  interface catalogs, manual language preferences or source phrases between apps.
+- Keep existing manual selectors and reviewed dictionaries. Pass their selected
+  language and reviewed messages to `AutomaticTranslationProvider`; projects
+  without a selector follow device language automatically.
+- Public data-driven labels render through `AutoText`. Declare public JSON UI
+  registries in the project's `package.json` `localization.catalogs`; new registry
+  entries are then discovered automatically. Keep brands in `localization.preserve`.
+- Preserve names, passwords, addresses, documents, messages and editable content.
+  Do not register private data as a translation source or send it to providers.
+  Use `translate="no"` or `data-no-translate` for original-content containers.
+- Canvas/imperative text, SEO metadata and dynamic backend prose require explicit
+  application localization; do not claim that the JSX compiler covers them.
+- Run `node --test localization/tests.cjs` and project translation tests from
+  `frontend/web` after changing this layer. Verify production builds because the
+  shared webpack loader participates in both server and client compilation.
+
 ## Dependency maintenance
 
 - The template owns core backend requirements and the frontend framework/tool

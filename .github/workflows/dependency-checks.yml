@@ -28,6 +28,7 @@ jobs:
       - run: npm ci --no-fund
       - run: npm run lint
       - run: npm run test --if-present
+      - run: node --test localization/tests.cjs
       - run: npm run typecheck
       - run: npm run build
   backend:

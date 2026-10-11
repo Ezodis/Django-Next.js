@@ -88,6 +88,7 @@ SHARED_PATHS = (
     'backend/requirements/deployment.txt',
     'frontend/web/Dockerfile', 'frontend/web/.dockerignore',
     'frontend/web/next.config.shared.ts',
+    'frontend/web/localization/*', 'frontend/web/app/ui-localization/route.ts',
     'frontend/web/package.json', 'frontend/web/eslint.config.mjs',
     '.github/dependabot.yml', '.github/workflows/dependency-checks.yml',
     '.github/workflows/template-sync.yml', '.github/workflows/dependency-automerge.yml',

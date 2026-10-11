@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
+import {AutomaticTranslationProvider} from '../localization/client';
 
 export const metadata: Metadata = {
   title: process.env.NEXT_PUBLIC_APP_NAME ?? "App",
@@ -22,7 +23,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <head />
-      <body className="antialiased">{children}</body>
+      <body className="antialiased"><AutomaticTranslationProvider>{children}</AutomaticTranslationProvider></body>
     </html>
   );
 }
