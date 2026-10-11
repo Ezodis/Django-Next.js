@@ -56,7 +56,9 @@ jobs:
                              check=True, stdout=subprocess.DEVNULL)
               try:
                   for attempt in range(60):
-                      ready = subprocess.run(['docker', 'exec', container, 'pg_isready', '-U', 'postgres'],
+                      # The init-only server exposes a Unix socket before the final
+                      # server starts. TCP readiness avoids restoring during shutdown.
+                      ready = subprocess.run(['docker', 'exec', container, 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres'],
                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                       if ready.returncode == 0:
                           break

@@ -673,6 +673,16 @@ sync_workspace() {
 sync_workspace
 # Normalize before starting the persistent Windows-owned WSL worker.
 sed -i 's/\r//' "`$WORKSPACE_DIR/dev.sh"
+# A detached worker has already loaded its old script. Replace it when rsync
+# installs a new inode, so new exclusions protect runtime data immediately.
+WORKER_PID="`$(cat "`$WORKSPACE_DIR/.dev-sync.pid" 2>/dev/null || true)"
+if [[ "`$WORKER_PID" =~ ^[0-9]+`$ ]] && [[ "`$(ps -p "`$WORKER_PID" -o args=)" == *"_workspace-sync"*"`$WORKSPACE_DIR"* ]] && [[ ! "`$WORKSPACE_DIR/dev.sh" -ef "/proc/`$WORKER_PID/fd/255" ]]; then
+  kill -TERM "`$WORKER_PID" 2>/dev/null || true
+  for attempt in {1..30}; do
+    kill -0 "`$WORKER_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+fi
 # Stop the old launcher-bound worker when upgrading to the detached worker.
 if [[ -f "`$SYNC_PID_FILE" ]]; then
   OLD_PID="`$(cat "`$SYNC_PID_FILE" 2>/dev/null)"

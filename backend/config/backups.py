@@ -44,9 +44,9 @@ def pg_environment():
     return env
 
 
-def run_pg(args, output=None):
+def run_pg(args, output=None, environment=None):
     # Never put credentials in argv or surface SQL/data in exception messages.
-    result = subprocess.run(args, env=pg_environment(), stdout=output or subprocess.PIPE,
+    result = subprocess.run(args, env=environment or pg_environment(), stdout=output or subprocess.PIPE,
                             stderr=subprocess.PIPE)
     if result.returncode:
         raise RuntimeError(f'{args[0]} failed (exit {result.returncode}); archive/restore was not completed')
@@ -533,9 +533,122 @@ def restore(path, allow_legacy=False):
         return manifest
 
 
+def database_counts(sql, environment):
+    """Compare restored COPY inventories without exposing any row contents."""
+    expected, table = {}, None
+    identifier = r'(?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*)'
+    with Path(sql).open('rb') as stream:
+        for line in stream:
+            if table is not None:
+                if line.rstrip(b'\r\n') == b'\\.':
+                    table = None
+                else:
+                    expected[table] += 1
+            elif line.startswith(b'COPY '):
+                match = re.fullmatch(r'COPY (' + identifier + r'\.' + identifier + r') \(.*\) FROM stdin;\s*', line.decode())
+                if not match:
+                    raise ValueError('Unsupported SQL COPY inventory')
+                table = match[1]
+                expected[table] = 0
+    if table is not None:
+        raise ValueError('Incomplete SQL COPY inventory')
+    if not expected:
+        return {}
+    query = ' UNION ALL '.join("SELECT '" + name.replace("'", "''") + "', count(*) FROM " + name for name in expected)
+    result = run_pg(['psql', '-X', '-At', '-F', '|', '-v', 'ON_ERROR_STOP=1', '-c', query], environment=environment)
+    actual = {name: int(count) for name, count in (line.rsplit('|', 1) for line in result.decode().splitlines())}
+    if actual != expected:
+        raise ValueError('Restored row counts do not match the snapshot')
+    return actual
+
+
+def replace_local(path, destination):
+    """Stage and validate a local refresh; retain the previous database and media."""
+    settings, storage = settings_and_storage()
+    from django.core.files.storage import FileSystemStorage
+    if not settings.DEBUG or not isinstance(storage, FileSystemStorage):
+        raise ValueError('Local replacement requires development mode and local filesystem media')
+    database = dict(settings.DATABASES['default'])
+    if database['HOST'] not in ('db', 'localhost', '127.0.0.1', '::1'):
+        raise ValueError('Local replacement cannot target a remote database')
+    manifest = verify(path)
+    if manifest['scope'] != 'full' or manifest.get('project') != os.getenv('PROJECT_HOST'):
+        raise ValueError('Local refresh requires a full snapshot belonging to this project')
+    environment = os.environ.copy()
+    environment.pop('DATABASE_URL', None)
+    environment.update(PGHOST=database['HOST'], PGPORT=str(database['PORT'] or 5432),
+                       PGUSER=database['USER'], PGPASSWORD=database['PASSWORD'], PGDATABASE=database['NAME'])
+    maintenance = {**environment, 'PGDATABASE': 'template1'}
+    token = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S') + '_' + uuid.uuid4().hex[:6]
+    staged_name = database['NAME'][:25] + '_restore_' + token
+    retained_name = database['NAME'][:25] + '_saved_' + token
+    quote = lambda name: '"' + name.replace('"', '""') + '"'
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    media_root = Path(storage.location).resolve()
+    retained_media = destination / ('.backup-media-saved-' + token)
+    # Refuse mount-point swaps rather than deleting or partially replacing uploads.
+    if os.path.ismount(media_root):
+        raise ValueError('Local media is a mount point; use an empty recovery destination instead')
+    if os.stat(destination).st_dev != os.stat(media_root.parent).st_dev:
+        raise ValueError('Local media and recovery storage require the same filesystem for an atomic swap')
+    journal = destination / ('.backup-local-' + token + '.json')
+    recovery = {'project': manifest['project'], 'snapshot': Path(path).name, 'database': database['NAME'],
+                'staged_database': staged_name, 'retained_database': retained_name,
+                'retained_media': str(retained_media), 'status': 'staging'}
+    journal.write_text(json.dumps(recovery, indent=2), encoding='utf-8')
+    with plaintext_archive(path) as plaintext, tempfile.TemporaryDirectory(prefix='.backup-refresh-', dir=destination) as temporary:
+        root = extract(plaintext, Path(temporary))
+        verify_root(root)
+        sql = root / 'database.sql'
+        run_pg(['psql', '-X', '-v', 'ON_ERROR_STOP=1', '-c', 'CREATE DATABASE ' + quote(staged_name) + ' TEMPLATE template0'], environment=maintenance)
+        staged_environment = {**environment, 'PGDATABASE': staged_name}
+        run_pg(['psql', '-X', '--single-transaction', '-v', 'ON_ERROR_STOP=1', '-f', str(sql)], environment=staged_environment)
+        counts = database_counts(sql, staged_environment)
+        from django.db import connections
+        from django.core.management import call_command
+        connection = connections['default']
+        connection.close()
+        connection.settings_dict['NAME'] = staged_name
+        try:
+            call_command('migrate', interactive=False, verbosity=0)
+            connection.check_constraints()
+        finally:
+            connection.close()
+            connection.settings_dict['NAME'] = database['NAME']
+        # Expire only this local app's Django cache/session namespace. Leave
+        # unrelated Redis keys and queued jobs intact, and never touch remote Redis.
+        from django.core.cache import cache
+        cache_location = settings.CACHES.get('default', {}).get('LOCATION', '')
+        if isinstance(cache_location, str) and urlsplit(cache_location).hostname in ('redis', 'localhost', '127.0.0.1', '::1'):
+            if getattr(cache, 'key_prefix', '') and hasattr(cache, 'delete_pattern'):
+                cache.delete_pattern('*')
+        # Application services are paused by dev.sh before this command runs.
+        had_media = media_root.exists()
+        if had_media:
+            os.replace(media_root, retained_media)
+        try:
+            os.replace(root / 'media', media_root)
+            literal = database['NAME'].replace("'", "''")
+            run_pg(['psql', '-X', '-v', 'ON_ERROR_STOP=1', '-c',
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='" + literal + "' AND pid <> pg_backend_pid()"], environment=maintenance)
+            run_pg(['psql', '-X', '--single-transaction', '-v', 'ON_ERROR_STOP=1', '-c',
+                    'ALTER DATABASE ' + quote(database['NAME']) + ' RENAME TO ' + quote(retained_name) + '; ' +
+                    'ALTER DATABASE ' + quote(staged_name) + ' RENAME TO ' + quote(database['NAME'])], environment=maintenance)
+        except Exception:
+            if media_root.exists():
+                os.replace(media_root, root / 'media')
+            if had_media:
+                os.replace(retained_media, media_root)
+            raise
+    recovery.update(status='complete', tables=len(counts), rows=sum(counts.values()))
+    journal.write_text(json.dumps(recovery, indent=2), encoding='utf-8')
+    return recovery
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['create', 'verify', 'restore', 'auto-restore', 'upload', 'download'])
+    parser.add_argument('command', choices=['create', 'verify', 'restore', 'auto-restore', 'upload', 'download', 'replace-local'])
     parser.add_argument('path', nargs='?')
     parser.add_argument('--scope', choices=['full', 'db', 'index', 'media'], default='full')
     parser.add_argument('--allow-legacy', action='store_true')
@@ -543,6 +656,7 @@ def main():
     parser.add_argument('--root', default=str(Path(__file__).resolve().parents[2]))
     parser.add_argument('--directory')
     parser.add_argument('--source', choices=['local', 'production'], default='local')
+    parser.add_argument('--path-only', action='store_true')
     args = parser.parse_args()
     backup_dir = Path(args.directory or os.getenv('BACKUP_DIR', '/backend/backup'))
     if args.command == 'upload':
@@ -553,8 +667,13 @@ def main():
         print(github_upload(archive, args.root))
     elif args.command == 'download':
         archive = github_download(backup_dir, args.root, args.source)
-        print('Downloaded and verified: ' + str(archive))
-        print('Restore this archive explicitly into an empty database/media destination.')
+        if args.path_only:
+            print(archive)
+        else:
+            print('Downloaded and verified: ' + str(archive))
+            print('Restore this archive explicitly into an empty database/media destination.')
+    elif args.command == 'replace-local':
+        print(json.dumps(replace_local(args.path, backup_dir), indent=2))
     elif args.command == 'create':
         print(create(args.path or backup_dir, args.scope,
                      tables=project_tables() if args.project_tables else None))

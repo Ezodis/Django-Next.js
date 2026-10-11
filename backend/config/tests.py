@@ -15,6 +15,55 @@ from .project_config import exposure_check_command, is_shared, mobile_apps, sync
 
 
 class PortableBackupTests(SimpleTestCase):
+    def test_local_refresh_refuses_production_before_any_database_operation(self):
+        from types import SimpleNamespace
+        from django.core.files.storage import FileSystemStorage
+        from .backups import replace_local
+        with TemporaryDirectory() as directory, patch('config.backups.run_pg') as pg:
+            with patch('config.backups.settings_and_storage', return_value=(SimpleNamespace(DEBUG=False), FileSystemStorage(location=directory))):
+                with self.assertRaisesRegex(ValueError, 'development mode'):
+                    replace_local('snapshot.tar.gz', directory)
+            pg.assert_not_called()
+
+    def test_row_inventory_is_verified_without_sending_private_values_in_queries(self):
+        from .backups import database_counts
+        with TemporaryDirectory() as directory:
+            sql = Path(directory) / 'database.sql'
+            sql.write_text('COPY public.items (name) FROM stdin;\nPrivate Person\nAnother Person\n\\.\n')
+            with patch('config.backups.run_pg', return_value=b'public.items|2\n') as pg:
+                self.assertEqual(database_counts(sql, {}), {'public.items': 2})
+                self.assertNotIn('Private Person', str(pg.call_args))
+            with patch('config.backups.run_pg', return_value=b'public.items|1\n'):
+                with self.assertRaisesRegex(ValueError, 'row counts'):
+                    database_counts(sql, {})
+
+    def test_failed_staging_preserves_the_current_database_and_media(self):
+        from types import SimpleNamespace
+        from django.core.files.storage import FileSystemStorage
+        from .backups import create, replace_local
+        with TemporaryDirectory() as directory, patch.dict(os.environ, {'BACKUP_AGE_RECIPIENT': '', 'PROJECT_HOST': 'project'}):
+            root = Path(directory)
+            media = root / 'media'
+            media.mkdir()
+            (media / 'private.txt').write_bytes(b'preserve this')
+            storage = FileSystemStorage(location=media)
+            def dump(command, output=None, **kwargs):
+                output.write(b'-- SQL snapshot\n')
+            with patch('config.backups.run_pg', side_effect=dump):
+                archive = create(root / 'backup', 'full', storage=storage)
+            settings = SimpleNamespace(DEBUG=True, DATABASES={'default': {'HOST': 'db', 'PORT': '5432', 'NAME': 'live', 'USER': 'user', 'PASSWORD': ''}})
+            def stage(command, **kwargs):
+                if '-f' in command:
+                    raise RuntimeError('Simulated restore failure')
+                self.assertNotIn('ALTER DATABASE', str(command))
+                return b''
+            with patch('config.backups.settings_and_storage', return_value=(settings, storage)), patch('config.backups.run_pg', side_effect=stage):
+                with self.assertRaisesRegex(RuntimeError, 'restore failure'):
+                    replace_local(archive, root / 'backup')
+            self.assertEqual((media / 'private.txt').read_bytes(), b'preserve this')
+            self.assertEqual(settings.DATABASES['default']['NAME'], 'live')
+            self.assertTrue(archive.exists())
+
     def test_local_upload_encrypts_and_retries_without_replacing_production_tree(self):
         import base64
         import hashlib

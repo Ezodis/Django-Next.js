@@ -102,6 +102,12 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   recovery copy using the private identity outside Git. Downloaded local archives
   remain ignored. Download/upload never replaces startup seeds or live data;
   restore explicitly into empty destinations using `dev.sh backup restore`.
+- `dev.sh backup restore [production|local]` explicitly refreshes development:
+  pause this project's application services, preserve a local snapshot, restore
+  into a fresh database, compare COPY row counts, apply migrations, then swap
+  database names transactionally and retain previous media in backup storage.
+  Retain the previous database and recovery journal; never drop it automatically.
+  This operation refuses production mode, remote databases and cloud media.
 - Profile-gated tools are not always-running monitor services, including tools
   that inherit profiles through Compose YAML anchors.
 - Restore only trusted archives into empty database/media destinations. Preserve

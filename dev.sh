@@ -58,8 +58,9 @@
 # ║    ./dev.sh backup --upload      Create + encrypt + upload local snapshot    ║
 # ║    ./dev.sh backup upload        Upload the latest existing local snapshot   ║
 # ║    ./dev.sh backup download [local|production]   Fetch a recovery snapshot   ║
+# ║    ./dev.sh backup restore production    Refresh local; retain old data      ║
 # ║      Saved to backend/backup/; startup seed is never replaced        ║
-# ║      Commit that file → production auto-restores on next deploy             ║
+# ║      Restore explicitly; existing production data is preserved             ║
 # ║    ./dev.sh backup list          List all backups (start/ and local)        ║
 # ║                                                                             ║
 # ║  TEMPLATE SYNC                                                              ║
@@ -9596,6 +9597,28 @@ try {
         ;;
       verify|restore)
         _backup_path="${3:?Specify the archive path}"
+        if [[ "$_backup_command" == restore && ( "$_backup_path" == production || "$_backup_path" == local ) ]]; then
+          _backup_path=$(python3 "$ROOT_DIR/backend/config/backups.py" download --source "$_backup_path" --path-only --root "${DEV_SOURCE_DIR:-$ROOT_DIR}" --directory "$ROOT_DIR/backend/backup")
+          _backup_services=()
+          while read -r _backup_service _backup_port _backup_container; do
+            case "$_backup_service" in db|redis|frontend|mobile-*) ;; *) _backup_services+=("$_backup_service") ;; esac
+          done < <(_parse_compose_services)
+          # Always resume this project's application services, including on failure.
+          if (
+            trap '"$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" start "${_backup_services[@]}"' EXIT
+            trap 'exit 130' INT TERM
+            "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" stop "${_backup_services[@]}" || exit $?
+            "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" run --rm --no-deps --entrypoint python backend \
+              -m config.backups create /backend/backup --scope full || exit $?
+            "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" run --rm --no-deps --entrypoint python backend \
+              -m config.backups replace-local "/backend/backup/$(basename "$_backup_path")" --directory /backend/backup || exit $?
+          ); then
+            echo 'Local refresh complete. Previous database, media, and local snapshot were retained.'
+          else
+            echo 'Local refresh failed; application services were resumed and recovery copies were retained.' >&2
+            exit 1
+          fi
+        else
         if [[ -f "$_backup_path" ]]; then
           _backup_real=$(realpath "$_backup_path")
           _backup_mount=$(realpath "$ROOT_DIR/backend/backup")
@@ -9603,6 +9626,7 @@ try {
         fi
         "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" exec -T backend \
           python -m config.backups "$_backup_command" "$_backup_path" "${@:4}"
+        fi
         ;;
       *) echo 'Usage: ./dev.sh backup [full|db|index|media] [--upload] | upload [ARCHIVE] | download [local|production] | list | verify ARCHIVE | restore ARCHIVE'; exit 1 ;;
     esac
