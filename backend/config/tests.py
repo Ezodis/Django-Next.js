@@ -14,6 +14,88 @@ from . import watchos
 from .project_config import exposure_check_command, is_shared, mobile_apps, sync_paths
 
 
+class PortableBackupTests(SimpleTestCase):
+    def test_media_archive_restores_exact_bytes_and_preserves_existing_uploads(self):
+        from django.core.files.storage import FileSystemStorage
+        from .backups import create, restore
+        with TemporaryDirectory() as directory, patch.dict(os.environ, {'BACKUP_AGE_RECIPIENT': ''}):
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'photo.bin').write_bytes(b'uploaded bytes')
+            archive = create(root / 'archives', 'media', storage=FileSystemStorage(location=source))
+            destination = FileSystemStorage(location=root / 'destination')
+            with patch('config.backups.settings_and_storage', return_value=(None, destination)):
+                restore(archive)
+                self.assertEqual((root / 'destination/photo.bin').read_bytes(), b'uploaded bytes')
+                with self.assertRaisesRegex(ValueError, 'empty media'):
+                    restore(archive)
+
+    def test_url_credentials_are_decoded_without_argv_exposure(self):
+        from .backups import pg_environment
+        with patch.dict(os.environ, {'DATABASE_URL': 'postgresql://user:p%40ss@[::1]:5433/db%20name?sslmode=require'}):
+            env = pg_environment()
+        self.assertEqual(env['PGPASSWORD'], 'p@ss')
+        self.assertEqual(env['PGHOST'], '::1')
+        self.assertEqual(env['PGDATABASE'], 'db name')
+        self.assertEqual(env['PGSSLMODE'], 'require')
+
+    def test_storage_failure_does_not_publish_partial_snapshot(self):
+        from .backups import create
+        storage = unittest.mock.Mock()
+        storage.listdir.side_effect = OSError('unavailable')
+        with TemporaryDirectory() as directory:
+            with self.assertRaises(OSError):
+                create(directory, 'media', storage=storage)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_manifest_detects_modified_media(self):
+        from .backups import verify_root, digest
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'media').mkdir()
+            media = root / 'media' / 'photo.jpg'
+            media.write_bytes(b'original')
+            (root / 'manifest.json').write_text(json.dumps({'format': 1, 'scope': 'media',
+                'files': {'media/photo.jpg': {'bytes': 8, 'sha256': digest(media)}}}))
+            verify_root(root)
+            media.write_bytes(b'modified')
+            with self.assertRaisesRegex(ValueError, 'checksum'):
+                verify_root(root)
+
+    def test_archive_rejects_traversal_links_and_duplicate_names_before_extracting(self):
+        import io
+        import tarfile
+        from .backups import extract
+        for names in [('root/../../escape',), ('root/link',), ('root/file', 'root/file')]:
+            with self.subTest(names=names), TemporaryDirectory() as directory:
+                archive = Path(directory) / 'test.tar.gz'
+                target = Path(directory) / 'target'
+                target.mkdir()
+                with tarfile.open(archive, 'w:gz') as stream:
+                    for name in names:
+                        member = tarfile.TarInfo(name)
+                        if name.endswith('link'):
+                            member.type = tarfile.SYMTYPE
+                            member.linkname = '/etc/passwd'
+                        else:
+                            member.size = 1
+                        stream.addfile(member, io.BytesIO(b'x'))
+                with self.assertRaises(ValueError):
+                    extract(archive, target)
+                self.assertEqual(list(target.iterdir()), [])
+
+    def test_database_restore_preserves_nonempty_target(self):
+        from .backups import restore
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'seed.sql'
+            path.write_text('DROP TABLE important;')
+            with patch('config.backups.database_initialized', return_value=True), patch('config.backups.run_pg') as pg:
+                with self.assertRaisesRegex(ValueError, 'empty database'):
+                    restore(path, allow_legacy=True)
+                pg.assert_not_called()
+
+
 class RestoredSequenceTestCase(TestCase):
     def test_restored_ids_are_repaired_without_rewinding_ahead_sequences(self):
         from django.contrib.auth import get_user_model

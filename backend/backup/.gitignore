@@ -1,10 +1,8 @@
-# Ignore intermediate backup rotation files in this directory
-# (these are created during backup runs and deleted after moving to start/)
-backup_*.sql.gz
-snapshot_*.tar.gz
-*.log
-.db_restored
-
-# Allow the start/ directory and its contents (seed backups committed to git)
-!start/
-!start/**
+# Runtime archives are private. Publication uses the encrypted backup branch.
+/snapshot_*
+/backup_*
+/.backup-*
+/*.log
+/.db_restored
+/restore_temp_*
+# Existing project-owned startup seeds remain supported and are not synced.

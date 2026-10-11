@@ -86,6 +86,40 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   it was actually synchronized or published. Report any remaining propagation
   or runtime verification work.
 
+## Backup and recovery
+
+- Shared portable exports live in `backend/config/backups.py`. Use the project's
+  configured Django storage rather than assuming uploaded files are on disk.
+- `dev.sh backup [full|db|index|media]` creates verified archives in
+  `backend/backup/`; it must never delete or automatically replace startup seeds.
+  `index` means the complete database, including metadata; it excludes media.
+- Restore only trusted archives into empty database/media destinations. Preserve
+  legacy SQL/tar startup seeds, but fail on SQL errors rather than accepting a
+  partial restore. Existing user tables prevent automatic startup replay.
+- Production backups are encrypted with `age` before leaving the recovery host.
+  Keep private identities outside Git and deployment variables; only configure
+  the public recipient on exporters. Keep a second independent identity copy.
+- The optional daily `production-backup.yml` workflow writes to the separate
+  `production-backups` branch. Enable with `PRODUCTION_BACKUP_ENABLED`, the public
+  `BACKUP_AGE_RECIPIENT` variable, and `PRODUCTION_BACKUP_ENV` Actions secret
+  containing `DATABASE_URL`, project identity and `BACKUP_SOURCE_STORAGE` JSON.
+  Treat its database/storage credentials as secrets with minimum permissions.
+  Seven archives remain visible; Git history retains older encrypted copies and
+  grows. The workflow refuses archives over 90 MiB; use object storage for growth.
+- `BACKUP_DESTINATION_STORAGE` accepts a Django storage backend/options JSON
+  (S3, GCS or another installed adapter); `BACKUP_DESTINATION_PREFIX` isolates each
+  project. `BACKUP_COPY_DIRECTORY` adds a verified copy to a mounted personal or
+  external drive. S3-only exporters may alternatively use `BACKUP_S3_*` options.
+  Backup destination credentials are separate from production media credentials.
+- Example recovery: `age -d -i <identity-file> -o snapshot.tar.gz <archive.age>`,
+  `python -m config.backups verify snapshot.tar.gz`, then
+  `python -m config.backups restore snapshot.tar.gz` in the target backend and run
+  project migrations. Never point a recovery drill at the live production database.
+- PostgreSQL exports are transactionally consistent; database and object storage
+  do not share a transaction. Pause uploads/deletes for an exact recovery boundary.
+  Redis queues/caches and external integrations are not included in these exports.
+  Drill restores periodically; a successfully uploaded file alone is insufficient.
+
 ## Interface translation
 
 - The template's `frontend/web/localization/` compiler and root provider cover

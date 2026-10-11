@@ -68,6 +68,7 @@ RUN apt-get update \
     netcat-openbsd \
     cron \
     gzip \
+    age \
     cpio \
     wget \
     gnupg ca-certificates \

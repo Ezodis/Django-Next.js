@@ -53,9 +53,9 @@
 # ║    ./dev.sh disk                 Show disk usage breakdown                  ║
 # ║                                                                             ║
 # ║  BACKUP / RESTORE                                                           ║
-# ║    ./dev.sh backup               Full snapshot (DB + media) → start/        ║
-# ║    ./dev.sh backup db            DB-only backup (.sql.gz) → start/          ║
-# ║      Saved to backend/backup/start/ (one file max — oldest removed)        ║
+# ║    ./dev.sh backup               Full snapshot (DB + media) → backup/        ║
+# ║    ./dev.sh backup db            DB-only portable archive → backup/          ║
+# ║      Saved to backend/backup/; startup seed is never replaced        ║
 # ║      Commit that file → production auto-restores on next deploy             ║
 # ║    ./dev.sh backup list          List all backups (start/ and local)        ║
 # ║                                                                             ║
@@ -9544,162 +9544,23 @@ try {
 
 
   backup)
-    # ── ./dev.sh backup [db] ─────────────────────────────────────────────────
-    # backup      → full snapshot (DB + media) saved as .tar.gz in backend/backup/start/
-    # backup db   → DB-only backup (.sql.gz) saved in backend/backup/start/
-    #
-    # Only ONE file is kept in start/ at a time — the new file replaces any
-    # existing one.  Commit the file to git and production will auto-restore on
-    # next deploy (backup.sh checks start/ on container startup).
-    _BACKUP_SUBCOMMAND="${2:-full}"
-    _BACKUP_START_DIR="$ROOT_DIR/backend/backup/start"
-    _BACKUP_DIR="$ROOT_DIR/backend/backup"
-
-    if [[ "$_BACKUP_SUBCOMMAND" == "list" ]]; then
-      # ── List all backups ───────────────────────────────────────────────────
-      echo ""
-      echo "📦 Backups in backend/backup/start/  (committed to git → auto-restore on deploy)"
-      echo "──────────────────────────────────────────────────────────────────"
-      _found_start=false
-      for f in "$_BACKUP_START_DIR"/backup_*.sql.gz "$_BACKUP_START_DIR"/snapshot_*.tar.gz; do
-        [[ -f "$f" ]] || continue
-        _found_start=true
-        _fname=$(basename "$f")
-        _size=$(du -sh "$f" 2>/dev/null | cut -f1)
-        # Mark if it's the active seed (only file in start/)
-        printf "  %-45s  %s\n" "$_fname" "$_size"
-      done
-      $_found_start || echo "  (none)"
-
-      echo ""
-      echo "🗄  Backups in backend/backup/  (local rotation, not committed)"
-      echo "──────────────────────────────────────────────────────────────────"
-      _found_local=false
-      for f in "$_BACKUP_DIR"/backup_*.sql.gz "$_BACKUP_DIR"/snapshot_*.tar.gz; do
-        [[ -f "$f" ]] || continue
-        _found_local=true
-        _fname=$(basename "$f")
-        _size=$(du -sh "$f" 2>/dev/null | cut -f1)
-        printf "  %-45s  %s\n" "$_fname" "$_size"
-      done
-      $_found_local || echo "  (none)"
-
-      echo ""
-      exit 0
-    fi
-
-    # Ensure db is running
-    echo "🔍 Checking database is running..."
-    if ! "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" ps db 2>/dev/null | grep -q "running\|Up\|healthy"; then
-      echo "⚠️  Database is not running. Starting core services first..."
-      dc_up_ordered
-      echo "⏳ Waiting for database to be healthy..."
-      sleep 5
-    fi
-
-    if [[ "$_BACKUP_SUBCOMMAND" == "db" ]]; then
-      # ── DB-only backup ────────────────────────────────────────────────────
-      echo ""
-      echo "💾 Creating DB-only backup..."
-      echo "   This runs pg_dump inside a temporary container — no local postgres needed."
-      echo ""
-
-      _BACKUP_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-      _BACKUP_OUTFILE="backup_${_BACKUP_TIMESTAMP}.sql.gz"
-
-      # Use podman run directly — join the compose network so the temp container
-      # can reach the db service by hostname.
-      _DB_NETWORK="${PROJECT_NAME}_default"
-
-      podman run --rm \
-        -e PGPASSWORD="${DB_PASSWORD:-postgres}" \
-        -v "$ROOT_DIR/backend:/backend" \
-        --network "$_DB_NETWORK" \
-        postgres:17 \
-        sh -c "
-          pg_dump \
-            --host='${DB_HOST:-db}' \
-            --port='${DB_PORT:-5432}' \
-            --username='${DB_USER:-postgres}' \
-            --dbname='${DB_NAME:-postgres}' \
-            --clean --if-exists --encoding=UTF8 \
-            | gzip > '/backend/backup/${_BACKUP_OUTFILE}' &&
-          echo '✅ DB backup written: ${_BACKUP_OUTFILE}'
-        "
-
-      _BACKUP_FULL_PATH="$ROOT_DIR/backend/backup/${_BACKUP_OUTFILE}"
-      if [[ ! -f "$_BACKUP_FULL_PATH" ]]; then
-        echo "❌ Backup failed — file not found at: $_BACKUP_FULL_PATH"
-        exit 1
-      fi
-
-      echo "📂 Moving to backend/backup/start/ (clearing any previous seed)..."
-      find "$_BACKUP_START_DIR" -maxdepth 1 -type f ! -name '.gitkeep' -delete
-      mv "$_BACKUP_FULL_PATH" "$_BACKUP_START_DIR/${_BACKUP_OUTFILE}"
-
-      echo ""
-      echo "✅ DB backup saved to: backend/backup/start/${_BACKUP_OUTFILE}"
-      echo ""
-      echo "   Next steps:"
-      echo "     git add backend/backup/start/${_BACKUP_OUTFILE}"
-      echo "     git commit -m 'chore: update seed DB backup'"
-      echo "     git push"
-      echo ""
-      echo "   Production will auto-restore this backup on the next deploy."
-
-    else
-      # ── Full snapshot (DB + media) ────────────────────────────────────────
-      echo ""
-      echo "📦 Creating full snapshot (DB + media)..."
-      echo "   This runs inside a temporary container — no local postgres needed."
-      echo ""
-
-      _BACKUP_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-
-      # Use podman run directly — join the compose network so the temp container
-      # can reach the db service by hostname.
-      # Podman-compose uses underscores: <project>_default
-      _DB_NETWORK="${PROJECT_NAME}_default"
-
-      podman run --rm \
-        -e DB_HOST="${DB_HOST:-db}" \
-        -e DB_PORT="${DB_PORT:-5432}" \
-        -e DB_NAME="${DB_NAME:-postgres}" \
-        -e DB_USER="${DB_USER:-postgres}" \
-        -e DB_PASSWORD="${DB_PASSWORD:-postgres}" \
-        -e DJANGO_DEBUG="true" \
-        -e FULL_BACKUP="true" \
-        -v "$ROOT_DIR/backend:/backend" \
-        --network "$_DB_NETWORK" \
-        postgres:17 \
-        sh -c "
-          apt-get update -qq > /dev/null 2>&1 &&
-          apt-get install -y -qq gzip tar cpio > /dev/null 2>&1 &&
-          /backend/backup/backup.sh snapshot
-        "
-
-      _LATEST_SNAPSHOT=$(ls -1t "$ROOT_DIR/backend/backup"/snapshot_*.tar.gz 2>/dev/null | head -1)
-      if [[ -z "$_LATEST_SNAPSHOT" ]]; then
-        echo "❌ Snapshot failed — no snapshot_*.tar.gz found in backend/backup/"
-        exit 1
-      fi
-
-      _SNAPSHOT_FILENAME=$(basename "$_LATEST_SNAPSHOT")
-
-      echo "📂 Moving to backend/backup/start/ (clearing any previous seed)..."
-      find "$_BACKUP_START_DIR" -maxdepth 1 -type f ! -name '.gitkeep' -delete
-      mv "$_LATEST_SNAPSHOT" "$_BACKUP_START_DIR/${_SNAPSHOT_FILENAME}"
-
-      echo ""
-      echo "✅ Full snapshot saved to: backend/backup/start/${_SNAPSHOT_FILENAME}"
-      echo ""
-      echo "   Next steps:"
-      echo "     git add backend/backup/start/${_SNAPSHOT_FILENAME}"
-      echo "     git commit -m 'chore: update seed snapshot'"
-      echo "     git push"
-      echo ""
-      echo "   Production will auto-restore this snapshot on the next deploy."
-    fi
+    # Reuse the application container and its configured database/media storage.
+    _backup_command="${2:-full}"
+    case "$_backup_command" in
+      full|db|index|media)
+        "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" exec -T backend \
+          python -m config.backups create --scope "$_backup_command"
+        echo "Backup saved under backend/backup/. Startup seed files were preserved."
+        ;;
+      list)
+        "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" exec -T backend /backend/backup/backup.sh list
+        ;;
+      verify|restore)
+        "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" exec -T backend \
+          python -m config.backups "$_backup_command" "${3:?Specify the container archive path}" "${@:4}"
+        ;;
+      *) echo 'Usage: ./dev.sh backup [full|db|index|media|list|verify ARCHIVE|restore ARCHIVE]'; exit 1 ;;
+    esac
     ;;
 
   qr)
