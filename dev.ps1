@@ -110,16 +110,35 @@ function Ensure-WSLPortForwarding {
     # Fix WSL2 port forwarding to localhost - only runs if needed and has admin rights
     if (-not (Test-UbuntuInstalled)) { return }
 
-    try {
-        # Check if localhost:80 is already accessible
+    $testConnection = $true
+    foreach ($webPort in @(80, 443)) {
         $client = New-Object System.Net.Sockets.TcpClient
         try {
-            $connect = $client.ConnectAsync('127.0.0.1', 80)
-            $testConnection = $connect.Wait(1500) -and $client.Connected
+            $connect = $client.ConnectAsync('127.0.0.1', $webPort)
+            if (-not ($connect.Wait(1500) -and $client.Connected)) {
+                $testConnection = $false
+            }
+        } catch {
+            $testConnection = $false
         } finally {
             $client.Dispose()
         }
-    } catch { }
+    }
+
+    # A stale portproxy can accept TCP connections while forwarding them to a
+    # previous WSL address. Check its destination before trusting the listener.
+    $wslIP = ((wsl.exe -d Ubuntu -- hostname -I 2>$null) -split '\s+')[0]
+    if ($wslIP) {
+        $forwarding = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\PortProxy\v4tov4\tcp' -ErrorAction SilentlyContinue
+        foreach ($webPort in @(80, 443)) {
+            foreach ($listenAddress in @('127.0.0.1', '0.0.0.0')) {
+                $rule = if ($forwarding) { $forwarding.PSObject.Properties["$listenAddress/$webPort"] } else { $null }
+                if ($rule -and $rule.Value -ne "$wslIP/$webPort") {
+                    $testConnection = $false
+                }
+            }
+        }
+    }
 
     # Only the repository-derived canonical hostname is registered.
     $projectFolder = (Get-Item $ROOT_DIR).Name
@@ -184,8 +203,7 @@ function Ensure-WSLPortForwarding {
                 if ($wslTest -and -not $testConnection) {
                     # WSL is reachable but localhost isn't - offer to fix
                     Write-Host ""
-                    _warn "localhost:80 is not accessible (WSL2 port forwarding issue)"
-                    _step "You can access via WSL IP:  http://$wslIP/"
+                    _warn "Local HTTP/HTTPS forwarding is missing or points to a previous WSL address"
                     Write-Host ""
                     $response = Read-Host "  Fix port forwarding permanently? (requires admin) [Y/n]"
                     if ($response -ne 'n' -and $response -ne 'N') {
