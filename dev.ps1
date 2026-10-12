@@ -85,8 +85,18 @@ function Ensure-WslSourceAccess {
     }
     if ($script:WindowsSourceBridge) { return }
     $sourcePath = Get-WslPath $ROOT_DIR
-    wsl.exe -d Ubuntu -u root --cd / -- test -r "$sourcePath/dev.sh"
-    if ($LASTEXITCODE -eq 0 -and $env:DEV_WINDOWS_SOURCE_BRIDGE -ne '1') { return }
+    # Reading file contents catches EIO even when mount metadata looks healthy.
+    $probe = "/tmp/devtools-source-probe-$PID.py"
+    $probeWin = "\\wsl.localhost\Ubuntu\tmp\devtools-source-probe-$PID.py"
+    $probeCode = "import sys`nfrom pathlib import Path`ntry:`n    for name in sys.argv[1:]:`n        Path(name).read_bytes()`nexcept OSError:`n    sys.exit(1)`n"
+    [IO.File]::WriteAllText($probeWin, $probeCode, (New-Object Text.UTF8Encoding $false))
+    $probeFiles = @("$sourcePath/dev.sh")
+    if (Test-Path -LiteralPath (Join-Path $ROOT_DIR '.env')) { $probeFiles += "$sourcePath/.env" }
+    try {
+        wsl.exe -d Ubuntu -u root --cd / -- python3 $probe @probeFiles
+        $sourceReadable = $LASTEXITCODE -eq 0
+    } finally { Remove-Item -LiteralPath $probeWin -ErrorAction SilentlyContinue }
+    if ($sourceReadable -and $env:DEV_WINDOWS_SOURCE_BRIDGE -ne '1') { return }
 
     # Windows reads its own checkout and writes through WSL's filesystem share.
     # No Linux Windows-drive mount or drive repair is required for this bridge.
@@ -101,20 +111,68 @@ param([switch]`$Once)
 `$ErrorActionPreference = 'Stop'
 `$source = '$quotedRoot'
 `$target = '$quotedBridge'
+function Read-EnvValues([string]`$content) {
+    `$values = @{}
+    foreach (`$match in [regex]::Matches(`$content, '(?m)^[ \t]*(?:export[ \t]+)?([A-Za-z_]\w*)[ \t]*=(.*)`$')) {
+        `$values[`$match.Groups[1].Value] = `$match.Groups[2].Value.TrimEnd("``r")
+    }
+    return `$values
+}
+function Sync-Environment {
+    `$nativePath = Join-Path `$source '.env'
+    `$stagePath = Join-Path `$target '.env'
+    if (-not (Test-Path -LiteralPath `$nativePath)) { return }
+    `$nativeText = [IO.File]::ReadAllText(`$nativePath)
+    `$native = Read-EnvValues `$nativeText
+    if (`$script:lastEnv -and (Test-Path -LiteralPath `$stagePath)) {
+        `$staged = Read-EnvValues ([IO.File]::ReadAllText(`$stagePath))
+        `$lines = New-Object 'System.Collections.Generic.List[string]'
+        foreach (`$line in (`$nativeText -split "``r?``n")) { `$lines.Add(`$line) }
+        foreach (`$key in `$staged.Keys) {
+            # Runtime updates may change only keys not concurrently edited on Windows.
+            if (`$staged[`$key] -ne `$script:lastEnv[`$key] -and `$native[`$key] -eq `$script:lastEnv[`$key]) {
+                `$replacement = `$key + '=' + `$staged[`$key]
+                `$found = `$false
+                for (`$i=0; `$i -lt `$lines.Count; `$i++) {
+                    if (`$lines[`$i] -match ('^[ \t]*(?:export[ \t]+)?' + [regex]::Escape(`$key) + '[ \t]*=')) {
+                        `$lines[`$i] = `$replacement; `$found = `$true; break
+                    }
+                }
+                if (-not `$found) { `$lines.Add(`$replacement) }
+            }
+        }
+        `$merged = (`$lines -join "``n")
+        if (`$merged -ne `$nativeText) {
+            [IO.File]::WriteAllText(`$nativePath, `$merged, (New-Object Text.UTF8Encoding `$false))
+            `$nativeText = `$merged
+        }
+    }
+    if (-not (Test-Path -LiteralPath `$stagePath) -or [IO.File]::ReadAllText(`$stagePath) -ne `$nativeText) {
+        [IO.File]::WriteAllText(`$stagePath, `$nativeText, (New-Object Text.UTF8Encoding `$false))
+    }
+    `$script:lastEnv = Read-EnvValues `$nativeText
+}
 function Copy-Checkout {
-    & robocopy.exe `$source `$target /MIR /FFT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP /XJ /XD node_modules .next .expo .metro-cache .gradle .cxx Pods build dist .venv venv __pycache__ "`$source\backend\media" "`$source\backend\config\staticfiles" /XF *.pyc snapshot_*.tar* backup_*.sql* backup_*.tar* .backup-* .dev-sync.lock .dev-sync.pid | Out-Null
+    & robocopy.exe `$source `$target /MIR /FFT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP /XJ /XD node_modules .next .expo .metro-cache .gradle .cxx Pods build dist .venv venv __pycache__ "`$source\backend\media" "`$source\backend\config\staticfiles" /XF "`$source\.env" *.pyc snapshot_*.tar* backup_*.sql* backup_*.tar* .backup-* .dev-sync.lock .dev-sync.pid | Out-Null
     if (`$LASTEXITCODE -ge 8) { throw 'Windows could not copy the checkout into WSL.' }
 }
-if (`$Once) { Copy-Checkout; exit 0 }
+if (`$Once) { Copy-Checkout; Sync-Environment; exit 0 }
+`$script:lastEnv = Read-EnvValues ([IO.File]::ReadAllText((Join-Path `$source '.env')))
 `$mutex = New-Object System.Threading.Mutex(`$false, 'Local\DevToolsSourceBridge-$leaf')
 if (-not `$mutex.WaitOne(0)) { exit 0 }
 try {
     while (`$true) {
-        try { Copy-Checkout } catch { Start-Sleep -Seconds 5 }
+        try { Sync-Environment; Copy-Checkout } catch { Start-Sleep -Seconds 5 }
         Start-Sleep -Seconds 3
     }
 } finally { `$mutex.ReleaseMutex(); `$mutex.Dispose() }
 "@
+    # Replace a running worker so it uses the current environment merge logic.
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains($workerWin) -and $_.CommandLine -notmatch '-Once') {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
     [System.IO.File]::WriteAllText($workerWin, $worker, (New-Object System.Text.UTF8Encoding $true))
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $workerWin -Once
     if ($LASTEXITCODE -ne 0) { throw 'Could not refresh the Windows-to-WSL source bridge. Runtime data was preserved.' }
@@ -700,7 +758,8 @@ set -e
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:`$HOME/.local/bin"
 SOURCE_DIR='$wslRoot'
 WORKSPACE_DIR='$wslWorkspace'
-export DEV_SOURCE_DIR='$sourceIdentity'
+export DEV_SOURCE_DIR='$wslRoot'
+export DEV_CHECKOUT_DIR='$sourceIdentity'
 SYNC_PID_FILE="/tmp/devtools-sync-$workspaceLeaf.pid"
 mkdir -p "`$WORKSPACE_DIR"
 

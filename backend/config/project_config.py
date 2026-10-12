@@ -308,7 +308,7 @@ def environment_values(root, include_environment=False):
 
 def project_environment(root):
     """Keep host tooling paths, replacing application inputs with this .env."""
-    keys = environment_keys(root) - {'DEV_SOURCE_DIR'}
+    keys = environment_keys(root) - {'DEV_SOURCE_DIR', 'DEV_CHECKOUT_DIR'}
     values = {key: value for key, value in os.environ.items()
               if key not in keys and not key.startswith(('EXPO_PUBLIC_', 'NEXT_PUBLIC_'))}
     values.update(environment_values(root))
@@ -458,9 +458,10 @@ def check_project_isolation(root, project, hosts):
     # Windows launches run from a native WSL mirror of the same checkout.
     # Containers created before mirroring still carry the source directory.
     checkout_directories = {root}
-    source_directory = os.environ.get('DEV_SOURCE_DIR')
-    if source_directory:
-        checkout_directories.add(Path(source_directory).resolve())
+    for key in ('DEV_SOURCE_DIR', 'DEV_CHECKOUT_DIR'):
+        source_directory = os.environ.get(key)
+        if source_directory:
+            checkout_directories.add(Path(source_directory).resolve())
     for container in containers:
         labels = container.get('Config', {}).get('Labels') or {}
         owner = labels.get('com.docker.compose.project') or labels.get('io.podman.compose.project')

@@ -15,6 +15,20 @@ from .project_config import exposure_check_command, is_shared, mobile_apps, sync
 
 
 class ProjectIsolationTests(SimpleTestCase):
+    def test_checkout_identity_is_separate_from_accessible_source_bridge(self):
+        from .project_config import check_project_isolation
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            container = {'Config': {'Labels': {
+                'com.docker.compose.project': 'project',
+                'com.docker.compose.project.working_dir': str(root / 'original'),
+            }}}
+            with patch.dict(os.environ, {
+                'DEV_SOURCE_DIR': str(root / 'bridge'),
+                'DEV_CHECKOUT_DIR': str(root / 'original'),
+            }), patch('config.project_config.subprocess.check_output', side_effect=['id\n', json.dumps([container])]):
+                check_project_isolation(root / 'runtime', 'project', ['project.localhost'])
+
     def test_retries_inventory_changed_by_concurrent_startup(self):
         from .project_config import check_project_isolation
         missing = subprocess.CalledProcessError(125, ['podman', 'inspect'])
