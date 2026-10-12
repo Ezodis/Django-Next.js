@@ -61,6 +61,9 @@ function Test-UbuntuInstalled {
 
 function Get-WslPath {
     param([string]$WinPath)
+    if ($script:WindowsSourceBridge -and $WinPath.TrimEnd('\') -eq $ROOT_DIR.TrimEnd('\')) {
+        return $script:WindowsSourceBridge
+    }
     # Forward slashes survive native argument passing in Windows PowerShell.
     $WinPath = $WinPath -replace '\\', '/'
     $wslPath = $null
@@ -80,40 +83,47 @@ function Ensure-WslSourceAccess {
     if (-not (Test-Path -LiteralPath (Join-Path $ROOT_DIR 'dev.sh'))) {
         throw 'The selected Windows project folder is unavailable.'
     }
+    if ($script:WindowsSourceBridge) { return }
     $sourcePath = Get-WslPath $ROOT_DIR
-    $repairScript = "/tmp/devtools-source-check-$PID.sh"
-    $repairScriptWin = "\\wsl.localhost\Ubuntu\tmp\devtools-source-check-$PID.sh"
-    $repairContent = @'
-#!/bin/bash
-set -e
-source_dir="$1"
-if test -r "$source_dir/dev.sh" && test -r "$source_dir/dev.ps1"; then exit 0; fi
-# Only repair the Windows drive containing this existing source checkout.
-if [[ "$source_dir" =~ ^/mnt/([a-z])(/|$) ]]; then
-  drive="${BASH_REMATCH[1]}"
-  mount_dir="/mnt/$drive"
-  exec 9>"/tmp/devtools-windows-drive-$drive.lock"
-  flock -x 9
-  if test -r "$source_dir/dev.sh" && test -r "$source_dir/dev.ps1"; then exit 0; fi
-  echo "Repairing unavailable WSL Windows-drive mount: $mount_dir"
-  if mountpoint -q "$mount_dir"; then umount -l "$mount_dir"; fi
-  mkdir -p "$mount_dir"
-  mount -t drvfs "${drive^^}:" "$mount_dir"
-fi
-if ! test -r "$source_dir/dev.sh" || ! test -r "$source_dir/dev.ps1"; then
-  echo 'WSL cannot read the Windows checkout after mount recovery.' >&2
-  exit 1
-fi
-'@
-    [System.IO.File]::WriteAllText($repairScriptWin, ($repairContent -replace "`r", ''), (New-Object System.Text.UTF8Encoding $false))
-    try {
-        wsl.exe -d Ubuntu -u root --cd / -- bash $repairScript $sourcePath
-        if ($LASTEXITCODE -ne 0) {
-            throw 'Could not recover WSL access to the Windows project drive. Runtime data was preserved.'
-        }
-    } finally {
-        wsl.exe -d Ubuntu -u root --cd / -- rm -f $repairScript 2>$null | Out-Null
+    wsl.exe -d Ubuntu -u root --cd / -- test -r "$sourcePath/dev.sh"
+    if ($LASTEXITCODE -eq 0 -and $env:DEV_WINDOWS_SOURCE_BRIDGE -ne '1') { return }
+
+    # Windows reads its own checkout and writes through WSL's filesystem share.
+    # No Linux Windows-drive mount or drive repair is required for this bridge.
+    $leaf = ((Get-Item -LiteralPath $ROOT_DIR).Name -replace '[^a-zA-Z0-9._-]', '-').ToLowerInvariant()
+    $bridge = "/tmp/devtools-windows-source-$leaf"
+    $bridgeWin = "\\wsl.localhost\Ubuntu\tmp\devtools-windows-source-$leaf"
+    $workerWin = Join-Path $env:TEMP "devtools-windows-source-$leaf.ps1"
+    $quotedRoot = $ROOT_DIR.Replace("'", "''")
+    $quotedBridge = $bridgeWin.Replace("'", "''")
+    $worker = @"
+param([switch]`$Once)
+`$ErrorActionPreference = 'Stop'
+`$source = '$quotedRoot'
+`$target = '$quotedBridge'
+function Copy-Checkout {
+    & robocopy.exe `$source `$target /MIR /FFT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP /XJ /XD node_modules .next .expo .metro-cache .gradle .cxx Pods build dist .venv venv __pycache__ "`$source\backend\media" "`$source\backend\config\staticfiles" /XF *.pyc snapshot_*.tar* backup_*.sql* backup_*.tar* .backup-* .dev-sync.lock .dev-sync.pid | Out-Null
+    if (`$LASTEXITCODE -ge 8) { throw 'Windows could not copy the checkout into WSL.' }
+}
+if (`$Once) { Copy-Checkout; exit 0 }
+`$mutex = New-Object System.Threading.Mutex(`$false, 'Local\DevToolsSourceBridge-$leaf')
+if (-not `$mutex.WaitOne(0)) { exit 0 }
+try {
+    while (`$true) {
+        try { Copy-Checkout } catch { Start-Sleep -Seconds 5 }
+        Start-Sleep -Seconds 3
     }
+} finally { `$mutex.ReleaseMutex(); `$mutex.Dispose() }
+"@
+    [System.IO.File]::WriteAllText($workerWin, $worker, (New-Object System.Text.UTF8Encoding $true))
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $workerWin -Once
+    if ($LASTEXITCODE -ne 0) { throw 'Could not refresh the Windows-to-WSL source bridge. Runtime data was preserved.' }
+    Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$workerWin`""
+    ) | Out-Null
+    $script:WindowsOriginalSource = $sourcePath
+    $script:WindowsSourceBridge = $bridge
+    Write-Host 'Using the Windows-to-WSL source bridge; no Windows-drive mount is needed.'
 }
 
 function Build-ArgStr {
@@ -311,6 +321,14 @@ function Install-Scrcpy {
 # no Podman machine startup, just WSL2 → bash dev.sh sync.
 $isProjectCommand = $false
 Ensure-WslSourceAccess
+
+# Template sync must edit the actual Windows Git checkout, never a staging copy.
+if ($script:WindowsSourceBridge -and $DevArgs.Count -gt 0 -and $DevArgs[0] -eq 'sync') {
+    $nativePython = Get-Command python.exe -ErrorAction SilentlyContinue
+    if (-not $nativePython) { throw 'Template sync without a drive mount requires Windows Python 3.' }
+    & $nativePython.Source (Join-Path $ROOT_DIR 'backend/config/project_config.py') $ROOT_DIR @DevArgs
+    exit $LASTEXITCODE
+}
 
 if ($DevArgs.Count -gt 0 -and $DevArgs[0] -ne 'sync' -and (Test-UbuntuInstalled)) {
     $commandRoot = Get-WslPath $ROOT_DIR
@@ -666,6 +684,7 @@ Ensure-WSLPortForwarding
 # frontend and backend dead.  Run containers from a native WSL mirror instead,
 # and keep that mirror refreshed in the background while the launcher runs.
 $wslRoot = Get-WslPath $ROOT_DIR
+$sourceIdentity = if ($script:WindowsOriginalSource) { $script:WindowsOriginalSource } else { $wslRoot }
 $workspaceLeaf = ((Get-Item $ROOT_DIR).Name -replace '[^a-zA-Z0-9._-]', '-').ToLowerInvariant()
 $wslWorkspace = "/root/.codex-workspaces/$workspaceLeaf"
 $argStr = Build-ArgStr $DevArgs
@@ -681,7 +700,7 @@ set -e
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:`$HOME/.local/bin"
 SOURCE_DIR='$wslRoot'
 WORKSPACE_DIR='$wslWorkspace'
-export DEV_SOURCE_DIR="`$SOURCE_DIR"
+export DEV_SOURCE_DIR='$sourceIdentity'
 SYNC_PID_FILE="/tmp/devtools-sync-$workspaceLeaf.pid"
 mkdir -p "`$WORKSPACE_DIR"
 
@@ -733,30 +752,23 @@ sync_workspace() {
     "`$SOURCE_DIR/" "`$WORKSPACE_DIR/"
 }
 
-sync_workspace
-# Normalize before starting the persistent Windows-owned WSL worker.
-sed -i 's/\r//' "`$WORKSPACE_DIR/dev.sh"
-# A detached worker has already loaded its old script. Replace it when rsync
-# installs a new inode, so new exclusions protect runtime data immediately.
-WORKER_PID="`$(cat "`$WORKSPACE_DIR/.dev-sync.pid" 2>/dev/null || true)"
-if [[ "`$WORKER_PID" =~ ^[0-9]+`$ ]] && [[ "`$(ps -p "`$WORKER_PID" -o args=)" == *"_workspace-sync"*"`$WORKSPACE_DIR"* ]] && [[ ! "`$WORKSPACE_DIR/dev.sh" -ef "/proc/`$WORKER_PID/fd/255" ]]; then
-  kill -TERM "`$WORKER_PID" 2>/dev/null || true
-  for attempt in {1..30}; do
-    kill -0 "`$WORKER_PID" 2>/dev/null || break
-    sleep 0.1
-  done
-fi
-# Stop the old launcher-bound worker when upgrading to the detached worker.
-if [[ -f "`$SYNC_PID_FILE" ]]; then
-  OLD_PID="`$(cat "`$SYNC_PID_FILE" 2>/dev/null)"
-  if [[ "`$OLD_PID" =~ ^[0-9]+`$ ]] && [[ "`$(ps -p "`$OLD_PID" -o args=)" == *devtools-run-* ]]; then
-    pkill -TERM -P "`$OLD_PID" 2>/dev/null || true
-    kill "`$OLD_PID" 2>/dev/null || true
+if [[ "`${1:-}" == "_sync-only" ]]; then
+  # Stop the live copier before the initial rsync; concurrent --delete passes
+  # can remove each other's temporary files. Restart it after preparation.
+  WORKER_PID="`$(cat "`$WORKSPACE_DIR/.dev-sync.pid" 2>/dev/null || true)"
+  if [[ "`$WORKER_PID" =~ ^[0-9]+`$ ]] && [[ "`$(ps -p "`$WORKER_PID" -o args=)" == *"_workspace-sync"*"`$WORKSPACE_DIR"* ]]; then
+    kill -TERM "`$WORKER_PID" 2>/dev/null || true
+    for attempt in {1..50}; do
+      kill -0 "`$WORKER_PID" 2>/dev/null || break
+      sleep 0.1
+    done
   fi
+  sync_workspace
+  sed -i 's/\r//' "`$WORKSPACE_DIR/dev.sh"
+  exit 0
 fi
+
 cd "`$WORKSPACE_DIR"
-sed -i 's/\r//' dev.sh
-[[ "`${1:-}" == "_sync-only" ]] && exit 0
 exec bash dev.sh $argStr
 "@
 # Convert CRLF to LF before writing
