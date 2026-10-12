@@ -14,6 +14,37 @@ from . import watchos
 from .project_config import exposure_check_command, is_shared, mobile_apps, sync_paths
 
 
+class ProjectIsolationTests(SimpleTestCase):
+    def test_retries_inventory_changed_by_concurrent_startup(self):
+        from .project_config import check_project_isolation
+        missing = subprocess.CalledProcessError(125, ['podman', 'inspect'])
+        with patch('config.project_config.subprocess.check_output', side_effect=[
+            'old\n', missing, 'new\n', '[]',
+        ]) as command:
+            check_project_isolation(Path.cwd(), 'project', ['project.localhost'])
+        self.assertEqual(command.call_args_list[-1].args[0], ['podman', 'inspect', 'new'])
+
+    def test_unchanged_inventory_inspection_failure_is_not_ignored(self):
+        from .project_config import check_project_isolation
+        missing = subprocess.CalledProcessError(125, ['podman', 'inspect'])
+        with patch('config.project_config.subprocess.check_output', side_effect=['old\n', missing, 'old\n']):
+            with self.assertRaises(subprocess.CalledProcessError):
+                check_project_isolation(Path.cwd(), 'project', ['project.localhost'])
+
+    def test_retried_inventory_still_rejects_hostname_overlap(self):
+        from .project_config import check_project_isolation
+        missing = subprocess.CalledProcessError(125, ['podman', 'inspect'])
+        container = {'Config': {'Labels': {
+            'com.docker.compose.project': 'other',
+            'traefik.http.routers.other.rule': 'Host(`project.localhost`)',
+        }}}
+        with patch('config.project_config.subprocess.check_output', side_effect=[
+            'old\n', missing, 'new\n', json.dumps([container]),
+        ]):
+            with self.assertRaisesRegex(ValueError, 'already routed'):
+                check_project_isolation(Path.cwd(), 'project', ['project.localhost'])
+
+
 class PortableBackupTests(SimpleTestCase):
     def test_local_refresh_refuses_production_before_any_database_operation(self):
         from types import SimpleNamespace

@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Windows entry point for dev.sh.
@@ -65,7 +65,7 @@ function Get-WslPath {
     $WinPath = $WinPath -replace '\\', '/'
     $wslPath = $null
     try {
-        $wslPath = ((wsl.exe -d Ubuntu -- wslpath -a "$WinPath" 2>$null) -join '' -replace "`r", '').Trim()
+        $wslPath = ((wsl.exe -d Ubuntu --cd / -- wslpath -a "$WinPath" 2>$null) -join '' -replace "`r", '').Trim()
     } catch {}
     if (-not $wslPath -or $wslPath -eq '') {
         $drive = $WinPath.Substring(0, 1).ToLower()
@@ -73,6 +73,47 @@ function Get-WslPath {
         $wslPath = "/mnt/$drive$rest"
     }
     return $wslPath
+}
+
+function Ensure-WslSourceAccess {
+    if (-not (Test-UbuntuInstalled)) { return }
+    if (-not (Test-Path -LiteralPath (Join-Path $ROOT_DIR 'dev.sh'))) {
+        throw 'The selected Windows project folder is unavailable.'
+    }
+    $sourcePath = Get-WslPath $ROOT_DIR
+    $repairScript = "/tmp/devtools-source-check-$PID.sh"
+    $repairScriptWin = "\\wsl.localhost\Ubuntu\tmp\devtools-source-check-$PID.sh"
+    $repairContent = @'
+#!/bin/bash
+set -e
+source_dir="$1"
+if test -r "$source_dir/dev.sh" && test -r "$source_dir/dev.ps1"; then exit 0; fi
+# Only repair the Windows drive containing this existing source checkout.
+if [[ "$source_dir" =~ ^/mnt/([a-z])(/|$) ]]; then
+  drive="${BASH_REMATCH[1]}"
+  mount_dir="/mnt/$drive"
+  exec 9>"/tmp/devtools-windows-drive-$drive.lock"
+  flock -x 9
+  if test -r "$source_dir/dev.sh" && test -r "$source_dir/dev.ps1"; then exit 0; fi
+  echo "Repairing unavailable WSL Windows-drive mount: $mount_dir"
+  if mountpoint -q "$mount_dir"; then umount -l "$mount_dir"; fi
+  mkdir -p "$mount_dir"
+  mount -t drvfs "${drive^^}:" "$mount_dir"
+fi
+if ! test -r "$source_dir/dev.sh" || ! test -r "$source_dir/dev.ps1"; then
+  echo 'WSL cannot read the Windows checkout after mount recovery.' >&2
+  exit 1
+fi
+'@
+    [System.IO.File]::WriteAllText($repairScriptWin, ($repairContent -replace "`r", ''), (New-Object System.Text.UTF8Encoding $false))
+    try {
+        wsl.exe -d Ubuntu -u root --cd / -- bash $repairScript $sourcePath
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Could not recover WSL access to the Windows project drive. Runtime data was preserved.'
+        }
+    } finally {
+        wsl.exe -d Ubuntu -u root --cd / -- rm -f $repairScript 2>$null | Out-Null
+    }
 }
 
 function Build-ArgStr {
@@ -127,7 +168,7 @@ function Ensure-WSLPortForwarding {
 
     # A stale portproxy can accept TCP connections while forwarding them to a
     # previous WSL address. Check its destination before trusting the listener.
-    $wslIP = ((wsl.exe -d Ubuntu -- hostname -I 2>$null) -split '\s+')[0]
+    $wslIP = ((wsl.exe -d Ubuntu --cd / -- hostname -I 2>$null) -split '\s+')[0]
     if ($wslIP) {
         $forwarding = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\PortProxy\v4tov4\tcp' -ErrorAction SilentlyContinue
         foreach ($webPort in @(80, 443)) {
@@ -164,7 +205,7 @@ function Ensure-WSLPortForwarding {
         if ($testConnection) { return }
         # We have admin rights - fix port forwarding silently
         try {
-            $wslIP = (wsl.exe -d Ubuntu -- hostname -I 2>$null).Split()[0].Trim()
+            $wslIP = (wsl.exe -d Ubuntu --cd / -- hostname -I 2>$null).Split()[0].Trim()
             if ($wslIP) {
                 # Remove any existing rule first
                 netsh interface portproxy delete v4tov4 listenport=80 listenaddress=0.0.0.0 2>$null | Out-Null
@@ -191,7 +232,7 @@ function Ensure-WSLPortForwarding {
         # Not admin - check if forwarding is needed
         try {
             # Try to connect to WSL IP directly
-            $wslIP = (wsl.exe -d Ubuntu -- hostname -I 2>$null).Split()[0].Trim()
+            $wslIP = (wsl.exe -d Ubuntu --cd / -- hostname -I 2>$null).Split()[0].Trim()
             if ($wslIP) {
                 $client = New-Object System.Net.Sockets.TcpClient
                 try {
@@ -269,9 +310,11 @@ function Install-Scrcpy {
 # This makes `.\dev.ps1 sync` as fast as possible: no package manager installs,
 # no Podman machine startup, just WSL2 → bash dev.sh sync.
 $isProjectCommand = $false
+Ensure-WslSourceAccess
+
 if ($DevArgs.Count -gt 0 -and $DevArgs[0] -ne 'sync' -and (Test-UbuntuInstalled)) {
     $commandRoot = Get-WslPath $ROOT_DIR
-    wsl.exe -d Ubuntu -- python3 "$commandRoot/backend/config/project_config.py" "$commandRoot" has-dev-command $DevArgs[0]
+    wsl.exe -d Ubuntu --cd / -- python3 "$commandRoot/backend/config/project_config.py" "$commandRoot" has-dev-command $DevArgs[0]
     $isProjectCommand = $LASTEXITCODE -eq 0
 }
 if ($DevArgs.Count -gt 0 -and ($DevArgs[0] -eq 'sync' -or $isProjectCommand)) {
@@ -284,7 +327,7 @@ if ($DevArgs.Count -gt 0 -and ($DevArgs[0] -eq 'sync' -or $isProjectCommand)) {
 
     # 2. Quick readiness check
     try {
-        $out = (wsl.exe -d Ubuntu -- bash -c 'echo ready' 2>$null) -join ''
+        $out = (wsl.exe -d Ubuntu --cd / -- bash -c 'echo ready' 2>$null) -join ''
         if ($out -notmatch 'ready') { throw "not ready" }
     } catch {
         _fail "WSL2 Ubuntu is installed but not responding."
@@ -303,10 +346,10 @@ echo "  OK python3 $(python3 --version 2>/dev/null)"
     $tmpPrereqWin = "\\wsl.localhost\Ubuntu\tmp\devtools-prereq-$PID.sh"
     $prereqScriptUnix = $prereqScript -replace "`r`n", "`n" -replace "`r", "`n"
     [System.IO.File]::WriteAllText($tmpPrereqWin, $prereqScriptUnix, (New-Object System.Text.UTF8Encoding $false))
-    wsl.exe -d Ubuntu -- chmod +x $tmpPrereq
-    wsl.exe -d Ubuntu -- bash $tmpPrereq
+    wsl.exe -d Ubuntu --cd / -- chmod +x $tmpPrereq
+    wsl.exe -d Ubuntu --cd / -- bash $tmpPrereq
     $prereqExit = $LASTEXITCODE
-    wsl.exe -d Ubuntu -- rm -f $tmpPrereq 2>$null | Out-Null
+    wsl.exe -d Ubuntu --cd / -- rm -f $tmpPrereq 2>$null | Out-Null
     if ($prereqExit -ne 0) {
         _warn "Prerequisite check had warnings (non-fatal, continuing...)"
     }
@@ -318,10 +361,10 @@ echo "  OK python3 $(python3 --version 2>/dev/null)"
     $tmpScript2Win = "\\wsl.localhost\Ubuntu\tmp\devtools-sync-$PID.sh"
     $syncContent = "#!/bin/bash`nexport PATH=`"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:`$HOME/.local/bin`"`ncd '$wslRoot2'`nsed -i 's/\r//' dev.sh`nexec bash dev.sh $argStr2`n"
     [System.IO.File]::WriteAllText($tmpScript2Win, $syncContent, (New-Object System.Text.UTF8Encoding $false))
-    wsl.exe -d Ubuntu -- chmod +x $tmpScript2
-    wsl.exe -d Ubuntu -- bash $tmpScript2
+    wsl.exe -d Ubuntu --cd / -- chmod +x $tmpScript2
+    wsl.exe -d Ubuntu --cd / -- bash $tmpScript2
     $syncExit = $LASTEXITCODE
-    wsl.exe -d Ubuntu -- rm -f $tmpScript2 2>$null | Out-Null
+    wsl.exe -d Ubuntu --cd / -- rm -f $tmpScript2 2>$null | Out-Null
     exit $syncExit
 }
 
@@ -336,7 +379,7 @@ if (-not $wslOk) {
 } else {
     # Test if Ubuntu responds quickly
     try {
-        $out = (wsl.exe -d Ubuntu -- bash -c 'echo ready' 2>$null) -join ''
+        $out = (wsl.exe -d Ubuntu --cd / -- bash -c 'echo ready' 2>$null) -join ''
         if ($out -notmatch 'ready') { $needsBootstrap = $true }
     } catch {
         $needsBootstrap = $true
@@ -454,7 +497,7 @@ if ($needsBootstrap) {
     $ready = $false; $w = 0
     while ($w -lt 240) {
         try {
-            $out = (wsl.exe -d Ubuntu -- bash -c 'echo ready' 2>$null) -join ''
+            $out = (wsl.exe -d Ubuntu --cd / -- bash -c 'echo ready' 2>$null) -join ''
             if ($out -match 'ready') { $ready = $true; break }
         } catch {}
         Start-Sleep 5; $w += 5
@@ -469,7 +512,7 @@ if ($needsBootstrap) {
         wsl.exe --terminate Ubuntu 2>$null | Out-Null
         Start-Sleep 3
         try {
-            $out = (wsl.exe -d Ubuntu -- bash -c 'echo ready' 2>$null) -join ''
+            $out = (wsl.exe -d Ubuntu --cd / -- bash -c 'echo ready' 2>$null) -join ''
             $ready = $out -match 'ready'
         } catch {}
     }
@@ -583,10 +626,10 @@ echo "  OK All tools ready inside Ubuntu"
     # Convert CRLF to LF before writing
     $bootstrapScriptUnix = $bootstrapScript -replace "`r`n", "`n" -replace "`r", "`n"
     [System.IO.File]::WriteAllText($tmpBootstrapWin, $bootstrapScriptUnix, (New-Object System.Text.UTF8Encoding $false))
-    wsl.exe -d Ubuntu -- chmod +x $tmpBootstrap
-    wsl.exe -d Ubuntu -- bash $tmpBootstrap
+    wsl.exe -d Ubuntu --cd / -- chmod +x $tmpBootstrap
+    wsl.exe -d Ubuntu --cd / -- bash $tmpBootstrap
     $bootstrapExit = $LASTEXITCODE
-    wsl.exe -d Ubuntu -- rm -f $tmpBootstrap 2>$null | Out-Null
+    wsl.exe -d Ubuntu --cd / -- rm -f $tmpBootstrap 2>$null | Out-Null
     if ($bootstrapExit -ne 0) {
         _warn "Tool bootstrap had errors (non-fatal — will retry next run)"
     }
@@ -604,13 +647,15 @@ if ($DevArgs.Count -gt 1 -and $DevArgs[0] -eq 'build' -and $DevArgs -notcontains
     $cloudContent = "#!/bin/bash`nexport PATH=`"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:`$HOME/.local/bin`"`ncd '$cloudRoot'`nsed -i 's/\r//' dev.sh`nexec bash dev.sh $cloudArgs`n"
     [System.IO.File]::WriteAllText($cloudScriptWin, $cloudContent, (New-Object System.Text.UTF8Encoding $false))
     try {
-        wsl.exe -d Ubuntu -- bash $cloudScript
+        wsl.exe -d Ubuntu --cd / -- bash $cloudScript
         $cloudExit = $LASTEXITCODE
     } finally {
-        wsl.exe -d Ubuntu -- rm -f $cloudScript 2>$null | Out-Null
+        wsl.exe -d Ubuntu --cd / -- rm -f $cloudScript 2>$null | Out-Null
     }
     exit $cloudExit
 }
+
+Ensure-WslSourceAccess
 
 # ── Fix WSL2 port forwarding if needed ────────────────────────────────────────
 Ensure-WSLPortForwarding
@@ -717,19 +762,23 @@ exec bash dev.sh $argStr
 # Convert CRLF to LF before writing
 $bashContentUnix = $bashContent -replace "`r`n", "`n" -replace "`r", "`n"
 [System.IO.File]::WriteAllText($tmpScriptWin, $bashContentUnix, (New-Object System.Text.UTF8Encoding $false))
-wsl.exe -d Ubuntu -- chmod +x $tmpScript
+wsl.exe -d Ubuntu --cd / -- chmod +x $tmpScript
 # A Linux-detached worker can outlive its wsl.exe bridge and retain a broken
 # Windows drive mount (EIO). Keep its own Windows WSL invocation alive instead.
 # The worker's flock prevents duplicates when the launcher is run again.
-wsl.exe -d Ubuntu -- bash $tmpScript _sync-only
-if ($LASTEXITCODE -ne 0) { throw 'Could not refresh the WSL development workspace.' }
+wsl.exe -d Ubuntu --cd / -- bash $tmpScript _sync-only
+if ($LASTEXITCODE -ne 0) {
+    Ensure-WslSourceAccess
+    wsl.exe -d Ubuntu --cd / -- bash $tmpScript _sync-only
+    if ($LASTEXITCODE -ne 0) { throw 'Could not refresh the WSL development workspace after source-drive recovery.' }
+}
 Start-Process -FilePath (Get-Command wsl.exe).Source -WindowStyle Hidden -ArgumentList @(
-    '-d', 'Ubuntu', '--', 'bash', "`"$wslWorkspace/dev.sh`"", '_workspace-sync',
+    '-d', 'Ubuntu', '--cd', '/', '--', 'bash', "`"$wslWorkspace/dev.sh`"", '_workspace-sync',
     "`"$wslRoot`"", "`"$wslWorkspace`""
 ) | Out-Null
-wsl.exe -d Ubuntu -- bash $tmpScript
+wsl.exe -d Ubuntu --cd / -- bash $tmpScript
 $devShExitCode = $LASTEXITCODE
-wsl.exe -d Ubuntu -- rm -f $tmpScript 2>$null | Out-Null
+wsl.exe -d Ubuntu --cd / -- rm -f $tmpScript 2>$null | Out-Null
 
 # ── Android: open emulator screen via scrcpy ─────────────────────────────────
 if ($DevArgs.Count -gt 0 -and $DevArgs[0] -eq 'android') {

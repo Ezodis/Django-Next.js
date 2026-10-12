@@ -439,10 +439,21 @@ def merge_requirements(template, project):
 
 def check_project_isolation(root, project, hosts):
     """Reject container namespaces or hostnames already owned by another checkout."""
+    # Other checkouts can recreate containers between listing and inspection.
+    # Retry a changed inventory, but fail closed for genuine inspection errors.
     identifiers = subprocess.check_output(['podman', 'ps', '-aq'], text=True).split()
-    if not identifiers:
-        return
-    containers = json.loads(subprocess.check_output(['podman', 'inspect', *identifiers], text=True))
+    for attempt in range(3):
+        if not identifiers:
+            return
+        try:
+            containers = json.loads(subprocess.check_output(
+                ['podman', 'inspect', *identifiers], text=True, stderr=subprocess.PIPE))
+            break
+        except subprocess.CalledProcessError:
+            current = subprocess.check_output(['podman', 'ps', '-aq'], text=True).split()
+            if set(current) == set(identifiers) or attempt == 2:
+                raise
+            identifiers = current
     root = Path(root).resolve()
     # Windows launches run from a native WSL mirror of the same checkout.
     # Containers created before mirroring still carry the source directory.

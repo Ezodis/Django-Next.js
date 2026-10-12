@@ -1369,6 +1369,8 @@ _start_healthcheck_runner() {
   # Ignore terminal hangups and detach all standard streams. disown alone does
   # not protect a background subshell when its WSL launcher closes.
   nohup bash -c '
+    # Background checks must not retain a Windows mount as their working directory.
+    cd / || exit 1
     PROJECT_NAME="$1"
     _log_file="$2"
     _run_checks() {
