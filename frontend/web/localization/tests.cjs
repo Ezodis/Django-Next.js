@@ -3,6 +3,65 @@ const {compile}=require('./compiler.cjs');
 const {detectLocale,matchLocale,direction,textKey}=require('./core.cjs');
 const {createService}=require('./service.cjs');
 
+test('translator aliases register new copy and reject unsafe dynamic templates',()=>{
+ const result=compile(`const localize=useInterfaceTranslator();const caption=localize('New checkout caption');`,'page.tsx');
+ assert.equal(result.messages[textKey('New checkout caption')],'New checkout caption');
+ assert.throws(()=>compile('const localize=useInterfaceTranslator();localize(`Hello ${person.name}`);','page.tsx'),/static source and separate values/);
+});
+
+test('direct production builds invoke the coverage gate',()=>{
+ const ts=require('typescript'),Module=require('node:module');
+ const file=path.join(__dirname,'../next.config.shared.ts'),compiledModule=new Module(file,module);
+ compiledModule.filename=file;compiledModule.paths=Module._nodeModulePaths(__dirname);
+ const original=compiledModule.require.bind(compiledModule);let called=false;
+ compiledModule.require=id=>id==='./localization/prepare.cjs'?{verify:()=>{called=true;throw Error('Incomplete production dictionary');},prepare:()=>{throw Error('Production must not silently prepare source');}}:original(id);
+ compiledModule._compile(ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,esModuleInterop:true}}).outputText,file);
+ const before=process.env.NODE_ENV;
+ try{process.env.NODE_ENV='production';assert.throws(()=>compiledModule.exports.withSharedDevConfig({}),/Incomplete production dictionary/);assert.equal(called,true);}
+ finally{if(before===undefined)delete process.env.NODE_ENV;else process.env.NODE_ENV=before;}
+});
+
+test('helper option placeholders are discovered without translating input values',()=>{
+ const result=compile(`const field=(options:{placeholder:string},value:string)=><input placeholder={options.placeholder} value={value}/>; const page=field({placeholder:'Your delivery address'},user.address);`,'page.tsx');
+ assert.equal(result.messages[textKey('Your delivery address')],'Your delivery address');
+ assert.match(result.code,/translationCandidates/);assert.match(result.code,/value=\{value\}/);
+ const defaults=compile(`const field=(label='Recipient',options={placeholder:'Additional information'})=><label>{label}<input placeholder={options.placeholder}/></label>;`,'page.tsx');
+ for(const phrase of ['Recipient','Additional information'])assert.equal(defaults.messages[textKey(phrase)],phrase);
+});
+
+test('coverage verification rejects undiscovered UI and incomplete locales without modifying files',()=>{
+ const {prepare,verify}=require('./prepare.cjs');
+ const {locales}=require('./core.cjs');
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'translation-coverage-'));
+ try{
+  fs.mkdirSync(path.join(root,'app'));fs.mkdirSync(path.join(root,'messages'));
+  fs.writeFileSync(path.join(root,'package.json'),'{}');
+  fs.writeFileSync(path.join(root,'app/page.tsx'),'<p>New interface heading</p>');
+  const manifest=path.join(root,'messages/automatic-source.json');fs.writeFileSync(manifest,'{}');
+  assert.throws(()=>verify(root),/1 unregistered phrases/);assert.equal(fs.readFileSync(manifest,'utf8'),'{}');
+  prepare(root);const source=JSON.parse(fs.readFileSync(manifest,'utf8'));
+  fs.mkdirSync(path.join(root,'messages/automatic'));
+  for(const locale of locales)fs.writeFileSync(path.join(root,'messages/automatic',locale+'.json'),JSON.stringify(Object.fromEntries(Object.entries(source).map(([id,text])=>[id,{source:text,translation:'Localized heading'}]))));
+  assert.equal(verify(root),1);
+  fs.writeFileSync(path.join(root,'messages/automatic/es.json'),'{}');
+  const before=fs.readFileSync(manifest,'utf8');assert.throws(()=>verify(root),/es: 1/);assert.equal(fs.readFileSync(manifest,'utf8'),before);
+ }finally{assert.ok(path.resolve(root).startsWith(path.resolve(os.tmpdir())+path.sep));fs.rmSync(root,{recursive:true,force:true});}
+});
+
+test('new helper labels and computed captions are discovered without changing identifiers or private data',()=>{
+ const result=compile(`const field=(label:string,value:string)=><label htmlFor={label}>{label}<input value={value}/></label>; const searchLabel=count?\`Show \${count} books\`:'Search books'; export default()=> <>{field('New delivery label',person.name)}<button>{searchLabel}</button><p>{personName}</p></>; const personName='Private Person';`,'page.tsx');
+ for(const phrase of ['New delivery label','Show {v0} books','Search books'])assert.equal(result.messages[textKey(phrase)],phrase);
+ assert.ok(!Object.values(result.messages).includes('Private Person'));
+ assert.match(result.code,/htmlFor=\{label\}/);assert.match(result.code,/value=\{value\}/);assert.match(result.code,/candidates=/);
+});
+
+test('inferred phrases match only authored patterns and preserve interpolation values',()=>{
+ const {matchAuthoredPhrase}=require('./core.cjs');
+ assert.deepEqual(matchAuthoredPhrase('Show 42 books',['Show {v0} books']),{source:'Show {v0} books',values:['42']});
+ assert.equal(matchAuthoredPhrase('Private Person',['Search books']),undefined);
+ assert.deepEqual(matchAuthoredPhrase('Open [item] 5?',['Open [item] {v0}?']),{source:'Open [item] {v0}?',values:['5']});
+});
+
 test('attribute templates localize their captions without cataloging private values',()=>{
  const result=compile('<button aria-label={`Copies of ${book.title}`} title={`View ${book.title}`}>{book.title}</button>','page.tsx');
  assert.deepEqual(Object.values(result.messages),['Copies of {v0}','View {v0}']);
@@ -143,6 +202,9 @@ test('the first server render includes localized text and interpolation values',
  const phrase='Hello {v0}';
  const html=renderToString(React.createElement(AutomaticTranslationProvider,{initial:{language:'de',catalog:{[textKey(phrase)]:'Hallo {v0}'}}},React.createElement(AutoText,{source:phrase,values:['Private Person']})));
  assert.ok(html.includes('Hallo'));assert.ok(html.includes('Private Person'));assert.ok(!html.includes('Hello'));
+ const helper='Show {v0} books';
+ const inferred=renderToString(React.createElement(AutomaticTranslationProvider,{initial:{language:'de',catalog:{[textKey(helper)]:'{v0} Bücher anzeigen'}}},React.createElement(AutoText,{source:'Show 42 books',candidates:[helper]})));
+ assert.ok(inferred.includes('Bücher anzeigen'));assert.ok(inferred.includes('42'));assert.ok(!inferred.includes('Show'));
 });
 test('legacy manual preferences migrate before paint without reload loops',()=>{
  const ts=require('typescript'),Module=require('node:module'),vm=require('node:vm');

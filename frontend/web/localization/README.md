@@ -17,8 +17,7 @@ Each project owns `messages/automatic-source.json`; template sync never copies
 another application's phrases or preferences. Startup/build prepares this manifest,
 and development compilation updates it for newly added text.
 
-Helper-generated UI labels need `useInterfaceTranslator()` (name the returned
-function `translate`) around their authored phrases. Keep original field IDs,
+Helper-generated UI labels need `useInterfaceTranslator()` around their authored phrases. Keep original field IDs,
 option values and backend data separate from the translated display labels.
 `useInterfaceLanguage()` exposes the currently rendered locale for built-in
 `Intl.DisplayNames`, date or number formatting without translation requests.
@@ -63,3 +62,25 @@ need no live translation provider. Machine wording still needs language review.
 Run `node --test localization/tests.cjs` from `frontend/web`. The shared CI workflow
 runs these tests in every receiving project. Production and development currently
 use `--webpack`, as configured by the template scripts.
+
+## Release safeguards
+
+Common authored UI bindings (labels, captions, headings, placeholders, prompts,
+button/status text) and local helper arguments are discovered automatically in
+JavaScript and TypeScript React sources. Their display text is localized without
+changing the original identifiers or arguments. Private data bindings are not
+catalog sources. Opaque imported data and third-party widgets still need explicit
+localization integration or a declared interface catalog.
+
+Run `node localization/prepare.cjs --check` to audit current source against every
+supported dictionary without changing any files or contacting a provider. CI
+requires this check before the build. A direct production Next build also refuses
+missing, stale or malformed dictionaries. `npm run build` generates missing
+phrases first; commit the resulting project-owned source and locale files.
+
+Regression tests cover indirect helper labels, computed captions, option
+placeholders, private values, source changes and incomplete locale catalogs.
+
+Aliases of `useInterfaceTranslator()` are discovered automatically. Interpolated
+copy must use `AutoText` with a static source and separate values; passing a
+dynamic template directly into the string translator fails compilation.

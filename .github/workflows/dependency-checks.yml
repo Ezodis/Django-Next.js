@@ -29,6 +29,8 @@ jobs:
       - run: npm run lint
       - run: npm run test --if-present
       - run: node --test localization/tests.cjs
+      - name: Verify committed interface dictionaries
+        run: node localization/prepare.cjs --check
       - run: npm run typecheck
       - run: npm run build
   backend:

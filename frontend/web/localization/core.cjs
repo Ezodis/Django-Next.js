@@ -13,4 +13,20 @@ function detectHeaderLocale(value){
 }
 function direction(locale){return ['ar','he','fa','ur'].includes(locale)?'rtl':'ltr';}
 function tokens(text){return (text.match(/\{v\d+\}/g)||[]).sort().join(',');}
-module.exports={locales,textKey,matchLocale,detectLocale,detectHeaderLocale,direction,tokens};
+function matchAuthoredPhrase(value,candidates){
+ if(typeof value!=='string')return undefined;
+ for(const source of candidates??[]){
+  if(value===source)return {source};
+  const indices=[];
+  const pattern=source.split(/(\{v\d+\})/g).map(part=>{
+   const token=/^\{v(\d+)\}$/.exec(part);
+   if(token){indices.push(Number(token[1]));return '(.*?)';}
+   return part.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  }).join('');
+  if(!indices.length)continue;
+  const matched=new RegExp('^'+pattern+'$','s').exec(value);
+  if(matched){const values=[];indices.forEach((index,position)=>values[index]=matched[position+1]);return {source,values};}
+ }
+ return undefined;
+}
+module.exports={matchAuthoredPhrase,locales,textKey,matchLocale,detectLocale,detectHeaderLocale,direction,tokens};

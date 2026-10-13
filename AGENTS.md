@@ -213,3 +213,21 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   for review.
 - Audio/ML dependency restructuring is deferred. Keep its current requirements,
   compatibility constraints and worker layout intact.
+
+## Interface localization
+
+- New web UI must render through the shared localization compiler/provider.
+  Ordinary JSX copy and supported local helper labels are discovered automatically.
+  For custom widgets, imported registries or opaque data-driven UI labels, integrate
+  `AutoText` or `useInterfaceTranslator` explicitly and register authored phrases
+  or declare an interface catalog. Do not leave original-language helper text as
+  an implicit fallback or add DOM mutation/browser-translation workarounds.
+- Keep interpolation values separate from authored messages. Never translate or
+  send user-entered text, personal values, stored content, credentials or private
+  backend data to a translation provider. Preserve technical IDs, option values,
+  routes and existing automatic/manual language preferences.
+- After changing authored UI copy, run `node localization/prepare.cjs --translations`
+  and `node localization/prepare.cjs --check` from `frontend/web`. Commit this
+  project's generated source manifest and locale dictionaries with the feature.
+  Do not copy another project's dictionaries. CI and production builds enforce
+  complete coverage; report generation failures rather than weakening the gate.

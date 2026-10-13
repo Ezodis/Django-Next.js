@@ -1,6 +1,6 @@
 'use client';
 import {Fragment, createContext, createElement, useCallback, useContext, useEffect, useMemo, useState, useSyncExternalStore, type ReactNode} from 'react';
-import {detectLocale, direction, matchLocale, textKey} from './core.cjs';
+import {detectLocale, direction, matchLocale, textKey, matchAuthoredPhrase} from './core.cjs';
 import sources from '../messages/automatic-source.json';
 
 type Catalog = Record<string, string>;
@@ -80,18 +80,25 @@ export function useInterfaceTranslator() {
   const {language, catalog} = useContext(Context);
   return useCallback((source: string) => translatedText(catalog, language, source), [language, catalog]);
 }
-export function AutoText({source, values}: {source: string; values?: ReactNode[]}) {
-  const translated = useAutomaticTranslation(source);
-  if (!values) return translated;
+export function AutoText({source, values, candidates}: {source: string; values?: ReactNode[]; candidates?: string[]}) {
+  const matched = candidates ? matchAuthoredPhrase(source, candidates) : undefined;
+  const translated = useAutomaticTranslation(matched?.source ?? (typeof source === 'string' ? source : ''));
+  if (candidates && !matched) return source ?? '';
+  const interpolations = values ?? matched?.values;
+  if (!interpolations) return translated;
   return translated.split(/(\{v\d+\})/g).map((part, index) => {
     const match = /^\{v(\d+)\}$/.exec(part);
-    return <Fragment key={index}>{match ? values[Number(match[1])] : part}</Fragment>;
+    return <Fragment key={index}>{match ? interpolations[Number(match[1])] : part}</Fragment>;
   });
 }
-export function AutoElement({as, translationAttributes = [], translationTemplates = {}, ...props}: {as: string; translationAttributes?: string[]; translationTemplates?: Record<string, {source: string; values: unknown[]}>; [key: string]: unknown}) {
+export function AutoElement({as, translationAttributes = [], translationTemplates = {}, translationCandidates = {}, ...props}: {as: string; translationAttributes?: string[]; translationTemplates?: Record<string, {source: string; values: unknown[]}>; translationCandidates?: Record<string, string[]>; [key: string]: unknown}) {
   const {language, catalog} = useContext(Context);
   const localized = {...props};
   translationAttributes.forEach(key => {if (typeof props[key] === 'string') localized[key] = translatedText(catalog, language, props[key]);});
+  Object.entries(translationCandidates).forEach(([key, candidates]) => {
+    const matched = matchAuthoredPhrase(props[key], candidates);
+    if (matched) localized[key] = translatedText(catalog, language, matched.source).replace(/\{v(\d+)\}/g, (_token, index) => String(matched.values?.[Number(index)] ?? ''));
+  });
   Object.entries(translationTemplates).forEach(([key, template]) => {
     localized[key] = translatedText(catalog, language, template.source).replace(/\{v(\d+)\}/g, (_token, index) => String(template.values[Number(index)] ?? ''));
   });

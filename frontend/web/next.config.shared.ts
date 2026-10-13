@@ -1,6 +1,6 @@
 import type { NextConfig } from 'next';
 import path from 'node:path';
-import {prepare} from './localization/prepare.cjs';
+import {prepare, verify} from './localization/prepare.cjs';
 
 // Development infrastructure shared by every template project.
 // Keep routing, integrations, plugins, and application options in next.config.ts.
@@ -22,7 +22,8 @@ export function buildAllowedDevOrigins(): string[] {
 }
 
 export function withSharedDevConfig(projectConfig: NextConfig): NextConfig {
-  prepare(process.cwd());
+  if (process.env.NODE_ENV === 'production') verify(process.cwd());
+  else prepare(process.cwd());
   const projectWebpack = projectConfig.webpack;
   return {
     ...projectConfig,
@@ -34,9 +35,9 @@ export function withSharedDevConfig(projectConfig: NextConfig): NextConfig {
     ])],
     webpack(config, context) {
       const result = projectWebpack ? projectWebpack(config, context) : config;
-      result.module.rules.push({test: /\.tsx$/, enforce: 'pre',
+      result.module.rules.push({test: /\.[jt]sx?$/, enforce: 'pre',
         include: [path.join(process.cwd(), 'app'), path.join(process.cwd(), 'components')],
-        exclude: [/\.test\./],
+        exclude: [/\.(test|spec)\./],
         use: [{loader: path.join(process.cwd(), 'localization/loader.cjs')}],
       });
       if (context.dev) {
