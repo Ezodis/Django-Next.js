@@ -240,10 +240,11 @@ test('admin proxy is project-independent and preserves custom rewrites',async()=
   const custom={source:'/custom',destination:'/other'};
   const config=routing.withSharedDevConfig({rewrites:async()=>[custom]});
   const rules=await config.rewrites();assert.deepEqual(rules.afterFiles,[custom]);
-  assert.equal(rules.beforeFiles[0].destination,'https://backend.example.test/admin/:path*/');
-  assert.equal(rules.beforeFiles[1].destination,'https://backend.example.test/static/:path*');
+  assert.equal(rules.beforeFiles[0].destination,'https://backend.example.test/admin/');
+  assert.equal(rules.beforeFiles[1].destination,'https://backend.example.test/admin/:path+/');
+  assert.equal(rules.beforeFiles[2].destination,'https://backend.example.test/static/:path*');
   delete process.env.BACKEND_URL;process.env.NEXT_PUBLIC_API_URL='https://second.example.test/api';
-  assert.equal(routing.buildBackendRewrites()[0].destination,'https://second.example.test/admin/:path*/');
+  assert.equal(routing.buildBackendRewrites()[0].destination,'https://second.example.test/admin/');
   process.env.NEXT_PUBLIC_API_URL='/api';assert.deepEqual(routing.buildBackendRewrites(),[]);
  }finally{process.env=before;}
 });

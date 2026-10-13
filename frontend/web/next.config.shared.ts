@@ -27,8 +27,9 @@ export function buildBackendRewrites() {
   if (!value || !/^https?:\/\//i.test(value)) return [];
   const target = new URL(value);
   if (target.username || target.password || target.search || target.hash) throw new Error('Backend URL must not contain credentials, query or fragment');
-  return ['admin', 'static', 'media'].map(prefix => ({source: `/${prefix}/:path*`,
-    destination: `${target.origin}/${prefix}/:path*${prefix === 'admin' ? '/' : ''}`}));
+  return [{source: '/admin/', destination: `${target.origin}/admin/`},
+    ...['admin', 'static', 'media'].map(prefix => ({source: `/${prefix}/:path${prefix === 'admin' ? '+' : '*'}`,
+      destination: `${target.origin}/${prefix}/:path${prefix === 'admin' ? '+/' : '*'}`}))];
 }
 
 export function buildBackendRedirects(trailingSlash = false, skipNormalization = false) {
