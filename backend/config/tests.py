@@ -639,6 +639,36 @@ class AdminLoginURLTestCase(TestCase):
 
 
 class TemplateSyncTests(SimpleTestCase):
+    def test_project_relocation_preserves_legacy_file_and_refuses_conflicting_destination(self):
+        from .project_config import run_sync
+        with TemporaryDirectory() as directory:
+            template, project = (Path(directory) / name for name in ('template', 'project'))
+            for root in (template, project):
+                (root / 'backend/config').mkdir(parents=True)
+                (root / 'backend/project.py').write_text(
+                    "SYNC_TEMPLATE_REPO = 'owner/template'\nSYNC_RELOCATIONS = {'backend/config/legacy-tool': 'backend/helper/tool'}\n")
+                if root == project:
+                    (root / 'backend/config/legacy-tool').write_text('custom content')
+                for command in (['init', '-q'], ['add', '.'],
+                                ['-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-qm', 'initial']):
+                    subprocess.run(['git', '-C', str(root), *command], check=True)
+            target = project / 'backend/helper/tool'
+            target.parent.mkdir()
+            target.write_text('different content')
+            with self.assertRaisesRegex(ValueError, 'Relocation destination differs'):
+                run_sync(project, ['--dir', str(template), '--yes'])
+            self.assertEqual((project / 'backend/config/legacy-tool').read_text(), 'custom content')
+            target.unlink()
+            run_sync(project, ['--dir', str(template), '--dry-run'])
+            self.assertFalse(target.exists())
+            run_sync(project, ['--dir', str(template), '--yes'])
+            self.assertEqual(target.read_text(), 'custom content')
+            self.assertFalse((project / 'backend/config/legacy-tool').exists())
+            (project / 'backend/project.py').write_text("SYNC_TEMPLATE_REPO = 'owner/template'\nSYNC_RELOCATIONS = {'backend/config/legacy': '../outside'}\n")
+            with self.assertRaisesRegex(ValueError, 'stay inside the checkout'):
+                run_sync(project, ['--dir', str(template), '--dry-run'])
+
+
     def test_reusable_django_apps_sync_while_business_apps_are_protected(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

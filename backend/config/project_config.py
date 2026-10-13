@@ -99,7 +99,7 @@ SHARED_PATHS = (
     'frontend/mobile/metro.config.base.js',
 )
 RETIRED_SHARED_PATHS = (
-    'backend/config/.env.example', 'backend/config/Dockerfile.ml-service',
+    'backend/config/.env.example',
     'backend/config/test_template_config.py',
     '.sh/dev_qr_server.py',
 )
@@ -638,15 +638,28 @@ def apply_sync(root, args, clone, repo):
         # Remove obsolete tracked architecture files, preserving new local files
         # that have not yet been offered back to the template.
         retired |= tracked_shared_paths(destination) - set(paths)
+    relocations = project_option(destination, 'SYNC_RELOCATIONS', {})
+    for previous, replacement in relocations.items():
+        for item in (previous, replacement):
+            parts = PurePosixPath(item).parts
+            if (not parts or PurePosixPath(item).is_absolute() or '..' in parts
+                    or any(part.startswith('.env') for part in parts)
+                    or not (destination / item).resolve().is_relative_to(destination.resolve())):
+                raise ValueError('Sync relocation paths must stay inside the checkout and exclude environment files')
+    retired |= set(relocations)
     for path in sorted(retired):
         if any(path.startswith(prefix) if prefix.endswith('/') else path == prefix for prefix in protected):
             continue
         if (destination / path).is_file():
-            # A customized legacy ML Dockerfile must be relocated before removal.
-            if path.endswith('Dockerfile.ml-service') and not (destination / 'backend/ml_service/Dockerfile').is_file():
-                actions.append(('backend/ml_service/Dockerfile', (destination / path).read_bytes()))
-                snapshots['backend/ml_service/Dockerfile'] = None
-                print('  move: backend/config/Dockerfile.ml-service -> backend/ml_service/Dockerfile')
+            replacement = relocations.get(path)
+            if replacement:
+                existing = destination / replacement
+                if existing.is_file() and not same_shared_content(existing.read_bytes(), (destination / path).read_bytes()):
+                    raise ValueError(f'Relocation destination differs: {replacement}; preserve/reconcile it before syncing')
+                if not existing.is_file():
+                    actions.append((replacement, (destination / path).read_bytes()))
+                    snapshots[replacement] = None
+                    print(f'  move: {path} -> {replacement}')
             actions.append((path, None))
             snapshots[path] = (destination / path).read_bytes()
             print(f'  remove retired: {path}')

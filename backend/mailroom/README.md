@@ -26,7 +26,9 @@ and MX records with the provider while preserving existing mail routes.
 
 ## Workers
 
-Local development starts `mail-worker`. On Railway or another host, use the same
+Local development workers are declared in each project’s `COMPOSE_SERVICES`.
+EDY and EliteCar run `mail-worker`; OldBook reuses its existing order worker.
+On Railway or another host, use the same
 backend image and project database/email variables with the start command
 `python manage.py process_mail --loop`. Apply `python manage.py migrate mailroom`
 first. The worker needs no public port. OldBook's existing order worker already

@@ -60,6 +60,13 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   project and execute a handler only when that command is explicitly requested.
 - Keep business logic, models, views, migrations, and management commands in
   their existing Django apps. Use app management commands for app startup hooks.
+- Declare optional application workers and drive mounts only in the project's
+  literal `COMPOSE_SERVICES` and `OPTIONAL_BIND_MOUNTS`. Shared Compose contains
+  core infrastructure and generic developer tools; never copy an application's
+  mount paths, worker command, or integration environment into it.
+- Declare legacy project-file moves in a literal `SYNC_RELOCATIONS` mapping
+  (old relative path to new relative path) in `backend/project.py`. Sync validates
+  paths and refuses to replace a different existing destination.
 - Keep service implementation and custom Dockerfiles alongside the service,
   such as `backend/ml_service/Dockerfile`; do not place them in `backend/config/`.
   Declare a service in `project.py` only when that project actually needs it.
