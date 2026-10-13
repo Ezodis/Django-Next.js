@@ -1,0 +1,6 @@
+{% extends "admin/change_form.html" %}
+{% block submit_buttons_bottom %}
+{% if add %}
+<div class="submit-row"><input type="submit" value="Send email" class="default" name="_save"></div>
+{% else %}{{ block.super }}{% endif %}
+{% endblock %}

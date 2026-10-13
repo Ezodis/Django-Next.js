@@ -639,6 +639,19 @@ class AdminLoginURLTestCase(TestCase):
 
 
 class TemplateSyncTests(SimpleTestCase):
+    def test_reusable_django_apps_sync_while_business_apps_are_protected(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("mailroom", "catalog"):
+                app = root / "backend" / name
+                app.mkdir(parents=True)
+                (app / "__init__.py").touch()
+            protected = sync_paths(root)
+            self.assertNotIn("backend/mailroom/", protected)
+            self.assertIn("backend/catalog/", protected)
+            self.assertTrue(is_shared("backend/mailroom/models.py", protected))
+
+
     def test_line_endings_do_not_create_shared_updates(self):
         from .project_config import same_shared_content
         self.assertTrue(same_shared_content(b'first\r\nsecond\r\n', b'first\nsecond\n'))

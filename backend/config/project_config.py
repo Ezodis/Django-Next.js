@@ -84,7 +84,7 @@ def migrate_database():
 # discovered automatically; application source and project.py stay project-owned.
 SHARED_PATHS = (
     'AGENTS.md', 'dev.sh', 'dev.ps1', 'dev.yml', '.gitattributes', '.dockerignore', '.vercelignore',
-    'backend/config/*', 'backend/manage.py', 'backend/backup/*.sh', 'backend/backup/.gitignore',
+    'backend/config/*', 'backend/mailroom/*', 'backend/manage.py', 'backend/backup/*.sh', 'backend/backup/.gitignore',
     'backend/requirements/base.txt', 'backend/requirements/development.txt',
     'backend/requirements/deployment.txt',
     'frontend/web/Dockerfile', 'frontend/web/.dockerignore',
@@ -175,7 +175,10 @@ def mobile_apps(root):
 
 def sync_paths(root):
     root = Path(root)
-    paths = [f'backend/{name}/' for name in find_apps(root / 'backend')]
+    # Explicitly shared reusable Django apps participate in template sync.
+    # Business apps and explicit project protection remain project-owned.
+    paths = [f'backend/{name}/' for name in find_apps(root / 'backend')
+             if f'backend/{name}/*' not in SHARED_PATHS]
     paths += [f'frontend/mobile/{name}/' for name in mobile_apps(root)]
     paths += [config['path'].rstrip('/') + '/'
               for config in project_option(root, 'WATCHOS_APPS', {}).values()]
