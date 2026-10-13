@@ -7,6 +7,6 @@ module.exports=function(source){
  const catalog=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{};
  let changed=false;
  for(const [id,text]of Object.entries(result.messages)){if(catalog[id]&&catalog[id]!==text)throw Error('Translation key collision');if(catalog[id]!==text){catalog[id]=text;changed=true;}}
- if(changed){fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,JSON.stringify(catalog,null,2)+'\n');}
+ if(changed){fs.mkdirSync(path.dirname(file),{recursive:true});const temporary=file+'.'+process.pid+'.'+require('node:crypto').randomUUID()+'.tmp';fs.writeFileSync(temporary,JSON.stringify(catalog,null,2)+'\n');fs.renameSync(temporary,file);}
  return result.code;
 };

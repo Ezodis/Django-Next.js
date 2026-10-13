@@ -2,6 +2,46 @@ const {test}=require('node:test'),assert=require('node:assert/strict');
 const {compile}=require('./compiler.cjs');
 const {detectLocale,matchLocale,direction,textKey}=require('./core.cjs');
 const {createService}=require('./service.cjs');
+
+test('attribute templates localize their captions without cataloging private values',()=>{
+ const result=compile('<button aria-label={`Copies of ${book.title}`} title={`View ${book.title}`}>{book.title}</button>','page.tsx');
+ assert.deepEqual(Object.values(result.messages),['Copies of {v0}','View {v0}']);
+ assert.match(result.code,/translationTemplates/);assert.match(result.code,/values: \[book.title\]/);
+ assert.match(result.code,/\{book.title\}/);
+});
+
+test('fragment-based labels translate entire singular and plural phrases',()=>{
+ const result=compile("const label=count===1?<>{`Show ${count} book`}</>:<>{`Show ${count} books`}</>;",'page.tsx');
+ for(const phrase of ['Show {v0} book','Show {v0} books'])assert.equal(result.messages[textKey(phrase)],phrase);
+});
+
+test('conditional accessibility labels translate without changing option values',()=>{
+ const result=compile(`<button aria-label={open ? 'Close book' : 'Open book'} title={saved ? 'In cart' : 'Add to cart'} onClick={save}>Save</button>`,'page.tsx');
+ for(const phrase of ['Close book','Open book','In cart','Add to cart'])assert.equal(result.messages[textKey(phrase)],phrase);
+ assert.match(result.code,/translationAttributes/);assert.match(result.code,/onClick=\{save\}/);
+});
+
+test('conditional, logical and mapped JSX translate every nested interface phrase',()=>{
+ const result=compile(`export default () => <div>{failed ? <p>Try fewer filters.</p> : <section><h2>Address your parcel.</h2>{ready && <button>Continue</button>}{items.map(item => <span title="Open item">{item.name} Details</span>)}</section>}</div>`,'page.tsx');
+ for(const phrase of ['Try fewer filters.','Address your parcel.','Continue','Open item',' Details'])assert.equal(result.messages[textKey(phrase)],phrase);
+ assert.match(result.code,/\{item.name\}/);
+ assert.ok(!Object.values(result.messages).includes('item.name'));
+});
+
+test('server catalog refreshes when development discovers new interface phrases',async()=>{
+ const fs=require('node:fs'),path=require('node:path'),ts=require('typescript'),Module=require('node:module');
+ let manifest=JSON.stringify({[textKey('First')]: 'First'}),calls=0;
+ const file=path.join(__dirname,'server.ts'),compiledModule=new Module(file,module);
+ compiledModule.filename=file;compiledModule.paths=Module._nodeModulePaths(__dirname);
+ const original=compiledModule.require.bind(compiledModule);
+ compiledModule.require=id=>id==='server-only'?{}:id==='next/headers'?{}:id==='next/cache'?{unstable_cache:fn=>fn}:id==='node:fs'?{readFileSync:()=>manifest}:id==='./catalog.cjs'?{prepareCatalog:async(_root,_locale,source)=>{calls++;return source;}}:original(id);
+ compiledModule._compile(ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,esModuleInterop:true}}).outputText,file);
+ const {getInterfaceCatalog}=compiledModule.exports;
+ const first=getInterfaceCatalog('es');assert.equal(getInterfaceCatalog('es'),first);await first;
+ manifest=JSON.stringify({[textKey('First')]:'First',[textKey('New checkout label')]:'New checkout label'});
+ const updated=await getInterfaceCatalog('es');
+ assert.equal(updated[textKey('New checkout label')],'New checkout label');assert.equal(calls,2);
+});
 test('interpolation-only phrases preserve values without requesting translation',async()=>{
  const phrase='{v0}{v1}',source={[textKey(phrase)]:phrase};
  const service=createService({source,fetch:async()=>{throw Error('Must not contact provider');}});

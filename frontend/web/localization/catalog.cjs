@@ -18,7 +18,11 @@ async function prepareCatalog(root,language,source,{translate=createService({sou
  const catalog=readCatalog(root,locale,source);
  const missing=Object.keys(source).filter(id=>textKey(source[id])===id&&!Object.hasOwn(catalog,id));
  for(let offset=0;offset<missing.length;offset+=35){
-  Object.assign(catalog,await translate({language:locale,ids:missing.slice(offset,offset+35)}));
+  // Keep successful phrases cached and retry only the interrupted batch.
+  for(let attempt=0;;attempt++){
+   try{Object.assign(catalog,await translate({language:locale,ids:missing.slice(offset,offset+35)}));break;}
+   catch(error){if(attempt===2)throw error;await new Promise(resolve=>setTimeout(resolve,250*2**attempt));}
+  }
  }
  if(Object.keys(catalog).length!==Object.keys(source).length)throw Error('Incomplete interface dictionary');
  if(persist&&missing.length){

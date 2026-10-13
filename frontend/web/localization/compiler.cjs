@@ -18,8 +18,10 @@ function compile(source,filename,componentPath){
  const preserve=new Set(require(path.join(process.cwd(),'package.json')).localization?.preserve??[]);
  const record=text=>{if(!/\p{L}/u.test(text)||preserve.has(text.trim()))return false;const id=textKey(text);if(messages[id]&&messages[id]!==text)throw Error('Translation key collision');messages[id]=text;return true;};
  const collect=node=>{
-  if(ts.isStringLiteralLike(node))record(node.text);
-  else if(ts.isConditionalExpression(node)){collect(node.whenTrue);collect(node.whenFalse);}
+  if(ts.isStringLiteralLike(node))return record(node.text);
+  if(ts.isConditionalExpression(node)){const left=collect(node.whenTrue),right=collect(node.whenFalse);return left||right;}
+  if(ts.isParenthesizedExpression(node))return collect(node.expression);
+  return false;
  };
  const catalogCalls=node=>{
   if(ts.isCallExpression(node)&&['t','translate'].includes(node.expression.getText(tree))&&node.arguments[0])collect(node.arguments[0]);
@@ -33,18 +35,29 @@ function compile(source,filename,componentPath){
   if(values)props.push(factory.createJsxAttribute(factory.createIdentifier('values'),factory.createJsxExpression(undefined,factory.createArrayLiteralExpression(values))));
   return factory.createJsxSelfClosingElement(factory.createIdentifier('__SharedAutoText'),undefined,factory.createJsxAttributes(props));
  };
- const expression=node=>{
+ const expression=(node,visit)=>{
   if(ts.isStringLiteralLike(node))return textElement(node.text)||node;
-  if(ts.isConditionalExpression(node))return factory.updateConditionalExpression(node,node.condition,node.questionToken,expression(node.whenTrue),node.colonToken,expression(node.whenFalse));
+  if(ts.isConditionalExpression(node))return factory.updateConditionalExpression(node,node.condition,node.questionToken,expression(node.whenTrue,visit),node.colonToken,expression(node.whenFalse,visit));
   if(ts.isTemplateExpression(node)){
    let text=node.head.text;const values=[];
    for(const span of node.templateSpans){text+=`{v${values.length}}`+span.literal.text;values.push(span.expression);}
    return textElement(text,values)||node;
   }
-  return node;
+  // Expressions may contain JSX in ternaries, logical branches and callbacks.
+  // Visit those nodes without translating arbitrary application string data.
+  return ts.visitNode(node,visit);
  };
  const transform=context=>{
+    const localizeChild=child=>{
+     if(ts.isJsxText(child)){
+      const lines=child.text.split(/\r?\n/);const text=lines.length===1?child.text:lines.map((line,i)=>i===0?line.trimEnd():i===lines.length-1?line.trimStart():line.trim()).filter(Boolean).join(' ');
+      return textElement(decode(text))||child;
+     }
+     if(ts.isJsxExpression(child)&&child.expression)return factory.updateJsxExpression(child,expression(child.expression,visit));
+     return ts.visitNode(child,visit);
+    };
   const visit=node=>{
+   if(ts.isJsxFragment(node))return factory.updateJsxFragment(node,node.openingFragment,node.children.map(localizeChild),node.closingFragment);
    if(ts.isCallExpression(node)&&['t','translate'].includes(node.expression.getText(tree))&&node.arguments[0]&&ts.isStringLiteralLike(node.arguments[0]))record(node.arguments[0].text);
    if(ts.isJsxElement(node)||ts.isJsxSelfClosingElement(node)){
     const opening=ts.isJsxElement(node)?node.openingElement:node;
@@ -52,24 +65,30 @@ function compile(source,filename,componentPath){
     const skip=ignoredTags.has(tag)||opening.attributes.properties.some(p=>ts.isJsxAttribute(p)&&(p.name.getText(tree)==='data-no-translate'||p.name.getText(tree)==='contentEditable'||p.name.getText(tree)==='translate'&&p.initializer&&ts.isStringLiteral(p.initializer)&&p.initializer.text==='no'));
     if(skip)return node;
     const native=/^[a-z][a-z0-9-]*$/.test(tag);
-    const keys=[];
-    for(const p of opening.attributes.properties)if(native&&ts.isJsxAttribute(p)&&attributes.has(p.name.getText(tree))&&p.initializer&&ts.isStringLiteral(p.initializer)&&record(decode(p.initializer.text)))keys.push(p.name.getText(tree));
-    const originalProps=[...opening.attributes.properties];
+    const keys=[],templates=[];
+    for(const p of opening.attributes.properties)if(native&&ts.isJsxAttribute(p)&&attributes.has(p.name.getText(tree))&&p.initializer&&(ts.isStringLiteral(p.initializer)?record(decode(p.initializer.text)):ts.isJsxExpression(p.initializer)&&p.initializer.expression&&collect(p.initializer.expression)))keys.push(p.name.getText(tree));
+    for(const p of opening.attributes.properties)if(native&&ts.isJsxAttribute(p)&&attributes.has(p.name.getText(tree))&&p.initializer&&ts.isJsxExpression(p.initializer)&&p.initializer.expression&&ts.isTemplateExpression(p.initializer.expression)){
+     const template=p.initializer.expression,values=[];let text=template.head.text;
+     for(const span of template.templateSpans){text+=`{v${values.length}}`+span.literal.text;values.push(span.expression);}
+     if(record(text))templates.push({key:p.name.getText(tree),text,values});
+    }
+    const originalProps=opening.attributes.properties.map(p=>{
+     const template=ts.isJsxAttribute(p)&&templates.find(item=>item.key===p.name.getText(tree));
+     return template?factory.updateJsxAttribute(p,p.name,factory.createStringLiteral(template.text)):p;
+    });
     if(tag==='option'&&ts.isJsxElement(node)&&!originalProps.some(p=>ts.isJsxAttribute(p)&&p.name.getText(tree)==='value')&&node.children.every(child=>ts.isJsxText(child))){
      originalProps.push(factory.createJsxAttribute(factory.createIdentifier('value'),factory.createStringLiteral(decode(node.children.map(child=>child.text).join('').trim()))));changed=true;
     }
-    const props=keys.length?factory.createJsxAttributes([...originalProps,factory.createJsxAttribute(factory.createIdentifier('as'),factory.createStringLiteral(tag)),factory.createJsxAttribute(factory.createIdentifier('translationAttributes'),factory.createJsxExpression(undefined,factory.createArrayLiteralExpression(keys.map(k=>factory.createStringLiteral(k)))))]):factory.createJsxAttributes(originalProps);
-    const name=keys.length?factory.createIdentifier('__SharedAutoElement'):opening.tagName;
-    if(keys.length)changed=true;
+    const wrapped=keys.length||templates.length;
+    const additional=[factory.createJsxAttribute(factory.createIdentifier('as'),factory.createStringLiteral(tag)),factory.createJsxAttribute(factory.createIdentifier('translationAttributes'),factory.createJsxExpression(undefined,factory.createArrayLiteralExpression(keys.map(k=>factory.createStringLiteral(k)))))];
+    if(templates.length)additional.push(factory.createJsxAttribute(factory.createIdentifier('translationTemplates'),factory.createJsxExpression(undefined,factory.createObjectLiteralExpression(templates.map(item=>factory.createPropertyAssignment(factory.createStringLiteral(item.key),factory.createObjectLiteralExpression([
+     factory.createPropertyAssignment('source',factory.createStringLiteral(item.text)),factory.createPropertyAssignment('values',factory.createArrayLiteralExpression(item.values)),
+    ])))))));
+    const props=factory.createJsxAttributes(wrapped?[...originalProps,...additional]:originalProps);
+    const name=wrapped?factory.createIdentifier('__SharedAutoElement'):opening.tagName;
+    if(wrapped)changed=true;
     if(ts.isJsxSelfClosingElement(node))return factory.updateJsxSelfClosingElement(node,name,node.typeArguments,props);
-    const children=node.children.map(child=>{
-     if(ts.isJsxText(child)){
-      const lines=child.text.split(/\r?\n/);const text=lines.length===1?child.text:lines.map((line,i)=>i===0?line.trimEnd():i===lines.length-1?line.trimStart():line.trim()).filter(Boolean).join(' ');
-      return textElement(decode(text))||child;
-     }
-     if(ts.isJsxExpression(child)&&child.expression)return factory.updateJsxExpression(child,expression(child.expression));
-     return ts.visitNode(child,visit);
-    });
+    const children=node.children.map(localizeChild);
     return factory.updateJsxElement(node,factory.updateJsxOpeningElement(opening,name,opening.typeArguments,props),children,factory.updateJsxClosingElement(node.closingElement,name));
    }
    return ts.visitEachChild(node,visit,context);

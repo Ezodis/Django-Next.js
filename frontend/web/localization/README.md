@@ -9,11 +9,19 @@ Language does not change routes, authentication, money, dates or stored content.
 
 The shared webpack loader discovers authored JSX text, literal alternatives,
 template phrases and native `title`, `placeholder`, `alt` and accessibility labels.
+Conditional branches, fragments and mapped JSX are traversed too; dynamic
+attribute captions keep interpolation values separate from translation requests.
 New pages and nested layouts inherit the provider and compiler without a route list.
 React renders localized text; no DOM mutation or browser translation widget is used.
 Each project owns `messages/automatic-source.json`; template sync never copies
 another application's phrases or preferences. Startup/build prepares this manifest,
 and development compilation updates it for newly added text.
+
+Helper-generated UI labels need `useInterfaceTranslator()` (name the returned
+function `translate`) around their authored phrases. Keep original field IDs,
+option values and backend data separate from the translated display labels.
+`useInterfaceLanguage()` exposes the currently rendered locale for built-in
+`Intl.DisplayNames`, date or number formatting without translation requests.
 
 Dynamic data is preserved. For public UI data such as a navigation registry, add
 its JSON path to `package.json`'s `localization.catalogs` and render its authored
@@ -38,8 +46,9 @@ includes them in standalone deployments. Incomplete generation fails the build
 instead of shipping a partial dictionary. Keep these files in version control.
 
 Development scans new authored text and resolves any missing entries on the server
-before rendering. Clients request a complete internal dictionary only when the
-language changes; they keep the previous complete language until it is ready.
+before rendering. Source manifests are written atomically, and dictionary caches
+are keyed by manifest version so newly authored phrases invalidate stale results.
+Clients request a complete internal dictionary when the language or source changes; they keep the previous complete language until it is ready.
 OldBook persists manual choices in a cookie as well as its existing local storage;
 legacy local-storage-only preferences migrate on the first visit. EliteCar retains
 its existing preference cookies and regional settings. EDY stays automatic.

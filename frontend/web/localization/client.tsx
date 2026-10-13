@@ -4,9 +4,11 @@ import {detectLocale, direction, matchLocale, textKey} from './core.cjs';
 import sources from '../messages/automatic-source.json';
 
 type Catalog = Record<string, string>;
-export type LocalizationSnapshot = {language: string; catalog: Catalog; manual?: boolean};
+export type LocalizationSnapshot = {language: string; catalog: Catalog; sourceVersion?: string; manual?: boolean};
 type TranslationContext = {language: string; catalog: Catalog};
 const EMPTY: Catalog = {};
+const SOURCE_VERSION = textKey(Object.keys(sources).sort().join(','));
+const currentSource = (snapshot: LocalizationSnapshot) => !snapshot.sourceVersion || snapshot.sourceVersion === SOURCE_VERSION;
 const Context = createContext<TranslationContext>({language: 'en', catalog: EMPTY});
 const loaded = new Map<string, Catalog>();
 const inflight = new Map<string, Promise<Catalog>>();
@@ -35,23 +37,24 @@ export function AutomaticTranslationProvider({children, initial, language, revie
   const device = useSyncExternalStore(subscribeDevice, deviceLanguage, () => serverLanguage);
   const desired = matchLocale(language) ?? (initial?.manual ? serverLanguage : device);
   const [snapshot, setSnapshot] = useState<LocalizationSnapshot>(() => {
-    if (typeof window !== 'undefined' && initial) loaded.set(initial.language, initial.catalog);
+    if (typeof window !== 'undefined' && initial && currentSource(initial)) loaded.set(initial.language, initial.catalog);
     return initial ?? {language: serverLanguage, catalog: EMPTY};
   });
   // Keep the last complete language current when returning to the server snapshot.
-  if (initial?.language === desired && snapshot !== initial) setSnapshot(initial);
-  const base = initial?.language === desired ? initial : snapshot;
-  const ready = base.language !== desired && typeof window !== 'undefined' && loaded.has(desired)
-    ? {language: desired, catalog: loaded.get(desired)!} : base;
+  if (initial?.language === desired && currentSource(initial) && snapshot !== initial) setSnapshot(initial);
+  const base = initial?.language === desired && currentSource(initial) ? initial : snapshot;
+  const ready = (base.language !== desired || !currentSource(base)) && typeof window !== 'undefined' && loaded.has(desired)
+    ? {language: desired, catalog: loaded.get(desired)!, sourceVersion: SOURCE_VERSION} : base;
   useEffect(() => {
-    if (initial) loaded.set(initial.language, initial.catalog);
+    if (initial && currentSource(initial)) loaded.set(initial.language, initial.catalog);
   }, [initial]);
+  const baseCurrent = currentSource(base);
   useEffect(() => {
-    if (base.language === desired) return;
+    if (base.language === desired && baseCurrent) return;
     let active = true;
-    preloadInterfaceLanguage(desired).then(catalog => {if (active) setSnapshot({language: desired, catalog});}).catch(() => {});
+    preloadInterfaceLanguage(desired).then(catalog => {if (active) setSnapshot({language: desired, catalog, sourceVersion: SOURCE_VERSION});}).catch(() => {});
     return () => {active = false;};
-  }, [desired, base.language]);
+  }, [desired, base.language, baseCurrent]);
   const catalog = useMemo(() => ({...ready.catalog, ...(ready.language === desired ? reviewed : EMPTY)}), [ready.catalog, ready.language, desired, reviewed]);
   useEffect(() => {
     document.documentElement.lang = ready.language;
@@ -65,6 +68,9 @@ function translatedText(catalog: Catalog, language: string, source: string): str
   const translated = catalog[textKey(source)];
   // Known authored text never flashes in the source language while a new dictionary loads.
   return translated ?? (language === 'en' || !Object.hasOwn(sources, textKey(source)) ? source : '');
+}
+export function useInterfaceLanguage(): string {
+  return useContext(Context).language;
 }
 export function useAutomaticTranslation(source: string): string {
   const {language, catalog} = useContext(Context);
@@ -82,9 +88,12 @@ export function AutoText({source, values}: {source: string; values?: ReactNode[]
     return <Fragment key={index}>{match ? values[Number(match[1])] : part}</Fragment>;
   });
 }
-export function AutoElement({as, translationAttributes, ...props}: {as: string; translationAttributes: string[]; [key: string]: unknown}) {
+export function AutoElement({as, translationAttributes = [], translationTemplates = {}, ...props}: {as: string; translationAttributes?: string[]; translationTemplates?: Record<string, {source: string; values: unknown[]}>; [key: string]: unknown}) {
   const {language, catalog} = useContext(Context);
   const localized = {...props};
   translationAttributes.forEach(key => {if (typeof props[key] === 'string') localized[key] = translatedText(catalog, language, props[key]);});
+  Object.entries(translationTemplates).forEach(([key, template]) => {
+    localized[key] = translatedText(catalog, language, template.source).replace(/\{v(\d+)\}/g, (_token, index) => String(template.values[Number(index)] ?? ''));
+  });
   return createElement(as, localized);
 }

@@ -25,7 +25,7 @@ function prepare(root){
  for(const [id,text]of Object.entries(catalog))if(preserve.has(text.trim()))delete catalog[id];
  fs.mkdirSync(path.dirname(file),{recursive:true});
  const content=JSON.stringify(catalog,null,2)+'\n';
- if(!fs.existsSync(file)||fs.readFileSync(file,'utf8')!==content)fs.writeFileSync(file,content);
+ if(!fs.existsSync(file)||fs.readFileSync(file,'utf8')!==content){const temporary=file+'.'+process.pid+'.'+require('node:crypto').randomUUID()+'.tmp';fs.writeFileSync(temporary,content);fs.renameSync(temporary,file);}
  return Object.keys(catalog).length;
 }
 async function prepareTranslations(root,languages=require('./core.cjs').locales){
