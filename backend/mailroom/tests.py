@@ -146,3 +146,105 @@ class ComposeTests(TestCase):
         message.refresh_from_db()
         self.assertIsNone(message.sent_at)
         self.assertIsNotNone(message.next_attempt_at)
+
+
+@override_settings(MAILBOX_DOMAIN="example.test")
+class MailboxWorkspaceTests(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_superuser("mailowner", "owner@example.test", "test-pass")
+        self.client.force_login(self.owner)
+        self.url = reverse("admin:mailroom_receivedemail_changelist")
+        self.message = ReceivedEmail.objects.create(sender="reader@example.test", recipient="support@example.test",
+            subject="A special edition", text_body="Could you help find a signed copy? <script>unsafe()</script>",
+            raw_message=b"Subject: A special edition\n\nHello", digest="c" * 64)
+
+    def test_one_navigation_entry_and_unified_layout(self):
+        from django.contrib import admin
+        response = self.client.get(self.url)
+        self.assertContains(response, 'class="mailbox')
+        self.assertContains(response, "A special edition")
+        self.assertContains(response, "Compose")
+        self.assertContains(response, "Search mail")
+        entries = next(app for app in admin.site.get_app_list(response.wsgi_request) if app["app_label"] == "mailroom")
+        self.assertEqual([item["object_name"] for item in entries["models"]], ["ReceivedEmail"])
+
+    def test_search_and_folders_filter_without_exposing_unrelated_results(self):
+        response = self.client.get(self.url, {"q": "signed"})
+        self.assertContains(response, "A special edition")
+        self.assertNotContains(self.client.get(self.url, {"q": "absent phrase"}), "A special edition")
+        self.client.post(self.url, {"action": "archive", "selected": self.message.pk})
+        self.assertNotContains(self.client.get(self.url), "A special edition")
+        self.assertContains(self.client.get(self.url, {"folder": "archive"}), "A special edition")
+        self.client.post(self.url + "?folder=archive", {"action": "restore", "selected": self.message.pk})
+        self.assertContains(self.client.get(self.url), "A special edition")
+
+    def test_reader_escapes_message_content_and_does_not_mutate_on_get(self):
+        response = self.client.get(self.url, {"message": self.message.pk})
+        self.assertContains(response, "&lt;script&gt;unsafe()&lt;/script&gt;")
+        self.assertNotContains(response, "<script>unsafe()</script>")
+        self.assertContains(response, "Download original email")
+        self.assertContains(response, "Reply")
+        self.message.refresh_from_db()
+        self.assertFalse(self.message.is_read)
+        self.client.post(self.url, {"action": "read", "selected": self.message.pk})
+        self.message.refresh_from_db()
+        self.assertTrue(self.message.is_read)
+
+    def test_compose_reply_and_delivery_status_share_the_workspace(self):
+        response = self.client.get(self.url, {"reply": self.message.pk})
+        self.assertContains(response, 'class="mail-composer"')
+        self.assertContains(response, 'value="reader@example.test"')
+        self.assertContains(response, 'value="support"')
+        with patch("mailroom.delivery.send_mail") as send:
+            response = self.client.post(self.url, {"action": "send", "from_alias": "support",
+                "recipient": "reader@example.test", "subject": "Re: A special edition", "body": "Hello"})
+            send.assert_not_called()
+        self.assertRedirects(response, self.url + "?folder=outbox")
+        self.assertEqual(OutgoingEmail.objects.get().sender, "support@example.test")
+        self.assertContains(self.client.get(self.url, {"folder": "outbox"}), "Queued")
+        self.assertNotContains(self.client.get(self.url, {"folder": "sent"}), "Re: A special edition")
+
+    def test_invalid_compose_retains_form_errors_without_queuing(self):
+        response = self.client.post(self.url, {"action": "send", "from_alias": "other@foreign.test",
+            "recipient": "not-an-email", "subject": "Test", "body": "Body"})
+        self.assertContains(response, 'class="mail-composer"')
+        self.assertContains(response, "Enter a valid email address")
+        self.assertFalse(OutgoingEmail.objects.exists())
+
+    def test_readonly_staff_cannot_modify_or_send_and_unprivileged_staff_are_denied(self):
+        from django.contrib.auth.models import Permission
+        staff = User.objects.create_user("reader", is_staff=True)
+        staff.user_permissions.add(Permission.objects.get(codename="view_receivedemail"))
+        self.client.force_login(staff)
+        self.assertEqual(self.client.get(self.url).status_code, 200)
+        for action in ("read", "archive", "send", "retry"):
+            self.assertEqual(self.client.post(self.url, {"action": action, "selected": self.message.pk}).status_code, 403)
+        self.assertEqual(self.client.get(self.url, {"compose": 1}).status_code, 403)
+        outsider = User.objects.create_user("outsider", is_staff=True)
+        self.client.force_login(outsider)
+        self.assertEqual(self.client.get(self.url).status_code, 403)
+
+    def test_outgoing_only_staff_cannot_read_incoming_messages(self):
+        from django.contrib.auth.models import Permission
+        staff = User.objects.create_user("sentreader", is_staff=True)
+        staff.user_permissions.add(Permission.objects.get(codename="view_outgoingemail"))
+        self.client.force_login(staff)
+        response = self.client.get(self.url, {"folder": "sent"})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "A special edition")
+        self.assertEqual(self.client.get(self.url, {"message": self.message.pk}).status_code, 404)
+
+    def test_pagination_limits_rows_and_malformed_identifiers_fail_closed(self):
+        ReceivedEmail.objects.bulk_create([ReceivedEmail(sender="reader@example.test", recipient="support@example.test",
+            subject=f"Message {index}", raw_message=b"Hello", digest=f"{index:064x}") for index in range(35)])
+        response = self.client.get(self.url)
+        self.assertEqual(len(response.context["page"].object_list), 30)
+        self.assertTrue(response.context["page"].has_next())
+        self.assertEqual(self.client.get(self.url, {"message": "invalid"}).status_code, 404)
+        self.assertEqual(self.client.post(self.url, {"action": "archive", "selected": "invalid"}).status_code, 404)
+
+    def test_actions_require_csrf(self):
+        from django.test import Client
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.owner)
+        self.assertEqual(client.post(self.url, {"action": "archive", "selected": self.message.pk}).status_code, 403)

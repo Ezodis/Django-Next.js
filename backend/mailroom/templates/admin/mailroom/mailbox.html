@@ -1,0 +1,100 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+{% block extrastyle %}{{ block.super }}<link rel="stylesheet" href="{% static 'mailroom/mailbox.css' %}">{% endblock %}
+{% block extrahead %}{{ block.super }}<script src="{% static 'mailroom/mailbox.js' %}" defer></script>{% endblock %}
+{% block breadcrumbs %}<div class="breadcrumbs"><a href="{% url 'admin:index' %}">{% translate "Home" %}</a> &rsaquo; {% translate "Mailbox" %}</div>{% endblock %}
+{% block content_title %}{% endblock %}
+{% block content %}
+<div class="mailbox{% if selected %} has-message{% endif %}">
+  <header class="mail-heading">
+    <div class="mail-identity"><span class="mail-logo" aria-hidden="true">✉</span><div><h1>{% translate "Mailbox" %}</h1><p>{{ domain|default:"Email workspace" }}</p></div></div>
+    <form class="mail-search" method="get" role="search">
+      <input type="hidden" name="folder" value="{{ folder }}">
+      <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m16 16 5 5"></path></svg>
+      <label class="mail-sr" for="mail-search">{% translate "Search mail" %}</label>
+      <input id="mail-search" type="search" name="q" value="{{ query }}" placeholder="{% translate 'Search mail' %}" maxlength="200">
+      <button type="submit">{% translate "Search" %}</button>
+    </form>
+  </header>
+  <div class="mail-shell">
+    <aside class="mail-sidebar" aria-label="{% translate 'Mail folders' %}">
+      {% if can_compose %}<a class="mail-compose" href="{{ list_url }}&amp;compose=1" data-compose-link><span aria-hidden="true">＋</span>{% translate "Compose" %}</a>{% endif %}
+      <nav>
+        {% if can_receive %}
+        <a href="{{ base_url }}?folder=inbox" class="{% if folder == 'inbox' %}active{% endif %}" {% if folder == 'inbox' %}aria-current="page"{% endif %}><span class="mail-folder-icon" aria-hidden="true">▣</span>{% translate "Inbox" %}{% if unread_count %}<b>{{ unread_count }}</b>{% endif %}</a>
+        <a href="{{ base_url }}?folder=unread" class="{% if folder == 'unread' %}active{% endif %}" {% if folder == 'unread' %}aria-current="page"{% endif %}><span class="mail-folder-icon" aria-hidden="true">●</span>{% translate "Unread" %}</a>
+        {% endif %}
+        {% if can_view_outgoing %}
+        <a href="{{ base_url }}?folder=sent" class="{% if folder == 'sent' %}active{% endif %}" {% if folder == 'sent' %}aria-current="page"{% endif %}><span class="mail-folder-icon" aria-hidden="true">↗</span>{% translate "Sent" %}</a>
+        <a href="{{ base_url }}?folder=outbox" class="{% if folder == 'outbox' %}active{% endif %}" {% if folder == 'outbox' %}aria-current="page"{% endif %}><span class="mail-folder-icon" aria-hidden="true">◷</span>{% translate "Outbox" %}{% if outbox_count %}<b>{{ outbox_count }}</b>{% endif %}</a>
+        {% endif %}
+        {% if can_receive %}<a href="{{ base_url }}?folder=archive" class="{% if folder == 'archive' %}active{% endif %}" {% if folder == 'archive' %}aria-current="page"{% endif %}><span class="mail-folder-icon" aria-hidden="true">▤</span>{% translate "Archive" %}</a>{% endif %}
+      </nav>
+      <div class="mail-sidebar-note"><span class="mail-connection" aria-hidden="true"></span>{% translate "Your project mailbox" %}</div>
+    </aside>
+    <section class="mail-main" aria-label="{% translate 'Mail messages' %}">
+      <div class="mail-toolbar">
+        <div class="mail-toolbar-title"><h2>{{ folder_title }}</h2><span>{% blocktranslate count counter=page.paginator.count %}{{ counter }} message{% plural %}{{ counter }} messages{% endblocktranslate %}</span></div>
+        <a class="mail-button mail-refresh" href="{{ list_url }}" title="{% translate 'Refresh mailbox' %}"><span aria-hidden="true">↻</span><span class="mail-sr">{% translate "Refresh" %}</span></a>
+      </div>
+      <form method="post" id="mail-actions" class="mail-selection-bar">
+        {% csrf_token %}
+        {% if incoming and can_change or not incoming and can_retry %}
+        <label class="mail-select-all"><input type="checkbox" data-select-all> <span>{% translate "Select page" %}</span></label>
+        <span class="mail-selection-count" data-selection-count aria-live="polite"></span>
+        {% if incoming and can_change %}
+        <button class="mail-button" name="action" value="read">{% translate "Mark read" %}</button>
+        <button class="mail-button" name="action" value="unread">{% translate "Mark unread" %}</button>
+        {% if folder == 'archive' %}<button class="mail-button" name="action" value="restore">{% translate "Move to inbox" %}</button>{% else %}<button class="mail-button" name="action" value="archive">{% translate "Archive" %}</button>{% endif %}
+        {% elif folder == 'outbox' and can_retry %}<button class="mail-button" name="action" value="retry">{% translate "Retry delivery" %}</button>{% endif %}
+        {% endif %}
+      </form>
+      <div class="mail-layout">
+        <section class="mail-list" aria-label="{{ folder_title }}">
+          {% for email in page %}
+          <div class="mail-row{% if incoming and not email.is_read %} unread{% endif %}{% if selected.pk == email.pk %} selected{% endif %}">
+            {% if incoming and can_change or not incoming and can_retry %}<input class="mail-check" type="checkbox" name="selected" value="{{ email.pk }}" form="mail-actions" aria-label="{% translate 'Select message' %}: {{ email.subject }}">{% endif %}
+            <a class="mail-row-link" href="{{ list_url }}&amp;page={{ page.number }}&amp;message={{ email.pk }}" {% if selected.pk == email.pk %}aria-current="true"{% endif %}>
+              <span class="mail-avatar" aria-hidden="true">{% if incoming %}{{ email.sender|first|upper|default:"?" }}{% else %}{{ email.recipient|first|upper }}{% endif %}</span>
+              <span class="mail-row-content"><span class="mail-row-top"><span class="mail-correspondent">{% if incoming %}{{ email.sender|default:"Unknown sender" }}{% else %}{{ email.recipient }}{% endif %}</span><time>{% if incoming %}{{ email.received_at|date:"M j" }}{% else %}{{ email.created_at|date:"M j" }}{% endif %}</time></span>
+                <span class="mail-subject">{{ email.subject|default:"(No subject)" }}</span><span class="mail-preview">{{ email.preview|truncatechars:100 }}</span>
+              </span>
+              {% if incoming and not email.is_read %}<span class="mail-unread-dot" aria-label="{% translate 'Unread' %}"></span>{% elif not incoming %}<span class="mail-status{% if email.last_error %} retrying{% endif %}">{% if email.sent_at %}{% translate "Sent" %}{% elif email.last_error %}{% translate "Retrying" %}{% else %}{% translate "Queued" %}{% endif %}</span>{% endif %}
+            </a>
+          </div>
+          {% empty %}
+          <div class="mail-empty"><span aria-hidden="true">✉</span><h3>{% if query %}{% translate "No matching messages" %}{% else %}{% translate "A little room to breathe" %}{% endif %}</h3><p>{% if query %}{% translate "Try a different name, address or subject." %}{% else %}{% translate "Messages will appear here when they arrive." %}{% endif %}</p>{% if query %}<a href="{{ base_url }}?folder={{ folder }}">{% translate "Clear search" %}</a>{% endif %}</div>
+          {% endfor %}
+          {% if page.paginator.num_pages > 1 %}<div class="mail-pagination">{% if page.has_previous %}<a class="mail-button" href="{{ list_url }}&amp;page={{ page.previous_page_number }}">{% translate "Previous" %}</a>{% endif %}<span>{{ page.number }} / {{ page.paginator.num_pages }}</span>{% if page.has_next %}<a class="mail-button" href="{{ list_url }}&amp;page={{ page.next_page_number }}">{% translate "Next" %}</a>{% endif %}</div>{% endif %}
+        </section>
+        {% if selected %}
+        <article class="mail-reader" aria-label="{% translate 'Selected message' %}">
+          <header><a class="mail-back" href="{{ list_url }}&amp;page={{ page.number }}">← {% translate "Back to messages" %}</a><h2>{{ selected.subject|default:"(No subject)" }}</h2>
+            <div class="mail-reader-meta"><span class="mail-avatar" aria-hidden="true">{{ selected.sender|first|upper|default:"?" }}</span><div><strong>{{ selected.sender|default:"Unknown sender" }}</strong><div>{% translate "to" %} {{ selected.recipient }}</div></div><time>{% if incoming %}{{ selected.received_at|date:"M j, Y · H:i" }}{% else %}{{ selected.created_at|date:"M j, Y · H:i" }}{% endif %}</time></div>
+          </header>
+          <div class="mail-body" translate="no">{% if incoming %}{{ selected.text_body|default:"(No text content)" }}{% else %}{{ selected.body }}{% endif %}</div>
+          {% if incoming %}
+          <div class="mail-attachments">{% for url, name in attachments %}<a href="{{ url }}" class="mail-button">↧ {{ name }}</a>{% endfor %}<a class="mail-original" href="{% url 'admin:mailroom_receivedemail_download' selected.pk 0 %}">{% translate "Download original email" %}</a></div>
+          <div class="mail-reader-actions">
+            {% if can_compose and selected.sender %}<a href="{{ list_url }}&amp;reply={{ selected.pk }}" class="mail-button mail-primary">↶ {% translate "Reply" %}</a>{% endif %}
+            {% if can_change %}<form method="post">{% csrf_token %}<input type="hidden" name="selected" value="{{ selected.pk }}"><button class="mail-button" name="action" value="{% if selected.is_read %}unread{% else %}read{% endif %}">{% if selected.is_read %}{% translate "Mark unread" %}{% else %}{% translate "Mark read" %}{% endif %}</button><button class="mail-button" name="action" value="{% if selected.is_archived %}restore{% else %}archive{% endif %}">{% if selected.is_archived %}{% translate "Move to inbox" %}{% else %}{% translate "Archive" %}{% endif %}</button></form>{% endif %}
+          </div>
+          {% else %}<div class="mail-delivery"><span class="mail-status">{% if selected.sent_at %}{% translate "Sent" %} · {{ selected.sent_at }}{% elif selected.last_error %}{% translate "Retrying" %}{% else %}{% translate "Queued" %}{% endif %}</span>{% if selected.last_error %}<p>{{ selected.last_error }}</p>{% endif %}{% if can_retry and not selected.sent_at %}<form method="post">{% csrf_token %}<input type="hidden" name="selected" value="{{ selected.pk }}"><button class="mail-button" name="action" value="retry">{% translate "Retry delivery" %}</button></form>{% endif %}</div>{% endif %}
+        </article>
+        {% endif %}
+      </div>
+    </section>
+  </div>
+  {% if composing %}
+  <section class="mail-composer" aria-labelledby="compose-title">
+    <header><h2 id="compose-title">{% translate "New message" %}</h2><a href="{{ list_url }}" aria-label="{% translate 'Close compose' %}">×</a></header>
+    <form method="post" class="mail-compose-form" data-compose-form>
+      {% csrf_token %}<input type="hidden" name="action" value="send">
+      {{ compose_form.non_field_errors }}
+      {% for field in compose_form %}<div class="mail-compose-field{% if field.errors %} invalid{% endif %}"><label for="{{ field.id_for_label }}">{{ field.label }}</label>{{ field }}{% if field.name == 'from_alias' %}<span class="mail-alias-domain">@{{ domain }}</span>{% endif %}{{ field.errors }}</div>{% endfor %}
+      <footer><button type="submit" class="mail-button mail-primary">{% translate "Send email" %} <span aria-hidden="true">↗</span></button><a class="mail-button" href="{{ list_url }}">{% translate "Discard" %}</a><span>{% translate "Messages are queued for delivery." %}</span></footer>
+    </form>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}

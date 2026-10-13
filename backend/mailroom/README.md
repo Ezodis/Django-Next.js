@@ -39,3 +39,21 @@ commit can duplicate a message; exactly-once delivery requires provider idempote
 
 Installing the app does not configure DNS or activate provider accounts. Receiving
 and sending each require per-project provider/domain activation.
+
+## Unified admin workspace
+
+Admin shows one Inbox entry for the mailbox. Its workspace contains Inbox,
+Unread, Sent, Outbox and Archive, a searchable message list, a reading pane,
+attachments, compose and reply. Search covers subject, addresses and message text;
+results are paginated in batches of 30 without loading full MIME payloads.
+Bulk read/unread/archive controls and delivery retry require the corresponding
+model change permissions. Compose requires outgoing add permission. All writes
+require CSRF protection; viewing a message does not change it through a GET.
+Outgoing-only users cannot see received mail. Legacy admin URLs remain available
+for bookmarked forms but are hidden from navigation.
+
+The interface follows Django admin's light/dark theme and adapts to small screens.
+`/` focuses search; `c` opens compose outside input fields. Edited compose forms
+warn before leaving the page; Discard explicitly abandons the current form.
+Drafts are not stored automatically. Authored labels use Django template i18n;
+message content is never sent to the web interface translation provider.
