@@ -36,9 +36,11 @@ export function buildBackendRedirects(trailingSlash = false, skipNormalization =
   const rules = [{source: '/admin:slash((?!/)$)', destination: '/admin/', permanent: false}];
   if (skipNormalization) return rules;
   const exempt = '(?!admin(?:/|$)|static(?:/|$)|media(?:/|$)|\\.well-known(?:/|$))';
+  // Next.js adds an optional slash to custom redirect matchers. Anchor the
+  // slashless capture itself so a canonical /page/ cannot redirect to itself.
   if (trailingSlash) rules.push(
     {source: `/:file(${exempt}(?:[^/]+/)*[^/]+\\.\\w+)/`, destination: '/:file', permanent: true},
-    {source: `/:page(${exempt}(?:[^/]+/)*[^/\\.]+)`, destination: '/:page/', permanent: true});
+    {source: `/:page(${exempt}(?:[^/]+/)*[^/\\.]+$)`, destination: '/:page/', permanent: true});
   else rules.push({source: `/:page(${exempt}.+)/`, destination: '/:page', permanent: true});
   return rules;
 }

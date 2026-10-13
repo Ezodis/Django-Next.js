@@ -261,3 +261,32 @@ test('admin slashes are exempt from frontend canonicalization',()=>{
  }
  assert.equal(routing.buildBackendRedirects(false,true).length,1);
 });
+
+test('compiled Next.js redirects reach a stable URL in at most one hop',async()=>{
+ const {unstable_getResponseFromNextConfig:request}=require('next/experimental/testing/server');
+ const routing=sharedRoutingModule();
+ for(const trailingSlash of [false,true]){
+  for(const basePath of ['', '/portal']){
+   const nextConfig=routing.withSharedDevConfig({basePath,trailingSlash});
+   const cases=[['/',null],['/admin','/admin/'],['/admin/',null],
+    ['/admin/login/',null],['/static/admin/css/base.css',null],['/media/photo.png',null],
+    ['/.well-known/acme-challenge/token',null],['/.well-known/acme-challenge/token/',null],
+    ['/favicon.ico',null],['/favicon.ico/','/favicon.ico']];
+   for(const page of ['/games','/games/exile','/login','/api/session','/version/1.2/settings']){
+    cases.push([page,trailingSlash?`${page}/`:null],[`${page}/`,trailingSlash?null:page]);
+   }
+   for(const [source,destination] of cases){
+    const url=`https://example.test${basePath}${source}?next=%2Fgames%2F&lang=es`;
+    const response=await request({url,nextConfig});
+    const location=response.headers.get('location');
+    assert.equal(location,destination?new URL(`${basePath}${destination}?next=%2Fgames%2F&lang=es`,url).href:null,
+     `trailingSlash=${trailingSlash} ${url}`);
+    if(location){
+     assert.notEqual(location,url,'a redirect must not target its own URL');
+     const canonical=await request({url:location,nextConfig});
+     assert.equal(canonical.headers.get('location'),null,`canonical URL must be stable: ${location}`);
+    }
+   }
+  }
+ }
+});

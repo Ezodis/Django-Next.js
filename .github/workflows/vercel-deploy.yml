@@ -57,6 +57,13 @@ jobs:
         if: steps.configuration.outputs.enabled == 'true'
         run: npm install -g vercel@latest
 
+      - name: Check shared routing before deployment
+        if: steps.configuration.outputs.enabled == 'true'
+        working-directory: frontend/web
+        run: |
+          npm ci --no-fund
+          node --test localization/tests.cjs
+
       - name: Configure monorepo root and supported runtime
         if: steps.configuration.outputs.enabled == 'true'
         env:
