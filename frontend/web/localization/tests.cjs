@@ -223,3 +223,40 @@ test('legacy manual preferences migrate before paint without reload loops',()=>{
  const automatic=compiledModule.exports.manualLanguageBootstrap('language','UI_LANGUAGE','auto');
  cookie='UI_LANGUAGE=de';context.localStorage.getItem=()=> 'auto';vm.runInNewContext(automatic,context);assert.equal(cookie,'UI_LANGUAGE=');assert.equal(reloads,2);
 });
+
+function sharedRoutingModule(){
+ const ts=require('typescript'),Module=require('node:module');
+ const file=path.join(__dirname,'../next.config.shared.ts'),loaded=new Module(file,module);
+ loaded.filename=file;loaded.paths=Module._nodeModulePaths(__dirname);
+ const original=loaded.require.bind(loaded);
+ loaded.require=id=>id==='./localization/prepare.cjs'?{prepare:()=>{},verify:()=>{}}:original(id);
+ loaded._compile(ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,esModuleInterop:true}}).outputText,file);
+ return loaded.exports;
+}
+test('admin proxy is project-independent and preserves custom rewrites',async()=>{
+ const routing=sharedRoutingModule(),before={...process.env};
+ try{
+  process.env.BACKEND_URL='https://backend.example.test';process.env.NEXT_PUBLIC_API_URL='/api';
+  const custom={source:'/custom',destination:'/other'};
+  const config=routing.withSharedDevConfig({rewrites:async()=>[custom]});
+  const rules=await config.rewrites();assert.deepEqual(rules.afterFiles,[custom]);
+  assert.equal(rules.beforeFiles[0].destination,'https://backend.example.test/admin/:path*/');
+  assert.equal(rules.beforeFiles[1].destination,'https://backend.example.test/static/:path*');
+  delete process.env.BACKEND_URL;process.env.NEXT_PUBLIC_API_URL='https://second.example.test/api';
+  assert.equal(routing.buildBackendRewrites()[0].destination,'https://second.example.test/admin/:path*/');
+  process.env.NEXT_PUBLIC_API_URL='/api';assert.deepEqual(routing.buildBackendRewrites(),[]);
+ }finally{process.env=before;}
+});
+test('admin slashes are exempt from frontend canonicalization',()=>{
+ const routing=sharedRoutingModule();
+ for(const trailing of [false,true]){
+  const rules=routing.buildBackendRedirects(trailing);assert.equal(rules[0].destination,'/admin/');
+  const exact=require('next/dist/compiled/path-to-regexp').pathToRegexp(rules[0].source);
+  assert.equal(exact.test('/admin'),true);assert.equal(exact.test('/admin/'),false);
+  const pattern=trailing?rules[2].source:rules[1].source;
+  const regex=new RegExp('^'+pattern.slice(pattern.indexOf('(')+1,pattern.lastIndexOf(')'))+'$');
+  for(const path of ['admin','admin/login','admin/mailroom/receivedemail','static/admin/css/base.css','media/file.png'])assert.equal(regex.test(path),false,path);
+  assert.equal(regex.test('checkout'),true);
+ }
+ assert.equal(routing.buildBackendRedirects(false,true).length,1);
+});

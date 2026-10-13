@@ -21,12 +21,56 @@ export function buildAllowedDevOrigins(): string[] {
   return [...origins];
 }
 
+// Main-domain backend routes mirror the local proxy; addresses are project-owned.
+export function buildBackendRewrites() {
+  const value = process.env.BACKEND_URL?.trim() || process.env.NEXT_PUBLIC_API_URL?.trim();
+  if (!value || !/^https?:\/\//i.test(value)) return [];
+  const target = new URL(value);
+  if (target.username || target.password || target.search || target.hash) throw new Error('Backend URL must not contain credentials, query or fragment');
+  return ['admin', 'static', 'media'].map(prefix => ({source: `/${prefix}/:path*`,
+    destination: `${target.origin}/${prefix}/:path*${prefix === 'admin' ? '/' : ''}`}));
+}
+
+export function buildBackendRedirects(trailingSlash = false, skipNormalization = false) {
+  const rules = [{source: '/admin:slash((?!/)$)', destination: '/admin/', permanent: false}];
+  if (skipNormalization) return rules;
+  const exempt = '(?!admin(?:/|$)|static(?:/|$)|media(?:/|$)|\\.well-known(?:/|$))';
+  if (trailingSlash) rules.push(
+    {source: `/:file(${exempt}(?:[^/]+/)*[^/]+\\.\\w+)/`, destination: '/:file', permanent: true},
+    {source: `/:page(${exempt}(?:[^/]+/)*[^/\\.]+)`, destination: '/:page/', permanent: true});
+  else rules.push({source: `/:page(${exempt}.+)/`, destination: '/:page', permanent: true});
+  return rules;
+}
+
 export function withSharedDevConfig(projectConfig: NextConfig): NextConfig {
   if (process.env.NODE_ENV === 'production') verify(process.cwd());
   else prepare(process.cwd());
   const projectWebpack = projectConfig.webpack;
+  const projectRewrites = projectConfig.rewrites;
+  const projectRedirects = projectConfig.redirects;
+  const projectHeaders = projectConfig.headers;
   return {
     ...projectConfig,
+    skipTrailingSlashRedirect: true,
+    async redirects() {
+      return [...(projectRedirects ? await projectRedirects() : []),
+        ...buildBackendRedirects(projectConfig.trailingSlash, projectConfig.skipTrailingSlashRedirect)];
+    },
+    async rewrites() {
+      const existing = projectRewrites ? await projectRewrites() : [];
+      const backend = buildBackendRewrites();
+      return Array.isArray(existing)
+        ? {beforeFiles: backend, afterFiles: existing, fallback: []}
+        : {...existing, beforeFiles: [...backend, ...(existing.beforeFiles ?? [])]};
+    },
+    async headers() {
+      return [...(projectHeaders ? await projectHeaders() : []), {
+        source: '/admin/:path*', headers: [
+          {key: 'Cache-Control', value: 'private, no-store'},
+          {key: 'X-Robots-Tag', value: 'noindex, nofollow'},
+        ],
+      }];
+    },
     outputFileTracingRoot: projectConfig.outputFileTracingRoot ?? process.cwd(),
     outputFileTracingIncludes: {...projectConfig.outputFileTracingIncludes, '/*': [...(projectConfig.outputFileTracingIncludes?.['/*'] ?? []), './messages/automatic/*.json']},
     allowedDevOrigins: [...new Set([
