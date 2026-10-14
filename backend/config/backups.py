@@ -321,7 +321,13 @@ def github_upload(path, root, api=None, recipient=None):
         raise ValueError('GitHub uploads require a valid age-encrypted snapshot')
     checksum = path.with_name(path.name + '.sha256')
     checksum.write_text(digest(path) + '  ' + path.name + '\n', encoding='ascii')
-    updates = []
+    # The recovery branch contains data rather than an application. Disable
+    # deploy hooks in the configured web root before publishing its next commit.
+    deployment_guard = b'{"git":{"deploymentEnabled":false}}\n'
+    guard_blob = api('git/blobs', {'content': base64.b64encode(deployment_guard).decode('ascii'),
+                                 'encoding': 'base64'})['sha']
+    updates = [{'path': 'frontend/web/vercel.json', 'mode': '100644',
+                'type': 'blob', 'sha': guard_blob}]
     for artifact in (path, checksum):
         content = artifact.read_bytes()
         blob = api('git/blobs', {'content': base64.b64encode(content).decode('ascii'), 'encoding': 'base64'})['sha']
@@ -333,7 +339,7 @@ def github_upload(path, root, api=None, recipient=None):
         head, tree, existing = backup_tree(api)
         names = {entry['path'] for entry in existing if entry['path'].startswith('snapshots/local/snapshot_')
                  and entry['path'].endswith('.tar.gz.age')}
-        names.add(updates[0]['path'])
+        names.add('snapshots/local/' + path.name)
         deletions = [{'path': name + suffix, 'mode': '100644', 'type': 'blob', 'sha': None}
                      for name in sorted(names, reverse=True)[7:] for suffix in ('', '.sha256')
                      if any(entry['path'] == name + suffix for entry in existing)]

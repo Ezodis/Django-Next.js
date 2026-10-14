@@ -1,9 +1,8 @@
 name: Deploy to Vercel
 
 on:
-  push:
-    branches:
-      - main
+  # Vercel's Git integration publishes main independently of Actions availability.
+  # Keep this workflow for explicit deployments and diagnostics, avoiding duplicates.
   workflow_dispatch:
     inputs:
       environment:

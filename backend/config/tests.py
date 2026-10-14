@@ -137,7 +137,11 @@ class PortableBackupTests(SimpleTestCase):
                     return {'tree': [{'path': 'snapshots/production.tar.gz.age', 'type': 'blob', 'sha': 'production'}]}
                 if endpoint == 'git/trees':
                     self.assertEqual(data['base_tree'], 'existing-tree')
-                    self.assertTrue(all(item['path'].startswith('snapshots/local/') for item in data['tree']))
+                    self.assertTrue(all(item['path'].startswith('snapshots/local/')
+                                        or item['path'] == 'frontend/web/vercel.json'
+                                        for item in data['tree']))
+                    self.assertEqual(sum(item['path'] == 'frontend/web/vercel.json'
+                                         for item in data['tree']), 1)
                     return {'sha': 'new-tree'}
                 if endpoint == 'git/commits':
                     return {'sha': 'new-commit'}
@@ -155,8 +159,9 @@ class PortableBackupTests(SimpleTestCase):
                 result = github_upload(archive, root, api=api, recipient='public-recipient')
             self.assertTrue(result.endswith('/snapshots/local'))
             self.assertTrue(archive.exists())
-            self.assertEqual(len(published), 2)
-            self.assertTrue(published[0].startswith(b'age-encryption.org/v1'))
+            self.assertEqual(len(published), 3)
+            self.assertEqual(json.loads(published[0]), {'git': {'deploymentEnabled': False}})
+            self.assertTrue(published[1].startswith(b'age-encryption.org/v1'))
             self.assertNotIn(b'private content', b''.join(published))
             self.assertEqual([c[1]['parents'] for c in calls if c[0] == 'git/commits'], [['original'], ['concurrent']])
 

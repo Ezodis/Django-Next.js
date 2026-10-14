@@ -1,7 +1,7 @@
 {
   "framework": "nextjs",
   "installCommand": "npm ci --no-fund",
-  "buildCommand": "npm run build",
+  "buildCommand": "node --test localization/tests.cjs && npm run build",
   "outputDirectory": ".next",
   "headers": [
     {
@@ -19,6 +19,9 @@
     }
   ],
   "git": {
-    "deploymentEnabled": false
+    "deploymentEnabled": {
+      "**": false,
+      "main": true
+    }
   }
 }

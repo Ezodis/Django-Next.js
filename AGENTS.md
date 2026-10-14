@@ -173,6 +173,13 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 
 ## Dependency maintenance
 
+- Vercel publishes `main` through its native Git integration, independently of
+  GitHub Actions billing availability. The shared `frontend/web/vercel.json`
+  runs routing tests before the production build; localization coverage remains
+  enforced by that build. Keep the Vercel Actions workflow manual-only to avoid
+  duplicate deployments. Backup branches carry a disabled-deployment guard in
+  the configured web root and must never deploy encrypted recovery archives.
+
 - The template owns core backend requirements and the frontend framework/tool
   versions. Template sync merges these versions into project manifests while
   retaining project packages, identity, routes, environment files and custom
