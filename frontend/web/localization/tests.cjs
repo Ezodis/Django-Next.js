@@ -134,7 +134,10 @@ test('conditional, logical and mapped JSX translate every nested interface phras
  assert.ok(!Object.values(result.messages).includes('item.name'));
 });
 
-test('server catalog refreshes when development discovers new interface phrases',async()=>{
+test('server catalog refreshes when development discovers new interface phrases',async t=>{
+ const environment=process.env.NODE_ENV;
+ process.env.NODE_ENV='development';
+ t.after(()=>{if(environment===undefined)delete process.env.NODE_ENV;else process.env.NODE_ENV=environment;});
  const fs=require('node:fs'),path=require('node:path'),ts=require('typescript'),Module=require('node:module');
  let manifest=JSON.stringify({[textKey('First')]: 'First'}),calls=0;
  const file=path.join(__dirname,'server.ts'),compiledModule=new Module(file,module);
