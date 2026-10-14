@@ -84,3 +84,23 @@ placeholders, private values, source changes and incomplete locale catalogs.
 Aliases of `useInterfaceTranslator()` are discovered automatically. Interpolated
 copy must use `AutoText` with a static source and separate values; passing a
 dynamic template directly into the string translator fails compilation.
+
+Local authored UI labels are also traced through object/tuple destructuring,
+array spreads, mapped or filtered lists, indexed label dictionaries, and props
+passed to components defined in the same file. Nested authored choices in a
+phrase such as `Browse: ${sortLabels[sort]}` are registered as complete phrase
+alternatives, so the selected choice is translated along with its caption.
+Rendering translates the display value only; option IDs, URLs, event handlers,
+input values, and unknown data remain unchanged. Large combinations require
+explicit `AutoText` interpolation instead of an unbounded generated catalog.
+
+Imported components cannot be inspected reliably by the per-file compiler.
+Authored text passed to their UI props (`label`, `title`, `placeholder`, `alt`,
+accessibility labels, and similar captions) now fails compilation unless it is
+explicitly localized. Pass a string from `useInterfaceTranslator()`, or use the
+project's existing translation API. Preserve original content with `translate="no"`
+on its container; keep brand and original-title exceptions in the project's
+`localization.preserve` list. Private dynamic values are not translation sources.
+These checks run during source preparation, coverage verification, and builds.
+Catalog completeness does not establish linguistic quality; reviewed wording
+and accents remain project-owned and are retained during regeneration.

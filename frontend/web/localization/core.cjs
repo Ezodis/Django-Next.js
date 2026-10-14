@@ -15,8 +15,11 @@ function direction(locale){return ['ar','he','fa','ur'].includes(locale)?'rtl':'
 function tokens(text){return (text.match(/\{v\d+\}/g)||[]).sort().join(',');}
 function matchAuthoredPhrase(value,candidates){
  if(typeof value!=='string')return undefined;
- for(const source of candidates??[]){
-  if(value===source)return {source};
+ const exact=candidates?.find(source=>source===value);
+ if(exact!==undefined)return {source:exact};
+ // Prefer authored alternatives over broad templates, regardless of list order.
+ const ordered=[...(candidates??[])].sort((a,b)=>tokens(a).split(',').filter(Boolean).length-tokens(b).split(',').filter(Boolean).length||b.replace(/\{v\d+\}/g,'').length-a.replace(/\{v\d+\}/g,'').length);
+ for(const source of ordered){
   const indices=[];
   const pattern=source.split(/(\{v\d+\})/g).map(part=>{
    const token=/^\{v(\d+)\}$/.exec(part);

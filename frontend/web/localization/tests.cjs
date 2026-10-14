@@ -29,6 +29,53 @@ test('helper option placeholders are discovered without translating input values
  for(const phrase of ['Recipient','Additional information'])assert.equal(defaults.messages[textKey(phrase)],phrase);
 });
 
+test('mapped labels, spreads and local component props expose complete authored phrases',()=>{
+ const source="function Tag({label}){return <span>{label}</span>} const tags=[...(sort?[{label:`Browse: ${({newest:'Newest',oldest:'Oldest'}[sort]||sort)}`}]:[]),...terms.map(term=>({label:`Author: ${term}`}))]; export default()=>tags.filter(Boolean).map(tag=><Tag label={tag.label}/>);";
+ const result=compile(source,'page.tsx');
+ for(const phrase of ['Browse: Newest','Browse: Oldest','Browse: {v0}','Author: {v0}'])assert.equal(result.messages[textKey(phrase)],phrase);
+ assert.match(result.code,/source=\{label\} candidates=/);
+ assert.match(result.code,/<Tag label=\{tag.label\}/);
+ assert.ok(!Object.values(result.messages).includes('newest'));
+});
+
+test('tuple options, object destructuring, aliases and indexed UI dictionaries preserve IDs',()=>{
+ const result=compile("const options=[['new','Newest'],['old','Oldest']] as const; const extra={label:'Ready'}; const labels={low:'Lowest price',high:'Highest price'}; export default()=> <>{options.map(([id,caption])=><button data-id={id}>{caption}</button>)}{[{...extra}].map(({label:caption})=><p>{caption}</p>)}<span>{labels[sort]}</span></>;",'page.tsx');
+ for(const phrase of ['Newest','Oldest','Ready','Lowest price','Highest price'])assert.equal(result.messages[textKey(phrase)],phrase);
+ assert.ok(!Object.values(result.messages).includes('new'));
+ assert.match(result.code,/data-id=\{id\}/);
+});
+
+test('private values, computed private fields, defaults and opted-out content stay unregistered',()=>{
+ const result=compile("const personName='Private Person';const secrets={a:'Private credential'};function Card({fullName='Private Default'}){return <p>{fullName}</p>} const page=<><Card/><p>{personName}</p><p>{`Owner: ${personName}`}</p><p>{secrets[key]}</p><span title={`${personName} (@${username})`}/><section translate='no'>{[{label:'Private label'}].map(item=><p>{item.label}</p>)}</section></>;",'page.tsx');
+ for(const phrase of ['Private Person','Private credential','Private Default','Private label'])assert.ok(!Object.values(result.messages).some(text=>text.includes(phrase)),phrase);
+ assert.equal(result.messages[textKey('Owner: {v0}')],'Owner: {v0}');
+ assert.match(result.code,/\{secrets\[key\]\}/);
+});
+
+test('imported widgets require explicit localization only for authored UI props',()=>{
+ for(const prop of ['label','title','placeholder','aria-label','alt'])assert.throws(()=>compile(`import Widget from './widget';export default()=> <Widget ${prop}="New interface caption"/>;`,'page.tsx'),/page.tsx:1: Interface prop .* useInterfaceTranslator/);
+ assert.doesNotThrow(()=>compile("import Widget from './widget';const translate=useInterfaceTranslator();export default()=> <><Widget label={translate('Ready')} value={password}/><Widget title={`${fullName} (@${username})`} placeholder='123456'/><div translate='no'><Widget title='Private document'/></div></>;",'page.tsx'));
+});
+
+test('specific alternatives win over generic interpolation templates',()=>{
+ const {matchAuthoredPhrase}=require('./core.cjs');
+ assert.deepEqual(matchAuthoredPhrase('Browse: Newest',['Browse: {v0}','Browse: Newest']),{source:'Browse: Newest'});
+ assert.deepEqual(matchAuthoredPhrase('Show 3 newest books',['Show {v0}','Show {v0} newest books']),{source:'Show {v0} newest books',values:['3']});
+});
+
+test('nested template alternatives localize on the first render without changing handlers or input values',()=>{
+ const React=require('react'),{renderToStaticMarkup}=require('react-dom/server'),ts=require('typescript'),Module=require('node:module');
+ const file=path.join(__dirname,'fixture.tsx');
+ const source="function Tag({label}){return <span>{label}</span>} const sortLabels={newest:'Newest',oldest:'Oldest'}; export default function Page(){const tags=[{label:`Browse: ${sortLabels['newest']}`}];return <><button title={`Browse: ${sortLabels['newest']}`}>{`Browse: ${sortLabels['newest']}`}</button>{tags.map(tag=><Tag key={tag.label} label={tag.label}/>)}<input value='Newest' readOnly/></>;}";
+ const result=compile(source,file),loaded=new Module(file,module);loaded.filename=file;loaded.paths=Module._nodeModulePaths(__dirname);
+ require.extensions['.tsx']=(mod,name)=>mod._compile(ts.transpileModule(fs.readFileSync(name,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,jsx:ts.JsxEmit.ReactJSX,esModuleInterop:true}}).outputText,name);
+ loaded._compile(ts.transpileModule(result.code,{compilerOptions:{module:ts.ModuleKind.CommonJS,jsx:ts.JsxEmit.ReactJSX,esModuleInterop:true}}).outputText,file);
+ const {AutomaticTranslationProvider}=require('./client.tsx');
+ const html=renderToStaticMarkup(React.createElement(AutomaticTranslationProvider,{initial:{language:'es',catalog:{[textKey('Browse: Newest')]:'Explorar: Más recientes'}}},React.createElement(loaded.exports.default)));
+ assert.equal((html.match(/Explorar: Más recientes/g)||[]).length,3);
+ assert.ok(!html.includes('Browse:'));assert.ok(html.includes('value="Newest"'));
+});
+
 test('coverage verification rejects undiscovered UI and incomplete locales without modifying files',()=>{
  const {prepare,verify}=require('./prepare.cjs');
  const {locales}=require('./core.cjs');
@@ -134,6 +181,8 @@ test('JSX entities are decoded once and remain valid text',()=>{
 test('select option values remain their original values while labels translate',()=>{
  const result=compile('<select><option>Weekly</option><option value="month">Monthly</option></select>','page.tsx');
  assert.match(result.code,/value="Weekly"/);assert.match(result.code,/value="month"/);
+ const mapped=compile("const options=[{label:'Newest'}];const page=<select>{options.map(({label})=><option key={label}>{label}</option>)}</select>;",'page.tsx');
+ assert.match(mapped.code,/<option key=\{label\} value=\{label\}/);
 });
 test('runtime translation batches static phrases, deduplicates requests and caches results',async()=>{
  const source=Object.fromEntries(['Welcome','Save'].map(text=>[textKey(text),text]));let calls=0;
