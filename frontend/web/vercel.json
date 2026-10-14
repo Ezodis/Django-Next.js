@@ -2,6 +2,7 @@
   "framework": "nextjs",
   "installCommand": "npm ci --no-fund",
   "buildCommand": "node --test localization/tests.cjs && npm run build",
+  "ignoreCommand": "if [ \"$VERCEL_ENV\" = production ]; then exit 1; else exit 0; fi",
   "outputDirectory": ".next",
   "headers": [
     {
