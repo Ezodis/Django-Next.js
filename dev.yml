@@ -65,54 +65,54 @@ services:
       - default
       - traefik
     labels:
-      # Tell global Traefik to route ${PROJECT_HOST}.localhost/api → this container
+      # Tell global Traefik to route ${PROJECT_HOST}.local/api → this container
       - "traefik.enable=true"
       - "traefik.docker.network=traefik"
       # Each local hostname is explicitly scoped to this project.
       # Tunnel routes are registered by hostname via the Traefik file provider.
       # Unknown hosts must never fall through to another project.
       # API routes — localhost (high priority)
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api.rule=Host(`${PROJECT_HOST}.localhost`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api.rule=Host(`${PROJECT_HOST}.local`) && PathPrefix(`/api`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api.entrypoints=web"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api.priority=100"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api.middlewares=${COMPOSE_PROJECT_NAME}-strip-api,${COMPOSE_PROJECT_NAME}-compress"
       - "traefik.http.middlewares.${COMPOSE_PROJECT_NAME}-strip-api.stripprefix.prefixes=/api"
       - "traefik.http.middlewares.${COMPOSE_PROJECT_NAME}-compress.compress=true"
       # Admin / static / media routes — localhost (high priority)
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin.rule=Host(`${PROJECT_HOST}.localhost`) && PathPrefix(`/admin`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin.rule=Host(`${PROJECT_HOST}.local`) && PathPrefix(`/admin`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin.entrypoints=web"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin.priority=100"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin.middlewares=${COMPOSE_PROJECT_NAME}-compress"
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static.rule=Host(`${PROJECT_HOST}.localhost`) && PathPrefix(`/static`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static.rule=Host(`${PROJECT_HOST}.local`) && PathPrefix(`/static`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static.entrypoints=web"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static.priority=100"
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media.rule=Host(`${PROJECT_HOST}.localhost`) && PathPrefix(`/media`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media.rule=Host(`${PROJECT_HOST}.local`) && PathPrefix(`/media`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media.entrypoints=web"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media.priority=100"
       # Backend service port
       - "traefik.http.services.${COMPOSE_PROJECT_NAME}-backend.loadbalancer.server.port=8000"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api.service=${COMPOSE_PROJECT_NAME}-backend"
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.rule=Host(`${PROJECT_HOST}.localhost`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.rule=Host(`${PROJECT_HOST}.local`) && PathPrefix(`/api`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.entrypoints=websecure"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.priority=100"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.middlewares=${COMPOSE_PROJECT_NAME}-strip-api,${COMPOSE_PROJECT_NAME}-compress"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.service=${COMPOSE_PROJECT_NAME}-backend"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-api-https.tls=true"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin.service=${COMPOSE_PROJECT_NAME}-backend"
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.rule=Host(`${PROJECT_HOST}.localhost`) && PathPrefix(`/admin`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.rule=Host(`${PROJECT_HOST}.local`) && PathPrefix(`/admin`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.entrypoints=websecure"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.priority=100"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.middlewares=${COMPOSE_PROJECT_NAME}-compress"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.service=${COMPOSE_PROJECT_NAME}-backend"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-admin-https.tls=true"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static.service=${COMPOSE_PROJECT_NAME}-backend"
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static-https.rule=Host(`${PROJECT_HOST}.localhost`) && PathPrefix(`/static`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static-https.rule=Host(`${PROJECT_HOST}.local`) && PathPrefix(`/static`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static-https.entrypoints=websecure"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static-https.priority=100"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static-https.service=${COMPOSE_PROJECT_NAME}-backend"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-static-https.tls=true"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media.service=${COMPOSE_PROJECT_NAME}-backend"
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media-https.rule=Host(`${PROJECT_HOST}.localhost`) && PathPrefix(`/media`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media-https.rule=Host(`${PROJECT_HOST}.local`) && PathPrefix(`/media`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media-https.entrypoints=websecure"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media-https.priority=100"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-media-https.service=${COMPOSE_PROJECT_NAME}-backend"
@@ -149,7 +149,7 @@ services:
       WATCHPACK_POLLING_INTERVAL: "${WATCHPACK_POLLING_INTERVAL:-1000}"
       CHOKIDAR_USEPOLLING: "${CHOKIDAR_USEPOLLING:-true}"
       CHOKIDAR_INTERVAL: "${CHOKIDAR_INTERVAL:-1000}"
-      NEXT_PUBLIC_URL: "https://${PROJECT_HOST}.localhost"
+      NEXT_PUBLIC_URL: "https://${PROJECT_HOST}.local"
       NEXT_PUBLIC_API_URL: "/api"
     volumes:
       - ./frontend/web:/app:z
@@ -157,7 +157,7 @@ services:
       - frontend_node_modules:/app/node_modules
       - frontend_next:/app/.next
     # No host port binding — frontend is ONLY accessible via Traefik at
-    # https://${PROJECT_HOST}.localhost (port 443). Direct :3000 access is
+    # https://${PROJECT_HOST}.local (port 443). Direct :3000 access is
     # intentionally blocked so HMR WebSocket always goes through port 80.
     depends_on:
       backend:
@@ -183,30 +183,30 @@ services:
       # Reason: Traefik applies middleware before inspecting whether a request
       # is a WebSocket upgrade. The compress middleware rewrites headers in a
       # way that prevents the Upgrade handshake from completing, killing HMR
-      # for BOTH the initial .localhost load and the tunnel hostname.
+      # for BOTH the initial .local load and the tunnel hostname.
       # Compression on a Next.js dev server is not worth the tradeoff anyway.
       #
       # passHostHeader=true ensures Next.js inside the container sees the real
-      # public Host header (e.g. "myapp.localhost", no port), so the HMR
+      # public Host header (e.g. "myapp.local", no port), so the HMR
       # client script it injects into every page builds the WebSocket URL as:
-      #   ws://myapp.localhost/_next/webpack-hmr  (port 80 = Traefik) ✓
-      # instead of ws://myapp.localhost:3000/...  (unreachable from browser)
+      #   ws://myapp.local/_next/webpack-hmr  (port 80 = Traefik) ✓
+      # instead of ws://myapp.local:3000/...  (unreachable from browser)
       #
-      # .localhost hostname (high priority)
+      # .local hostname (high priority)
       # Redirect the whole local site before it loads: secure session cookies
       # and API requests must share the same HTTPS origin.
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-local-https-redirect.rule=Host(`${PROJECT_HOST}.localhost`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-local-https-redirect.rule=Host(`${PROJECT_HOST}.local`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-local-https-redirect.entrypoints=web"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-local-https-redirect.priority=1000"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-local-https-redirect.service=noop@internal"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-local-https-redirect.middlewares=${COMPOSE_PROJECT_NAME}-local-https-redirect"
       - "traefik.http.middlewares.${COMPOSE_PROJECT_NAME}-local-https-redirect.redirectscheme.scheme=https"
       - "traefik.http.middlewares.${COMPOSE_PROJECT_NAME}-local-https-redirect.redirectscheme.permanent=true"
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend.rule=Host(`${PROJECT_HOST}.localhost`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend.rule=Host(`${PROJECT_HOST}.local`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend.entrypoints=web"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend.priority=10"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend.service=${COMPOSE_PROJECT_NAME}-frontend"
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend-https.rule=Host(`${PROJECT_HOST}.localhost`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend-https.rule=Host(`${PROJECT_HOST}.local`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend-https.entrypoints=websecure"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend-https.priority=10"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-frontend-https.service=${COMPOSE_PROJECT_NAME}-frontend"

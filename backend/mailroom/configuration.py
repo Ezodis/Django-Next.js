@@ -9,6 +9,12 @@ def mailbox_domain():
             or getattr(settings, "DOMAIN", "") or "").strip().lower()
 
 
+def inbound_domains():
+    """Accept explicitly retained domains while outgoing mail uses the primary one."""
+    aliases = os.getenv("MAILBOX_LEGACY_DOMAINS") or getattr(settings, "MAILBOX_LEGACY_DOMAINS", "")
+    return {domain.strip().lower() for domain in [mailbox_domain(), *aliases.split(",")] if domain.strip()}
+
+
 def default_alias():
     address = parseaddr(getattr(settings, "DEFAULT_FROM_EMAIL", ""))[1]
     if "@" in address and address.rsplit("@", 1)[1].lower() == mailbox_domain():

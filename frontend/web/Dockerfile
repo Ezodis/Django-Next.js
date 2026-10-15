@@ -6,8 +6,8 @@ WORKDIR /app
 # Copy package files first for better caching
 COPY frontend/web/package*.json ./
 
-# Install JS dependencies
-RUN npm ci --no-fund --loglevel=error && sha256sum package.json package-lock.json > node_modules/.dependency-manifest.sha256
+# Install hooks may write public assets before application source is copied.
+RUN mkdir -p public && npm ci --no-fund --loglevel=error && sha256sum package.json package-lock.json > node_modules/.dependency-manifest.sha256
 
 # Copy app source (the actual source will be mounted as volume in dev)
 COPY frontend/web/ ./

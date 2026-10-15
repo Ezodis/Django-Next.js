@@ -16,6 +16,11 @@ credentials. Django email backend/provider configuration stays in `backend/proje
 Existing project email integrations are unchanged. Console, dummy and file
 backends leave messages queued instead of claiming actual delivery.
 
+During a domain move, `MAILBOX_LEGACY_DOMAINS` can contain a comma-separated list
+of previous domains accepted by the signed inbound endpoint. Outgoing messages
+still use `MAILBOX_DOMAIN` or `DOMAIN`. Keep the old domain's MX/Worker route
+active until mail addressed to it is no longer needed.
+
 For incoming email, deploy `cloudflare-worker.js` as an Email Routing Worker.
 Set `INBOUND_URL` to this project's backend origin plus `/mailroom/inbound/`.
 Set a unique `INBOUND_EMAIL_SECRET` both on the Worker and this backend.

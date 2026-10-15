@@ -289,6 +289,14 @@ def bootstrap_environment(root):
     target.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 
+def resource_namespace(root):
+    default = re.sub(r'[^a-z0-9]', '', Path(root).name.lower())
+    value = project_option(root, 'DEV_RESOURCE_NAMESPACE', default)
+    if not isinstance(value, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}', value):
+        raise ValueError('DEV_RESOURCE_NAMESPACE must be a valid Compose namespace')
+    return value
+
+
 def environment_values(root, include_environment=False):
     """Read simple dotenv assignments as data, preserving embedded '=' signs."""
     # Host tools read the selected checkout. Inherited project credentials and
@@ -324,7 +332,7 @@ def exposure_check_command(root):
     url = urlsplit(values.get('CLOUDFLARE_TUNNEL_URL', ''))
     if values.get('CLOUDFLARE_TUNNEL_TOKEN') and (url.scheme != 'https' or not url.hostname or url.username or url.password
             or url.path not in ('', '/') or url.query or url.fragment
-            or url.hostname.endswith(('.trycloudflare.com', '.localhost'))
+            or url.hostname.endswith(('.trycloudflare.com', '.localhost', '.local', '.internal'))
             or url.hostname in ('localhost', '127.0.0.1', '::1')):
         raise ValueError('Set a fixed CLOUDFLARE_TUNNEL_URL=https://your-hostname in the root .env')
     command = project_option(root, 'PUBLIC_EXPOSURE_CHECK_COMMAND', [])
@@ -719,6 +727,8 @@ if __name__ == '__main__':
     root, option = sys.argv[1:3]
     if option == 'mobile-apps':
         print('\n'.join(mobile_apps(root)))
+    elif option == 'resource-namespace':
+        print(resource_namespace(root))
     elif option == 'sync-paths':
         print('\n'.join(sync_paths(root)))
     elif option == 'exposure-check-command':

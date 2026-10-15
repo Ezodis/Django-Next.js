@@ -11,7 +11,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from .models import ReceivedEmail
-from .configuration import mailbox_domain, inbound_secret
+from .configuration import inbound_domains, inbound_secret
 
 MAX_MESSAGE_BYTES = 10 * 1024 * 1024
 
@@ -43,8 +43,7 @@ def receive_email(request):
     expected = hmac.new(secret.encode(), prefix + raw, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, signature):
         return JsonResponse({"error": "Invalid delivery signature."}, status=403)
-    domain = mailbox_domain()
-    if recipient.count("@") != 1 or not recipient.rsplit("@", 1)[0] or recipient.rsplit("@", 1)[-1].lower() != domain or len(recipient) > 320 or len(sender) > 320:
+    if recipient.count("@") != 1 or not recipient.rsplit("@", 1)[0] or recipient.rsplit("@", 1)[-1].lower() not in inbound_domains() or len(recipient) > 320 or len(sender) > 320:
         return JsonResponse({"error": "Recipient is outside the mailbox domain."}, status=400)
     message = BytesParser(policy=policy.default).parsebytes(raw)
     body = message.get_body(preferencelist=("plain", "html"))

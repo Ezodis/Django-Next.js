@@ -54,7 +54,7 @@ else:
     for option in ("PROJECT_HOST",):
         local_name = os.getenv(option, "").strip()
         if local_name:
-            local_host = f"{local_name}.localhost"
+            local_host = f"{local_name}.local"
             if local_host not in ALLOWED_HOSTS:
                 ALLOWED_HOSTS.append(local_host)
 
@@ -322,8 +322,8 @@ CSRF_TRUSTED_ORIGINS.extend(
 )
 if DEBUG and os.getenv('PROJECT_HOST'):
     CSRF_TRUSTED_ORIGINS.extend([
-        f"http://{os.environ['PROJECT_HOST']}.localhost",
-        f"https://{os.environ['PROJECT_HOST']}.localhost",
+        f"http://{os.environ['PROJECT_HOST']}.local",
+        f"https://{os.environ['PROJECT_HOST']}.local",
     ])
 
 CORS_EXPOSE_HEADERS = ['Content-Type', 'X-CSRFToken']

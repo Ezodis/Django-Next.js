@@ -136,6 +136,19 @@ if [[ "${1:-}" == "sync" ]]; then
   exec python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" sync "${@:2}"
 fi
 
+if [[ "${1:-}" == lan && "${2:-status}" == certificate ]]; then
+  echo "Public phone HTTPS certificate: $(mkcert -CAROOT)/rootCA.pem"
+  exit 0
+fi
+if [[ "${1:-}" == lan && "${2:-status}" != on ]]; then
+  python3 "$ROOT_DIR/backend/config/network.py" "${2:-status}" --root "$ROOT_DIR" || exit 1
+  if [[ "${2:-status}" == off && "$(uname -s)" == Darwin ]]; then
+    _lan_namespace=$(python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" resource-namespace) || exit 1
+    podman machine ssh "rm -f '/tmp/traefik-dynamic/${_lan_namespace}-lan.yml'" || exit 1
+  fi
+  exit 0
+fi
+
 if [[ "${1:-}" == "watchos" || ( "${1:-}" == "build" && "${3:-}" == "watchos" ) ]]; then
   command -v python3 >/dev/null 2>&1 || { echo "Python 3 is required for watchOS tooling."; exit 1; }
   exec python3 "$ROOT_DIR/backend/config/watchos.py" "$ROOT_DIR" "$@"
@@ -144,7 +157,7 @@ fi
 # Project-owned commands run before bootstrap; discovery reads literals only.
 if [[ "${1:-}" == "_exposure_check_only" ]]; then
   _exposure_output=$(python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" exposure-check-command) || exit 1
-  _exposure_project=$(basename "$ROOT_DIR" | tr -cd 'a-zA-Z0-9.' | tr '[:upper:]' '[:lower:]' | tr -d '.')
+  _exposure_project=$(python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" resource-namespace) || exit 1
   [[ -n "$_exposure_project" ]] || _exposure_project="project-$(printf '%s' "$ROOT_DIR" | cksum | awk '{print $1}')"
   _exposure_backend=$(podman ps --filter "label=com.docker.compose.project=${_exposure_project}" \
     --filter "label=com.docker.compose.service=backend" --format '{{.Names}}' | head -1) || exit 1
@@ -170,6 +183,9 @@ fi
 # project-scoped temporary file.  In particular, project.py compose extensions
 # are extracted below, before the environment bootstrap.
 PROJECT_NAME="$(basename "$ROOT_DIR" | tr -cd 'a-zA-Z0-9.' | tr '[:upper:]' '[:lower:]' | tr -d '.')"
+if command -v python3 >/dev/null; then
+  PROJECT_NAME="$(python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" resource-namespace)" || exit 1
+fi
 [[ -n "$PROJECT_NAME" ]] || PROJECT_NAME="project-$(printf '%s' "$ROOT_DIR" | cksum | awk '{print $1}')"
 PROJECT_DISPLAY_NAME="$(basename "$ROOT_DIR")"
 
@@ -1888,7 +1904,7 @@ _start_cloudflare_tunnel() {
 
   local tunnel_log="/tmp/${PROJECT_NAME}-tunnel.log"
   local tunnel_pid_file="/tmp/${PROJECT_NAME}-tunnel.pid"
-  local _local_host="${PROJECT_HOST}.localhost"
+  local _local_host="${PROJECT_HOST}.local"
 
   # A failed HTTP/DNS/metrics probe is not proof that a tunnel lease died.
   # Let cloudflared reconnect using its existing identity after network loss.
@@ -2016,7 +2032,7 @@ _start_cloudflare_tunnel() {
       echo "⚠️  Cloudflare rate-limited tunnel creation (429 Too Many Requests)"
       echo "   Too many tunnels were created in a short period."
       echo "   ⏳ Wait ~10 minutes, then run ./dev.sh again."
-      echo "   ℹ️  App is still accessible at https://${PROJECT_HOST}.localhost"
+      echo "   ℹ️  App is still accessible at https://${PROJECT_HOST}.local"
     else
       echo "⚠️  Tunnel did not start in time — running without tunnel"
       echo "   Check: tail -f $tunnel_log"
@@ -2043,11 +2059,11 @@ _start_cloudflare_tunnel() {
 
 # ── Per-project tunnel proxy ──────────────────────────────────────────────────
 # Listens on 127.0.0.1:$proxy_port, rewrites the Host header to $local_host
-# (e.g. myproject.com.localhost), and forwards to Traefik on port 80.
+# (e.g. myproject.com.local), and forwards to Traefik on port 80.
 #
 # This is the key piece that makes multi-project tunnels work without DNS:
 #   cloudflared → localhost:$proxy_port → proxy rewrites Host → Traefik:80
-#   Traefik sees Host: myproject.com.localhost and routes to the right containers.
+#   Traefik sees Host: myproject.com.local and routes to the right containers.
 #   The trycloudflare.com hostname only needs to resolve on Cloudflare's edge.
 _start_tunnel_proxy() {
   local proxy_port="$1"
@@ -2231,7 +2247,7 @@ http:
     ${_proj}-tunnel-origin:
       headers:
         customRequestHeaders:
-          Host: "${PROJECT_HOST}.localhost"
+          Host: "${PROJECT_HOST}.local"
     ${_proj}-tunnel-strip-api:
       stripPrefix:
         prefixes: ["/api"]
@@ -2430,25 +2446,25 @@ detect_compose() {
   DC_CMD="podman-compose"
   # Fail before Compose can reuse another checkout's containers or host routes.
   python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" check-isolation \
-    "$PROJECT_NAME" "${PROJECT_HOST}.localhost" || exit 1
+    "$PROJECT_NAME" "${PROJECT_HOST}.local" || exit 1
   _wire_podman_socket
   export CONTAINER_RUNTIME="podman"
 }
 
 # ── Global Traefik — shared across all projects on this machine ───────────────
 # One Traefik instance on port 80 routes to all projects by hostname:
-#   http://myproject.localhost  → MyProject
-#   http://otherapp.localhost   → OtherApp
-#   http://<any>.localhost      → whichever project registered that host
+#   http://myproject.local  → MyProject
+#   http://otherapp.local   → OtherApp
+#   http://<any>.local      → whichever project registered that host
 #
 # Traefik watches the shared "traefik" Podman network for container labels.
 # Each project's dev.yml joins that network and sets traefik.enable=true labels.
 # This function is idempotent — safe to call from every project's dev.sh.
 
-# ── Ensure PROJECT_HOST.localhost resolves locally ────────────────────────────
-# Plain single-label subdomains like myapp.localhost resolve automatically on
+# ── Ensure PROJECT_HOST.local resolves locally ────────────────────────────
+# Plain single-label subdomains like myapp.local resolve automatically on
 # macOS and modern Linux. But if PROJECT_HOST contains a dot (e.g. myapp.io),
-# the resulting hostname myapp.io.localhost is a multi-level name that the
+# the resulting hostname myapp.io.local is a multi-level name that the
 # system resolver won't auto-resolve — it needs an /etc/hosts entry.
 # This function adds the entry idempotently using sudo (prompts once if needed).
 _ensure_hosts_entry() {
@@ -2456,7 +2472,7 @@ _ensure_hosts_entry() {
   # not change the Windows browser's resolver.
   [[ "$OS" == "wsl" ]] && return 0
   local _local_host
-  for _local_host in "${PROJECT_HOST}.localhost"; do
+  for _local_host in "${PROJECT_HOST}.local"; do
     grep -qF "$_local_host" /etc/hosts 2>/dev/null && continue
     echo "🔧 Adding ${_local_host} to /etc/hosts so browsers can resolve it..."
     printf '127.0.0.1  %s\n' "$_local_host" | sudo tee -a /etc/hosts >/dev/null \
@@ -2465,7 +2481,7 @@ _ensure_hosts_entry() {
 }
 
 _ensure_local_tls() {
-  local certdir="/tmp/traefik-dynamic/certs" host="${PROJECT_HOST}.localhost"
+  local certdir="/tmp/traefik-dynamic/certs" host="${PROJECT_HOST}.local"
   if ! command -v mkcert >/dev/null; then
     echo "Install mkcert to enable trusted local HTTPS." >&2
     return 1
@@ -2543,7 +2559,7 @@ for item in rules['nftables']:
             port = match.get('right')
         if 'dnat' in expression:
             destination = expression['dnat']
-    if (port in (80, 443, 8080) and destination
+    if (port in (80, 443, 8080, 8443) and destination
             and destination.get('port') == port
             and isinstance(destination.get('addr'), str)
             and destination['addr'] != address):
@@ -2651,6 +2667,16 @@ _ensure_global_traefik() {
 
   _ensure_local_tls
 
+  # Windows portproxy reaches the WSL VM address, not its loopback interface.
+  # Keep the Windows listeners loopback-only; expose no physical Linux NICs.
+  local _web_ports=(-p 127.0.0.1:80:80 -p 127.0.0.1:443:443 -p 127.0.0.1:8443:8443)
+  local _wsl_bind=""
+  if [[ "$OS" == wsl ]]; then
+    _wsl_bind=$(hostname -I | awk '{print $1}')
+    [[ -n "$_wsl_bind" ]] || return 1
+    _web_ports+=(-p "${_wsl_bind}:80:80" -p "${_wsl_bind}:443:443" -p "${_wsl_bind}:8443:8443")
+  fi
+
   # 3. Config fingerprint — hash of the flags we pass to Traefik.
   #    If it changes (e.g. after a dev.sh update), the container is recreated
   #    automatically. New container labels from projects are picked up live by
@@ -2661,8 +2687,8 @@ _ensure_global_traefik() {
   # recreated before it can discover routes again.
   local _sock_inode=""
   [[ -S "$_sock" ]] && _sock_inode=$(ls -i "$_sock" 2>/dev/null | awk '{print $1}')
-  _config_sig=$(echo "traefik:v3.6.5-selinux-disable-dashboard-fileprovider-project-tls-v1 ${_vm_sock_real:-$_sock} ${_sock_inode} ${_net}" | md5 -q 2>/dev/null \
-             || echo "traefik:v3.6.5-selinux-disable-dashboard-fileprovider-project-tls-v1 ${_vm_sock_real:-$_sock} ${_sock_inode} ${_net}" | md5sum 2>/dev/null | cut -d' ' -f1)
+  _config_sig=$(echo "traefik:v3.6.5-local-lan-v3 ${_vm_sock_real:-$_sock} ${_sock_inode} ${_net} ${_wsl_bind}" | md5 -q 2>/dev/null \
+             || echo "traefik:v3.6.5-local-lan-v3 ${_vm_sock_real:-$_sock} ${_sock_inode} ${_net} ${_wsl_bind}" | md5sum 2>/dev/null | cut -d' ' -f1)
   local _sig_label
   _sig_label=$(podman inspect "$_cname" \
     --format '{{index .Config.Labels "dev.kiro.config-sig"}}' 2>/dev/null || true)
@@ -2689,19 +2715,18 @@ _ensure_global_traefik() {
       --name "$_cname" \
       --network "$_net" \
       --restart unless-stopped \
-      -p 80:80 \
-      -p 443:443 \
-      -p 8080:8080 \
+      "${_web_ports[@]}" \
+      -p 127.0.0.1:8080:8080 \
       -v /tmp/traefik-dynamic:/traefik-dynamic:ro \
       --label "dev.kiro.config-sig=${_config_sig}" \
       --label "traefik.enable=true" \
       --label "traefik.docker.network=${_net}" \
-      --label "traefik.http.routers.traefik-dashboard.rule=Host(\`traefik.localhost\`)" \
+      --label "traefik.http.routers.traefik-dashboard.rule=Host(\`traefik.local\`)" \
       --label "traefik.http.routers.traefik-dashboard.entrypoints=web" \
       --label "traefik.http.routers.traefik-dashboard.service=api@internal" \
       --label "traefik.http.routers.traefik-dashboard.middlewares=traefik-dashboard-redirect" \
-      --label 'traefik.http.middlewares.traefik-dashboard-redirect.redirectregex.regex=^http://traefik\.localhost/?$' \
-      --label "traefik.http.middlewares.traefik-dashboard-redirect.redirectregex.replacement=http://traefik.localhost/dashboard/" \
+      --label 'traefik.http.middlewares.traefik-dashboard-redirect.redirectregex.regex=^http://traefik\.local/?$' \
+      --label "traefik.http.middlewares.traefik-dashboard-redirect.redirectregex.replacement=http://traefik.local/dashboard/" \
       --label "traefik.http.middlewares.traefik-dashboard-redirect.redirectregex.permanent=false" \
       "${_selinux_args[@]}" \
       "${_sock_args[@]}" \
@@ -2714,6 +2739,7 @@ _ensure_global_traefik() {
         --api.insecure=true \
         --entrypoints.web.address=:80 \
         --entrypoints.websecure.address=:443 \
+        --entrypoints.lan.address=:8443 \
         --entrypoints.traefik.address=:8080 \
         --entrypoints.web.transport.respondingTimeouts.readTimeout=0 \
         --entrypoints.web.transport.respondingTimeouts.writeTimeout=0 \
@@ -2726,7 +2752,7 @@ _ensure_global_traefik() {
         "${_endpoint_args[@]}" \
         --global.checknewversion=false \
         --global.sendanonymoususage=false \
-      >/dev/null 2>&1 && echo "✅ Global Traefik started → http://traefik.localhost" || echo "⚠️  Global Traefik failed to start (non-fatal)"
+      >/dev/null 2>&1 && echo "✅ Global Traefik started → http://traefik.local" || echo "⚠️  Global Traefik failed to start (non-fatal)"
   fi
 
   _repair_traefik_hostports
@@ -2853,7 +2879,7 @@ fi
 # Commands that don't need dependency checks or app discovery preamble
 _SKIP_SETUP=false
 case "$CMD" in
-  status|logs|down|stop|rebuild|disk|_status_only|_metro_tunnels_only|service-logs|sync|expose) _SKIP_SETUP=true ;;
+  status|logs|down|stop|rebuild|disk|_status_only|_metro_tunnels_only|service-logs|sync|expose|lan) _SKIP_SETUP=true ;;
   # ios/android only need Xcode/ADB/Node — no Podman, no Docker deps
   ios|android) _SKIP_SETUP=true ;;
 esac
@@ -4269,7 +4295,7 @@ _qr_page_link() {
   [[ -d "$root/frontend/mobile" ]] || return 1
   project=$(basename "$root" | tr -cd 'a-zA-Z0-9' | tr '[:upper:]' '[:lower:]')
   host=$(_project_host "$root")
-  host="${host}.localhost"
+  host="${host}.local"
   # The link is stable even while the local QR service is recovering.
   printf 'http://%s/qr' "$host"
   if [[ -n "$app" ]]; then
@@ -4518,7 +4544,7 @@ _draw_status_live() {
       : > "$_core_rows"
       for _gcn in "${_global_containers[@]}"; do
         printf '%s|%s\n' "$_gcn" "$_gcn" >> "$_rows_file"
-        [[ "$_gcn" == "traefik" ]] && _infra_links="  $(_hyperlink "http://traefik.localhost" "traefik.localhost")"
+        [[ "$_gcn" == "traefik" ]] && _infra_links="  $(_hyperlink "http://traefik.local" "traefik.local")"
         _draw_status_live_row "$_gcn" "$_gcn" "$_lw" "" "$_sf" >> "$_core_rows" || true
       done
       # Stopped sections stay hollow; failures take priority over startup.
@@ -4539,10 +4565,10 @@ _draw_status_live() {
     for _proj in "${_projects[@]}"; do
       local _display _root _host _tunnel _seen="|" _project_rows="" _label _cn _p _svc
       if [[ "$_proj" == "$PROJECT_NAME" ]]; then
-        _display="$PROJECT_DISPLAY_NAME"; _root="$ROOT_DIR"; _host="${PROJECT_HOST}.localhost"
+        _display="$PROJECT_DISPLAY_NAME"; _root="$ROOT_DIR"; _host="${PROJECT_HOST}.local"
       else
         _resolve_proj "$_proj" _display _root
-        _host="$(_project_host "${_root:-$_display}").localhost"
+        _host="$(_project_host "${_root:-$_display}").local"
       fi
       # Keep control bytes in paths/configuration out of terminal headers.
       _display=$(printf '%s' "$_display" | tr -d '[:cntrl:]')
@@ -4604,6 +4630,11 @@ _draw_status_live() {
         _row_indent=""
         if [[ "$_label" == "frontend" ]]; then
           _project_links="  $(_hyperlink "https://${_host}" "${_host}")"
+          if [[ -f "/tmp/traefik-dynamic/${_proj}-lan.state" ]]; then
+            _project_links+="  LAN on"
+          else
+            _project_links+="  LAN off"
+          fi
           [[ -n "$_tunnel" ]] && _project_links+="  $(_hyperlink "$_tunnel" "tunnel")"
         fi
         if [[ "$_label" == mobile-* ]]; then
@@ -4795,7 +4826,7 @@ _draw_status_live_row() {
 print_status() {
   _wire_podman_socket 2>/dev/null || true
 
-  local _local_host="${PROJECT_HOST}.localhost"
+  local _local_host="${PROJECT_HOST}.local"
   local _tunnel_url
   _tunnel_url=$(grep "^CLOUDFLARE_TUNNEL_URL=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2 || echo "")
 
@@ -4861,7 +4892,7 @@ print_status() {
   printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Web:"     "https://${_local_host}"
   printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "API:"     "https://${_local_host}/api"
   printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Admin:"   "https://${_local_host}/admin"
-  printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Traefik:" "http://traefik.localhost"
+  printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Traefik:" "http://traefik.local"
 
   if [[ -n "$_tunnel_url" ]]; then
     echo ""
@@ -5204,7 +5235,7 @@ _start_tunnel_watchdog() {
   local _pname="$PROJECT_NAME"
   local _rdir="$ROOT_DIR"
   local _sdir="${DEV_SOURCE_DIR:-$ROOT_DIR}"
-  local _lhost="${PROJECT_HOST}.localhost"
+  local _lhost="${PROJECT_HOST}.local"
   local _tlog="/tmp/${PROJECT_NAME}-tunnel.log"
   local _tpid="/tmp/${PROJECT_NAME}-tunnel.pid"
   local _wpid="$watchdog_pid_file"
@@ -5622,7 +5653,7 @@ _open_safari() {
   if [[ -n "$_tunnel_url" ]]; then
     _open_url="$_tunnel_url"
   else
-    _open_url="https://${PROJECT_HOST}.localhost"
+    _open_url="https://${PROJECT_HOST}.local"
   fi
 
   case "$OS" in
@@ -5674,7 +5705,7 @@ _print_access_urls() {
   _tunnel_url=$(grep "^CLOUDFLARE_TUNNEL_URL=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2 || echo "")
 
   # PROJECT_HOST is already the correct lowercase+dots form (e.g. myproject.com)
-  local _local_host="${PROJECT_HOST}.localhost"
+  local _local_host="${PROJECT_HOST}.local"
 
   echo "   🏠 Local (zero latency):"
   echo "      Web app:  https://${_local_host}"
@@ -6676,12 +6707,12 @@ _setup_physical_devices() {
 }
 
 # ── Backend proxy: localhost:8000 → Traefik → Django ─────────────────────────
-# Listens on 127.0.0.1:8000, rewrites Host → PROJECT_HOST.localhost, forwards
+# Listens on 127.0.0.1:8000, rewrites Host → PROJECT_HOST.local, forwards
 # to Traefik on port 80. This lets the Android emulator reach the backend via
 # adb reverse tcp:8000 tcp:8000 without needing privileged port 80.
 _start_backend_proxy() {
   local proxy_port=8000
-  local target_host="${PROJECT_HOST}.localhost"
+  local target_host="${PROJECT_HOST}.local"
   local pid_file="/tmp/${PROJECT_NAME}-backend-proxy.pid"
   local proxy_script="/tmp/${PROJECT_NAME}-backend-proxy.py"
   local proxy_log="/tmp/${PROJECT_NAME}-backend-proxy.log"
@@ -8267,6 +8298,37 @@ PATCH_PODFILE_EOF
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 case "$CMD" in
+  lan)
+    _lan_action="${2:-status}"
+    case "$_lan_action" in on|off|status) ;; *) echo 'Usage: ./dev.sh lan [on|off|status]'; exit 1 ;; esac
+    if [[ "$_lan_action" == on ]]; then
+      if python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" has-exposure-check; then
+        bash "$ROOT_DIR/dev.sh" _exposure_check_only || exit 1
+      fi
+      _ensure_global_traefik || exit 1
+    fi
+    _lan_relays=()
+    _lan_gateway=$(podman network inspect traefik --format '{{range .Subnets}}{{.Gateway}}{{end}}' 2>/dev/null || true)
+    [[ -n "$_lan_gateway" ]] && _lan_relays+=(--relay-source "${_lan_gateway}/32")
+    if [[ "$OS" == wsl ]]; then
+      _lan_gateway=$(ip route show default | awk 'NR==1 {print $3}')
+      [[ -n "$_lan_gateway" ]] && _lan_relays+=(--relay-source "${_lan_gateway}/32")
+    fi
+    python3 "$ROOT_DIR/backend/config/network.py" "$_lan_action" --root "$ROOT_DIR" "${_lan_relays[@]}" --discover || exit 1
+    if [[ "$OS" == mac ]]; then
+      podman machine ssh "cat > '/tmp/traefik-dynamic/${PROJECT_NAME}-lan.yml'" < "/tmp/traefik-dynamic/${PROJECT_NAME}-lan.yml" || exit 1
+    fi
+    if [[ "$_lan_action" == on && "$OS" != wsl ]]; then
+      _lan_ip=$(_get_lan_ip)
+      sudo -v || exit 1
+      sudo -b python3 "$ROOT_DIR/backend/config/network.py" serve --address "$_lan_ip" \
+        --root "$ROOT_DIR" >/tmp/devtools-lan.log 2>&1
+      echo 'LAN discovery requires multicast on the Wi-Fi network. Trust the public mkcert rootCA.pem on your phone.'
+    elif [[ "$_lan_action" == on ]]; then
+      echo 'Windows: use .\dev.ps1 lan on to start the native LAN listener.'
+    fi
+    ;;
+
   expose)
     _start_cloudflare_tunnel
     _start_tunnel_watchdog

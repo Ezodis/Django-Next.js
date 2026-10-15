@@ -30,9 +30,13 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   `SHARED_PATHS` in `backend/config/project_config.py` for the sync boundary.
 - Every project route on the shared proxy must match that project's explicit
   hostname. Do not add hostless catch-all frontend/API/admin/static/media routes.
-  The sole local web origin is `https://<repository-name>.localhost`, preserving
+  The sole local web origin is `https://<repository-name>.local`, preserving
   dots and hyphens. Do not add compact spelling aliases or publish frontend/API
   host ports. Keep simulator bridges and Metro ports limited to their tooling.
+  LAN is explicitly opt-in per project: preserve separate loopback and LAN
+  entrypoints, bounded local relay sources, and immediate revocation on off.
+  Never expose database, Redis, Docker/Podman sockets or the proxy dashboard.
+  Keep DEV_RESOURCE_NAMESPACE in project.py when renaming a project with data.
   Tunnel routes must match their assigned hostname too. Keep container, volume,
   service, router, and middleware names scoped to the project, and preserve the
   startup collision check before Compose can reuse another checkout's resources.
@@ -92,6 +96,18 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - Do not claim a structural update has reached other projects or GitHub unless
   it was actually synchronized or published. Report any remaining propagation
   or runtime verification work.
+
+## Local network access
+
+- Local web names end in `.local` and preserve the project folder name. The same
+  HTTPS address is used with LAN off (computer only) and LAN on (trusted subnet).
+- `dev.sh lan on|off|status` and `dev.ps1 lan on|off|status` control only this
+  project's ingress. LAN starts off; tunnel state is independent. Revoking access
+  must also close existing relay connections. Never share application ports.
+- Phones need multicast DNS support on their Wi-Fi and must trust the public
+  local CA. `dev.ps1 lan certificate` exports only rootCA.pem to Downloads as
+  ProjectLocalCA.crt. Never export rootCA-key.pem. Wi-Fi client isolation can
+  prevent LAN connectivity; do not bypass it or disable firewall protections.
 
 ## Backup and recovery
 

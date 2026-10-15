@@ -12,18 +12,18 @@ from .models import OutgoingEmail
 from unittest.mock import patch
 
 
-@override_settings(INBOUND_EMAIL_SECRET="mail-test-secret", MAILBOX_DOMAIN="oldbook.ai")
+@override_settings(INBOUND_EMAIL_SECRET="mail-test-secret", MAILBOX_DOMAIN="current.example.test")
 class MailboxTests(TestCase):
     def setUp(self):
         message = EmailMessage()
         message["Subject"] = "A question about a book"
         message["From"] = "reader@example.test"
-        message["To"] = "support@oldbook.ai"
+        message["To"] = "support@current.example.test"
         message.set_content("Please help me find this book.")
         message.add_attachment(b"attachment content", maintype="text", subtype="plain", filename="note.txt")
         self.raw = message.as_bytes()
 
-    def deliver(self, recipient="support@oldbook.ai", raw=None, timestamp=None, signature=None):
+    def deliver(self, recipient="support@current.example.test", raw=None, timestamp=None, signature=None):
         raw = self.raw if raw is None else raw
         timestamp = str(timestamp or int(time.time()))
         prefix = f"{timestamp}\nreader@example.test\n{recipient}\n".encode()
@@ -34,8 +34,8 @@ class MailboxTests(TestCase):
 
     def test_catch_all_accepts_any_alias_and_deduplicates_retries(self):
         for alias in ("bonn", "support", "any-name"):
-            self.assertEqual(self.deliver(alias + "@oldbook.ai").status_code, 201)
-            self.assertEqual(self.deliver(alias + "@oldbook.ai").status_code, 200)
+            self.assertEqual(self.deliver(alias + "@current.example.test").status_code, 201)
+            self.assertEqual(self.deliver(alias + "@current.example.test").status_code, 200)
         self.assertEqual(ReceivedEmail.objects.count(), 3)
         message = ReceivedEmail.objects.first()
         self.assertIn("Please help", message.text_body)
@@ -45,12 +45,21 @@ class MailboxTests(TestCase):
         self.assertEqual(self.deliver(signature="0" * 64).status_code, 403)
         self.assertEqual(self.deliver(timestamp=int(time.time()) - 600).status_code, 403)
         self.assertEqual(self.deliver("support@example.test").status_code, 400)
-        self.assertEqual(self.deliver("oldbook.ai").status_code, 400)
+        self.assertEqual(self.deliver("current.example.test").status_code, 400)
         self.assertFalse(ReceivedEmail.objects.exists())
 
     @override_settings(INBOUND_EMAIL_SECRET="")
     def test_unconfigured_receiver_is_closed(self):
         self.assertEqual(self.deliver().status_code, 503)
+
+    @override_settings(MAILBOX_LEGACY_DOMAINS=" legacy.example.test ")
+    def test_retained_domain_accepts_signed_mail_without_changing_sender_domain(self):
+        self.assertEqual(self.deliver("support@legacy.example.test").status_code, 201)
+        self.assertEqual(self.deliver("support@current.example.test").status_code, 201)
+        self.assertEqual(self.deliver("support@unrelated.example.test").status_code, 400)
+        message = OutgoingEmail(from_alias="support", recipient="reader@example.test", subject="Reply", body="Hello")
+        message.clean()
+        self.assertEqual(message.sender, "support@current.example.test")
 
     def test_rejects_oversize_message(self):
         self.assertEqual(self.deliver(raw=b"x" * (10 * 1024 * 1024 + 1)).status_code, 413)
@@ -87,17 +96,17 @@ class MailboxTests(TestCase):
         self.assertIn("attachment", response["Content-Disposition"])
 
 
-@override_settings(MAILBOX_DOMAIN="oldbook.ai", EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+@override_settings(MAILBOX_DOMAIN="current.example.test", EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
 class ComposeTests(TestCase):
     def test_any_alias_is_saved_and_sent_once(self):
         from django.core import mail
         from .delivery import send_pending_mail
         message = OutgoingEmail.objects.create(from_alias="support", recipient="reader@example.test", subject="Book reply", body="Hello")
-        self.assertEqual(message.sender, "support@oldbook.ai")
+        self.assertEqual(message.sender, "support@current.example.test")
         send_pending_mail()
         send_pending_mail()
         self.assertEqual(len(mail.outbox), 1)
-        self.assertEqual(mail.outbox[0].from_email, "support@oldbook.ai")
+        self.assertEqual(mail.outbox[0].from_email, "support@current.example.test")
         message.refresh_from_db()
         self.assertIsNotNone(message.sent_at)
 
@@ -116,12 +125,12 @@ class ComposeTests(TestCase):
         self.assertIsNone(message.sent_at)
         self.assertIsNotNone(message.next_attempt_at)
         self.assertNotIn("secret", message.last_error)
-        self.assertEqual(message.sender, "orders@oldbook.ai")
+        self.assertEqual(message.sender, "orders@current.example.test")
 
     def test_admin_compose_and_reply_prefill(self):
         owner = User.objects.create_superuser("owner", "owner@example.test", "test-pass")
         self.client.force_login(owner)
-        message = ReceivedEmail.objects.create(sender="reader@example.test", recipient="support@oldbook.ai", subject="Help",
+        message = ReceivedEmail.objects.create(sender="reader@example.test", recipient="support@current.example.test", subject="Help",
                                               text_body="A question", raw_message=b"Subject: Help\n\nA question", digest="b" * 64)
         response = self.client.get(reverse("admin:mailroom_outgoingemail_add"), {"reply_to": message.pk})
         self.assertContains(response, "Send email")
@@ -131,12 +140,12 @@ class ComposeTests(TestCase):
             "from_alias": "support", "recipient": "reader@example.test", "subject": "Re: Help", "body": "Hello", "_save": "Send email",
         })
         self.assertEqual(response.status_code, 302)
-        self.assertEqual(OutgoingEmail.objects.get().sender, "support@oldbook.ai")
+        self.assertEqual(OutgoingEmail.objects.get().sender, "support@current.example.test")
 
-    @override_settings(MAILBOX_DOMAIN="edy.chat")
+    @override_settings(MAILBOX_DOMAIN="other.example.test")
     def test_project_domain_is_isolated(self):
         message = OutgoingEmail.objects.create(from_alias="support", recipient="friend@example.test", subject="Hello", body="Hello")
-        self.assertEqual(message.sender, "support@edy.chat")
+        self.assertEqual(message.sender, "support@other.example.test")
 
     @override_settings(EMAIL_BACKEND="django.core.mail.backends.console.EmailBackend")
     def test_console_backend_does_not_mark_mail_delivered(self):

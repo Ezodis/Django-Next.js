@@ -14,6 +14,106 @@ from . import watchos
 from .project_config import exposure_check_command, is_shared, mobile_apps, sync_paths
 
 
+class LocalNetworkTests(SimpleTestCase):
+    def test_local_names_follow_folder_but_existing_resource_identity_is_preserved(self):
+        from .network import configure
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'Renamed.app'
+            (root / 'backend').mkdir(parents=True)
+            (root / 'backend/project.py').write_text("DEV_RESOURCE_NAMESPACE = 'existingdata'\n")
+            directory = Path(temporary) / 'routing'
+            result = configure(root, 'on', directory)
+            self.assertEqual(result['host'], 'renamed.app.local')
+            self.assertTrue((directory / 'existingdata-lan.yml').exists())
+            configure(root, 'off', directory)
+            self.assertEqual(list(directory.iterdir()), [])
+
+    def test_lan_routes_are_scoped_and_do_not_publish_backend_or_dashboard_ports(self):
+        from .network import lan_routes
+        config = lan_routes('project', 'project.app.local')
+        for router in config['http']['routers'].values():
+            self.assertEqual(router['entryPoints'], ['lan'])
+            self.assertIn('Host(`project.app.local`)', router['rule'])
+            self.assertIn('project-lan-relay', router['middlewares'])
+            self.assertNotIn('api@internal', router['service'])
+        self.assertEqual(config['http']['middlewares']['project-lan-relay']['ipAllowList']['sourceRange'],
+                         ['127.0.0.1/32', '::1/128'])
+
+    def test_mdns_answers_only_enabled_names_and_never_claims_other_projects(self):
+        import struct
+        from .network import mdns_answer, dns_name
+        def query(host):
+            encoded = b''.join(bytes([len(label)]) + label.encode() for label in host.split('.')) + b'\0'
+            return struct.pack('!HHHHHH', 0, 0, 1, 0, 0, 0) + encoded + struct.pack('!HH', 1, 1)
+        host = 'project.app.local'
+        answer = mdns_answer(query(host), {host}, '192.168.1.2')
+        self.assertEqual(dns_name(answer, 12)[0], host)
+        self.assertEqual(answer[-4:], bytes([192, 168, 1, 2]))
+        self.assertIsNone(mdns_answer(query('other.app.local'), {host}, '192.168.1.2'))
+        self.assertIsNone(mdns_answer(query(host), set(), '192.168.1.2'))
+        self.assertIsNone(mdns_answer(b'bad', {host}, '192.168.1.2'))
+
+    def test_tls_hostname_uses_real_clienthello_and_rejects_incomplete_input(self):
+        import ssl
+        from .network import hello_hostname
+        incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+        connection = ssl.create_default_context().wrap_bio(incoming, outgoing, server_hostname='project.app.local')
+        try:
+            connection.do_handshake()
+        except ssl.SSLWantReadError:
+            pass
+        packet = outgoing.read()
+        self.assertEqual(hello_hostname(packet), 'project.app.local')
+        self.assertIsNone(hello_hostname(packet[:30]))
+        self.assertIsNone(hello_hostname(b'GET / HTTP/1.1'))
+
+    def test_relay_rejects_disabled_projects_and_closes_live_connections_on_off(self):
+        import ipaddress
+        import socket
+        import socketserver
+        import ssl
+        import threading
+        from .network import Relay, Forward, configure
+        class Upstream(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.settimeout(4)
+                self.request.recv(65536)
+                self.request.sendall(b'CONNECTED')
+                self.request.recv(1)
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / 'project.app'
+            root.mkdir()
+            state = Path(directory) / 'routing'
+            configure(root, 'on', state)
+            output = ssl.MemoryBIO()
+            connection = ssl.create_default_context().wrap_bio(ssl.MemoryBIO(), output, server_hostname='project.app.local')
+            try:
+                connection.do_handshake()
+            except ssl.SSLWantReadError:
+                pass
+            hello = output.read()
+            with socketserver.ThreadingTCPServer(('127.0.0.1', 0), Upstream) as upstream, Relay(('127.0.0.1', 0), Forward) as relay:
+                relay.network = ipaddress.ip_network('127.0.0.0/8')
+                relay.directory, relay.upstream = state, upstream.server_address
+                workers = [threading.Thread(target=server.serve_forever, daemon=True) for server in [upstream, relay]]
+                for worker in workers:
+                    worker.start()
+                try:
+                    with socket.create_connection(relay.server_address, timeout=4) as client:
+                        client.sendall(hello)
+                        self.assertEqual(client.recv(9), b'CONNECTED')
+                        configure(root, 'off', state)
+                        self.assertEqual(client.recv(1), b'')
+                    with socket.create_connection(relay.server_address, timeout=4) as client:
+                        client.sendall(hello)
+                        self.assertEqual(client.recv(1), b'')
+                finally:
+                    relay.shutdown()
+                    upstream.shutdown()
+                    for worker in workers:
+                        worker.join(3)
+
+
 class ProjectIsolationTests(SimpleTestCase):
     def test_checkout_identity_is_separate_from_accessible_source_bridge(self):
         from .project_config import check_project_isolation
