@@ -1,4 +1,4 @@
-"""Opt-in LAN ingress and mDNS discovery; no app ports or data stores exposed.
+"""Controlled LAN ingress and mDNS discovery; no app ports or data stores exposed.
 
 The LAN entrypoint has routes only for enabled projects. Local-only routes use
 separate loopback listeners. Only the public CA certificate is exported for phones.
@@ -93,6 +93,19 @@ def discovered_routes(project, host):
     return routes
 
 
+def remove_lan_file(path):
+    # Windows may briefly hold a state file while a relay checks it. Revocation
+    # must survive that read rather than failing the user's off command.
+    for attempt in range(20):
+        try:
+            Path(path).unlink(missing_ok=True)
+            return
+        except PermissionError as error:
+            if getattr(error, 'winerror', None) not in (32, 33) or attempt == 19:
+                raise
+            time.sleep(0.01)
+
+
 def configure(root, action, directory, relays=('127.0.0.1/32', '::1/128'), discover=False):
     name, project = identity(root)
     from config.project_config import resource_namespace
@@ -109,8 +122,8 @@ def configure(root, action, directory, relays=('127.0.0.1/32', '::1/128'), disco
         atomic_json(state, {'host': host, 'checkout': str(Path(root).resolve())})
     elif action == 'off':
         # Revoke the relay first, including established WebSocket connections.
-        state.unlink(missing_ok=True)
-        route.unlink(missing_ok=True)
+        remove_lan_file(state)
+        remove_lan_file(route)
     return {'host': host, 'enabled': state.exists(), 'url': f'https://{host}'}
 
 
@@ -145,8 +158,8 @@ def network_signature(address):
 
 def revoke_all(directory):
     for state in Path(directory).glob('*-lan.state'):
-        state.unlink(missing_ok=True)
-        state.with_suffix('.yml').unlink(missing_ok=True)
+        remove_lan_file(state)
+        remove_lan_file(state.with_suffix('.yml'))
 
 
 def local_subnet(address):
@@ -375,18 +388,64 @@ def monitor_projects(root):
     return projects
 
 
-def monitor_change(root, directory, action):
+def lan_preferences(directory):
+    path = Path(directory) / '.lan-preferences.json'
+    if not path.exists():
+        return {'default': True, 'projects': {}}
+    value = json.loads(path.read_text(encoding='utf-8'))
+    if (not isinstance(value, dict) or not isinstance(value.get('default'), bool) or not isinstance(value.get('projects'), dict)
+            or any(not isinstance(item, bool) for item in value['projects'].values())):
+        raise ValueError('Invalid LAN preferences; sharing was not changed')
+    return value
+
+
+def running_projects():
+    command = ['podman', 'ps', '--format', '{{index .Labels "com.docker.compose.project"}}']
+    options = {}
+    if os.name == 'nt':
+        command = ['wsl.exe', '-d', 'Ubuntu', '--cd', '/', '--', *command]
+        options['creationflags'] = subprocess.CREATE_NO_WINDOW
+    return set(subprocess.check_output(command, text=True, timeout=15, **options).split())
+
+
+def monitor_defaults(root, directory, attempted):
+    """Try new running projects once per monitor; never undo a deliberate off."""
+    projects = monitor_projects(root)
+    for namespace in sorted(running_projects() & (projects.keys() - attempted)):
+        try:
+            with monitor_update_lock(directory):
+                preferences = lan_preferences(directory)
+                if preferences['projects'].get(namespace, preferences['default']):
+                    attempted.add(namespace)
+                    monitor_change(root, directory, 'on', namespace, remember=False)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # Public networks, denied elevation and network changes stay closed.
+            # A button can retry; background polling must never repeat prompts.
+            attempted.add(namespace)
+
+
+def monitor_change(root, directory, action, project=None, remember=True):
     if action not in ('on', 'off'):
         raise ValueError('Choose LAN on or off')
     projects = monitor_projects(root)
-    command = ['podman', 'ps', '--format', '{{index .Labels "com.docker.compose.project"}}']
+    if project is not None and project not in projects:
+        raise ValueError('Unknown project in this workspace')
     native = os.name == 'nt'
-    if native:
-        command = ['wsl.exe', '-d', 'Ubuntu', '--cd', '/', '--', *command]
     options = {'creationflags': subprocess.CREATE_NO_WINDOW} if native else {}
-    running = set(subprocess.check_output(command, text=True, timeout=15, **options).split()) if action == 'on' else set()
+    running = running_projects() if action == 'on' else set()
     enabled = {path.name[:-len('-lan.state')] for path in Path(directory).glob('*-lan.state')}
-    selected = sorted((running if action == 'on' else running | enabled) & projects.keys())
+    selected = sorted((running if action == 'on' else enabled) & projects.keys())
+    if project is not None:
+        if action == 'on' and project not in running:
+            raise ValueError('Start this project before enabling LAN')
+        selected = [project]
+    if remember:
+        preferences = lan_preferences(directory)
+        if project is None:
+            preferences = {'default': action == 'on', 'projects': {}}
+        else:
+            preferences['projects'][project] = action == 'on'
+        atomic_json(Path(directory) / '.lan-preferences.json', preferences)
     if not selected:
         if action == 'off':
             return 'LAN is already off for this workspace.'
@@ -482,7 +541,7 @@ history.replaceState(null, '', '/');
 (async () => {
   try {
     const response = await fetch('/toggle', {method:'POST', headers:{'Content-Type':'application/json',
-      'Authorization':'Bearer ' + parameters.get('token')}, body:JSON.stringify({action:parameters.get('action')})});
+      'Authorization':'Bearer ' + parameters.get('token')}, body:JSON.stringify({action:parameters.get('action'), project:parameters.get('project')})});
     const result = await response.json();
     document.getElementById('result').textContent = result.message || 'Use the LAN control in your terminal to try again.';
   } catch (_) {document.getElementById('result').textContent = 'The monitor has closed. Reopen it and try again.';}
@@ -505,6 +564,9 @@ history.replaceState(null, '', '/');
                 self.connection.settimeout(5)
                 request = json.loads(self.rfile.read(length))
                 action = request.get('action')
+                project = request.get('project')
+                if project is not None and (not isinstance(project, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}', project)):
+                    raise ValueError('Invalid project')
                 if action not in ('on', 'off'):
                     raise ValueError('Invalid LAN action')
             except (ValueError, OSError, AttributeError):
@@ -515,7 +577,7 @@ history.replaceState(null, '', '/');
                 return
             try:
                 with monitor_update_lock(directory):
-                    message = monitor_change(root, directory, action)
+                    message = monitor_change(root, directory, action, project)
                 self.respond(200, json.dumps({'message': message}))
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 self.respond(400, json.dumps({'message': str(error)}))
@@ -536,17 +598,38 @@ if __name__ == '__main__':
     parser.add_argument('--relay-source', action='append', default=[])
     parser.add_argument('--discover', action='store_true')
     parser.add_argument('--control-state')
+    parser.add_argument('--project')
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     if args.action == 'monitor':
         server, token = monitor_server(args.root, args.directory)
         with server:
-            atomic_json(args.control_state, {'url': f'http://127.0.0.1:{server.server_port}', 'token': token})
-            server.serve_forever()
+            atomic_json(args.control_state, {'url': f'http://127.0.0.1:{server.server_port}', 'token': token,
+                                             'projects': sorted(monitor_projects(args.root))})
+            stop = threading.Event()
+            def defaults():
+                attempted = set()
+                while not stop.is_set():
+                    try:
+                        monitor_defaults(args.root, args.directory, attempted)
+                    except (OSError, ValueError, subprocess.SubprocessError):
+                        pass
+                    stop.wait(10)
+            threading.Thread(target=defaults, daemon=True).start()
+            try:
+                server.serve_forever()
+            finally:
+                stop.set()
     elif args.action == 'monitor-link':
         state = json.loads(Path(args.control_state).read_text(encoding='utf-8'))
-        action = 'off' if enabled_hosts(args.directory) else 'on'
-        print(f'{state["url"]}/#token={state["token"]}&action={action}')
+        enabled = {path.name[:-len('-lan.state')] for path in Path(args.directory).glob('*-lan.state')}
+        projects = set(state['projects']) if 'projects' in state else monitor_projects(args.root).keys()
+        if args.project and args.project not in projects:
+            sys.exit(0)
+        selected = {args.project} if args.project else running_projects() & projects
+        action = 'off' if selected and selected <= enabled else 'on'
+        scope = f'&project={args.project}' if args.project else ''
+        print(f'{state["url"]}/#token={state["token"]}{scope}&action={action}')
     elif args.action == 'serve':
         serve(args.directory, args.address, args.upstream, network=args.network)
     else:

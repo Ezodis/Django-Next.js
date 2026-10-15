@@ -151,14 +151,78 @@ class MonitorLanTests(SimpleTestCase):
                 self.assertEqual(request('POST', {'Content-Type': 'application/json'}, '{"action":"on"}')[0], 403)
                 self.assertEqual(request('POST', headers, '{"action":"execute"}')[0], 400)
                 self.assertEqual(request('POST', headers, '[]')[0], 400)
+                self.assertEqual(request('POST', headers, '{"action":"on","project":"../outside"}')[0], 400)
                 self.assertEqual(request('POST', headers, 'x' * 257)[0], 400)
                 change.assert_not_called()
                 self.assertEqual(request('POST', headers, '{"action":"on"}')[0], 200)
-                change.assert_called_once_with(directory, directory, 'on')
+                change.assert_called_once_with(directory, directory, 'on', None)
+                change.reset_mock()
+                self.assertEqual(request('POST', headers, '{"action":"off","project":"one"}')[0], 200)
+                change.assert_called_once_with(directory, directory, 'off', 'one')
             finally:
                 server.shutdown()
                 server.server_close()
                 worker.join(3)
+
+    def test_individual_off_preserves_other_projects_and_remembers_its_choice(self):
+        from .network import configure, monitor_change, lan_preferences
+        with TemporaryDirectory() as directory:
+            roots = {name: Path(directory) / name for name in ('one', 'two')}
+            routing = Path(directory) / 'routing'
+            for root in roots.values():
+                root.mkdir()
+                configure(root, 'on', routing)
+            with patch('config.network.monitor_projects', return_value=roots), patch('config.network.subprocess.run', return_value=subprocess.CompletedProcess([], 0, '', '')) as command:
+                monitor_change(directory, routing, 'off', 'one')
+            self.assertFalse((routing / 'one-lan.state').exists())
+            self.assertTrue((routing / 'two-lan.state').exists())
+            self.assertEqual(lan_preferences(routing), {'default': True, 'projects': {'one': False}})
+            self.assertEqual(command.call_count, 1)
+            self.assertEqual(command.call_args.kwargs['cwd'], roots['one'])
+
+    def test_default_on_applies_to_new_running_projects_only_and_honors_saved_off(self):
+        from .network import monitor_defaults, atomic_json
+        with TemporaryDirectory() as directory:
+            roots = {name: Path(directory) / name for name in ('one', 'two')}
+            attempted = set()
+            with patch('config.network.monitor_projects', return_value=roots), patch('config.network.running_projects', return_value=set(roots)), patch('config.network.monitor_change') as change:
+                monitor_defaults(directory, directory, attempted)
+                self.assertEqual([call.args[3] for call in change.call_args_list], ['one', 'two'])
+                change.reset_mock()
+                monitor_defaults(directory, directory, attempted)
+                change.assert_not_called()
+                attempted.clear()
+                atomic_json(Path(directory) / '.lan-preferences.json', {'default': True, 'projects': {'one': False}})
+                monitor_defaults(directory, directory, attempted)
+                change.assert_called_once_with(directory, directory, 'on', 'two', remember=False)
+                change.reset_mock()
+                attempted.clear()
+                atomic_json(Path(directory) / '.lan-preferences.json', {'default': False, 'projects': {}})
+                monitor_defaults(directory, directory, attempted)
+                change.assert_not_called()
+
+    def test_failed_default_on_is_not_retried_in_the_background(self):
+        from .network import monitor_defaults
+        with TemporaryDirectory() as directory, patch('config.network.monitor_projects', return_value={'one': Path(directory)}), patch('config.network.running_projects', return_value={'one'}), patch('config.network.monitor_change', side_effect=ValueError('Public network')) as change:
+            attempted = set()
+            monitor_defaults(directory, directory, attempted)
+            monitor_defaults(directory, directory, attempted)
+            change.assert_called_once()
+
+    def test_master_off_clears_individual_overrides_and_applies_to_future_projects(self):
+        from .network import monitor_change, atomic_json, lan_preferences
+        with TemporaryDirectory() as directory, patch('config.network.monitor_projects', return_value={}):
+            atomic_json(Path(directory) / '.lan-preferences.json', {'default': True, 'projects': {'one': True, 'two': False}})
+            monitor_change(directory, directory, 'off')
+            self.assertEqual(lan_preferences(directory), {'default': False, 'projects': {}})
+
+    def test_unknown_project_cannot_run_commands_or_change_preferences(self):
+        from .network import monitor_change
+        with TemporaryDirectory() as directory, patch('config.network.monitor_projects', return_value={}), patch('config.network.subprocess.run') as command:
+            with self.assertRaisesRegex(ValueError, 'Unknown project'):
+                monitor_change(directory, directory, 'on', 'outside')
+            command.assert_not_called()
+            self.assertFalse((Path(directory) / '.lan-preferences.json').exists())
 
     def test_multiple_monitors_cannot_update_lan_concurrently(self):
         from .network import monitor_update_lock

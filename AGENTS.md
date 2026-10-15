@@ -33,7 +33,7 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   The sole local web origin is `https://<repository-name>.local`, preserving
   dots and hyphens. Do not add compact spelling aliases or publish frontend/API
   host ports. Keep simulator bridges and Metro ports limited to their tooling.
-  LAN is explicitly opt-in per project: preserve separate loopback and LAN
+  LAN is controlled per project: preserve separate loopback and LAN
   entrypoints, bounded local relay sources, and immediate revocation on off.
   Never expose database, Redis, Docker/Podman sockets or the proxy dashboard.
   Keep DEV_RESOURCE_NAMESPACE in project.py when renaming a project with data.
@@ -102,9 +102,13 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - Local web names end in `.local` and preserve the project folder name. The same
   HTTPS address is used with LAN off (computer only) and LAN on (trusted subnet).
 - `dev.sh lan on|off|status` and `dev.ps1 lan on|off|status` control only this
-  project's ingress. LAN starts off; tunnel state is independent. Revoking access
+  project's ingress. LAN defaults on for running projects on trusted networks;
+  remember explicit global/per-project off choices. Tunnel state is independent. Revoking access
   must also close existing relay connections. Never share application ports.
-- The monitor's Infrastructure LAN link controls running checkouts in its workspace.
+- The monitor's Infrastructure power button controls running checkouts in its workspace;
+  each project's power button controls only that project. Red/green reflects actual
+  sharing, not the saved preference. Startup defaults never bypass network trust
+  checks or repeatedly request elevation after a failure.
   Keep its controller on loopback only, with exact Host/Origin checks and a random
   session token. GET and link previews never mutate sharing; changes use POST.
   Serialize changes across monitors, fail closed on enable errors, and retain the

@@ -38,7 +38,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 function Start-ProjectLanListener {
-    # Called only after an explicit `lan on`; ordinary startup stays loopback-only.
+    # Called through `lan on`; default-on and manual controls share this trust gate.
     $profile = Get-NetConnectionProfile | Where-Object {
         $_.IPv4Connectivity -ne 'Disconnected' -and $_.NetworkCategory -in @('Private', 'DomainAuthenticated')
     } | Select-Object -First 1
@@ -939,7 +939,7 @@ Start-Process -FilePath (Get-Command wsl.exe).Source -WindowStyle Hidden -Argume
     "`"$wslRoot`"", "`"$wslWorkspace`""
 ) | Out-Null
 # A local terminal link can enable LAN through this native host without asking
-# WSL to access an unavailable Windows-drive mount. No sharing occurs at startup.
+# WSL to access an unavailable Windows-drive mount. Defaults retain trust checks.
 $lanControlProcess = $null
 $lanControlDirectory = ''
 $lanControlLinuxState = ''
