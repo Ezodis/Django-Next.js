@@ -93,12 +93,13 @@ SHARED_PATHS = (
     'frontend/web/package.json', 'frontend/web/eslint.config.mjs',
     '.github/dependabot.yml', '.github/workflows/dependency-checks.yml',
     '.github/workflows/template-sync.yml', '.github/workflows/dependency-automerge.yml',
-    '.github/workflows/vercel-deploy.yml', '.github/workflows/production-backup.yml',
+    '.github/workflows/vercel-deploy.yml',
     'frontend/mobile/Dockerfile', 'frontend/mobile/.dockerignore',
     'frontend/mobile/.npmrc', 'frontend/mobile/mobile.sh',
     'frontend/mobile/metro.config.base.js',
 )
 RETIRED_SHARED_PATHS = (
+    '.github/workflows/production-backup.yml',
     'backend/config/.env.example',
     'backend/config/test_template_config.py',
     '.sh/dev_qr_server.py',

@@ -1,11 +1,6 @@
 name: Merge checked dependency updates
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '*/30 * * * *'
-  workflow_run:
-    workflows: ['Dependency checks']
-    types: [completed]
 permissions:
   contents: write
   pull-requests: write

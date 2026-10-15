@@ -1,8 +1,6 @@
 name: Template updates
 on:
-  push:
-  schedule:
-    - cron: '15 * * * *'
+  # Local dev.sh sync is the default; never consume hosted runner time on a timer.
   workflow_dispatch:
 permissions:
   contents: write

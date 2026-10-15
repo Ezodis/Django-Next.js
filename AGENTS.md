@@ -123,13 +123,12 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - Production backups are encrypted with `age` before leaving the recovery host.
   Keep private identities outside Git and deployment variables; only configure
   the public recipient on exporters. Keep a second independent identity copy.
-- The optional daily `production-backup.yml` workflow writes to the separate
-  `production-backups` branch. Enable with `PRODUCTION_BACKUP_ENABLED`, the public
-  `BACKUP_AGE_RECIPIENT` variable, and `PRODUCTION_BACKUP_ENV` Actions secret
-  containing `DATABASE_URL`, project identity and `BACKUP_SOURCE_STORAGE` JSON.
-  Treat its database/storage credentials as secrets with minimum permissions.
-  Seven archives remain visible; Git history retains older encrypted copies and
-  grows. The workflow refuses archives over 90 MiB; use object storage for growth.
+- Backups are manual checkpoints and data-transfer tools. Do not add scheduled
+  exports, backup services, or GitHub Actions backup jobs. Use `dev.sh backup`
+  locally and upload only when explicitly requested. Preserve the live databases
+  and existing encrypted archives; removing automation never removes user data.
+  Seven uploaded archives remain visible; Git history retains older encrypted
+  copies and grows. Uploads over 90 MiB require independent object storage.
 - `BACKUP_DESTINATION_STORAGE` accepts a Django storage backend/options JSON
   (S3, GCS or another installed adapter); `BACKUP_DESTINATION_PREFIX` isolates each
   project. `BACKUP_COPY_DIRECTORY` adds a verified copy to a mounted personal or
@@ -188,10 +187,11 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - Dependabot checks npm, Python, container images and Actions weekly. Major
   upgrades are separate pull requests. Prefer the latest compatible patched
   versions and supported runtimes; do not override peer dependency conflicts.
-- `.github/workflows/template-sync.yml` checks after default-branch pushes and
-  hourly for shared updates, opening a project pull request from
-  the configured `SYNC_TEMPLATE_REPO`. This activates after these files are
-  committed and pushed to each repository's default branch.
+- Shared maintenance workflows are manual-only: no schedules, push/PR triggers,
+  or chained workflow triggers that consume hosted runner time automatically.
+  Use local checks and `dev.sh sync` by default. Vercel and Railway retain native
+  Git deployments; Vercel's build keeps its validation gates. A manually requested
+  hosted workflow still depends on the owner's GitHub runner allowance.
 - Local sync ignores LF/CRLF-only differences and locks each destination checkout
   during writes. Application edits do not block shared sync; conflicting unpublished
   shared edits do. Commit and review those changes, then offer them to the template
@@ -205,9 +205,9 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   set `TEMPLATE_READ_TOKEN` with read access. Never store credentials in source
   or the root environment file. The template itself skips self-sync.
 - Direct pushes to the default branch are allowed by the workspace owner.
-  Keep Dependency checks running after pushes, but do not configure required
+  Keep Dependency checks available on explicit request, but do not configure required
   status checks or PR-only protection unless the owner explicitly requests it.
-  Automatic dependency/template PR merges still require successful `frontend`
+  Explicit dependency/template PR merges still require successful `frontend`
   and `backend` jobs on the current PR commit.
   Checks cover a clean npm install, lint, TypeScript, production build, Python
   dependency consistency, Django system checks and shared dependency-sync tests.
@@ -221,7 +221,7 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   accepts successful checks on the exact current PR commit. Dependency major
   releases and backend/runtime updates still require review; template-sync PRs
   can merge after the receiving project's checks pass. It never runs PR code
-  with write permissions. A scheduled merge sweep also picks up bot-created
+  with write permissions. A manually requested merge sweep also picks up bot-created
   template PRs whose checks were explicitly dispatched; it verifies the same
   current-commit checks and base ancestry. Without this setup, update PRs remain
   for review.
