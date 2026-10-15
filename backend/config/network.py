@@ -14,6 +14,7 @@ import socket
 import socketserver
 import struct
 import subprocess
+import sys
 import threading
 import time
 
@@ -144,6 +145,30 @@ def revoke_all(directory):
         state.with_suffix('.yml').unlink(missing_ok=True)
 
 
+def local_subnet(address):
+    """Use the selected interface's real mask; never assume a /24 network."""
+    if sys.platform == 'win32':
+        command = f"Get-NetIPAddress -IPAddress '{address}' -AddressFamily IPv4 | Select-Object -First 1 -ExpandProperty PrefixLength"
+        prefix = subprocess.check_output(['powershell.exe', '-NoProfile', '-Command', command],
+                                         timeout=8, creationflags=subprocess.CREATE_NO_WINDOW, text=True).strip()
+        return ipaddress.ip_network(f'{address}/{int(prefix)}', strict=False)
+    if sys.platform == 'darwin':
+        result = subprocess.check_output(['ifconfig'], text=True)
+        match = re.search(r'\binet\s+' + re.escape(address) + r'\s+netmask\s+(0x[0-9a-fA-F]+|[0-9.]+)', result)
+        if match:
+            mask = match[1]
+            if mask.startswith('0x'):
+                mask = str(ipaddress.IPv4Address(int(mask, 16)))
+            return ipaddress.ip_network(f'{address}/{mask}', strict=False)
+    else:
+        result = json.loads(subprocess.check_output(['ip', '-j', '-4', 'address', 'show'], text=True))
+        for interface in result:
+            for item in interface.get('addr_info', []):
+                if item.get('local') == address:
+                    return ipaddress.ip_network(f'{address}/{item["prefixlen"]}', strict=False)
+    raise ValueError('Could not determine the selected interface subnet; specify --network')
+
+
 def hello_hostname(data):
     """Read SNI from a bounded, complete TLS ClientHello; reject malformed input."""
     try:
@@ -268,7 +293,7 @@ def serve(directory, address, upstream, port=443, network=None):
     signature = network_signature(address)
     checked = time.monotonic()
     with Relay((address, port), Forward) as relay:
-        relay.network = ipaddress.ip_network(network or (address + '/24'), strict=False)
+        relay.network = ipaddress.ip_network(network, strict=False) if network else local_subnet(address)
         if ip not in relay.network or not relay.network.is_private:
             raise ValueError('The listener must belong to the selected private subnet')
         relay.directory = directory

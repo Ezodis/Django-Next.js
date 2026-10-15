@@ -15,6 +15,12 @@ from .project_config import exposure_check_command, is_shared, mobile_apps, sync
 
 
 class LocalNetworkTests(SimpleTestCase):
+    def test_lan_uses_the_interface_prefix_instead_of_assuming_a_24_bit_network(self):
+        from .network import local_subnet
+        interfaces = [{'addr_info': [{'local': '192.168.4.2', 'prefixlen': 22}]}]
+        with patch('config.network.sys.platform', 'linux'), patch('config.network.subprocess.check_output', return_value=json.dumps(interfaces)):
+            self.assertEqual(str(local_subnet('192.168.4.2')), '192.168.4.0/22')
+
     def test_local_names_follow_folder_but_existing_resource_identity_is_preserved(self):
         from .network import configure
         with TemporaryDirectory() as temporary:
