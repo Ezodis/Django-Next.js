@@ -120,6 +120,108 @@ class LocalNetworkTests(SimpleTestCase):
                         worker.join(3)
 
 
+class MonitorLanTests(SimpleTestCase):
+    def test_control_get_is_read_only_and_post_requires_local_origin_host_and_token(self):
+        import http.client
+        import threading
+        from .network import monitor_server
+        with TemporaryDirectory() as directory, patch('config.network.monitor_change', return_value='LAN on') as change:
+            server, token = monitor_server(directory, directory)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            origin = f'http://127.0.0.1:{server.server_port}'
+            def request(method, headers=None, body=None):
+                connection = http.client.HTTPConnection(*server.server_address, timeout=3)
+                try:
+                    connection.request(method, '/' if method == 'GET' else '/toggle', body, headers or {})
+                    response = connection.getresponse()
+                    data = response.read()
+                    return response.status, data
+                finally:
+                    connection.close()
+            try:
+                status, page = request('GET')
+                self.assertEqual(status, 200)
+                self.assertIn(b'history.replaceState', page)
+                self.assertNotIn(token.encode(), page)
+                change.assert_not_called()
+                headers = {'Origin': origin, 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'}
+                for field, bad in [('Origin', 'https://untrusted.example'), ('Authorization', 'Bearer invalid'), ('Host', 'untrusted.example')]:
+                    self.assertEqual(request('POST', {**headers, field: bad}, '{"action":"on"}')[0], 403)
+                self.assertEqual(request('POST', {'Content-Type': 'application/json'}, '{"action":"on"}')[0], 403)
+                self.assertEqual(request('POST', headers, '{"action":"execute"}')[0], 400)
+                self.assertEqual(request('POST', headers, '[]')[0], 400)
+                self.assertEqual(request('POST', headers, 'x' * 257)[0], 400)
+                change.assert_not_called()
+                self.assertEqual(request('POST', headers, '{"action":"on"}')[0], 200)
+                change.assert_called_once_with(directory, directory, 'on')
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(3)
+
+    def test_multiple_monitors_cannot_update_lan_concurrently(self):
+        from .network import monitor_update_lock
+        with TemporaryDirectory() as directory:
+            with monitor_update_lock(directory):
+                with self.assertRaisesRegex(ValueError, 'Another monitor'):
+                    with monitor_update_lock(directory):
+                        self.fail('A second writer acquired the LAN lock')
+            with monitor_update_lock(directory):
+                pass
+
+    def test_workspace_discovery_preserves_resource_namespace_and_rejects_collisions(self):
+        from .network import monitor_projects
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('One.app', 'Two.app'):
+                checkout = root / name
+                (checkout / 'backend').mkdir(parents=True)
+                (checkout / 'dev.sh').touch()
+                (checkout / 'backend/project.py').write_text('')
+            (root / 'One.app/backend/project.py').write_text("DEV_RESOURCE_NAMESPACE = 'existing'\n")
+            self.assertEqual(set(monitor_projects(root / 'One.app')), {'existing', 'twoapp'})
+            (root / 'Two.app/backend/project.py').write_text("DEV_RESOURCE_NAMESPACE = 'existing'\n")
+            with self.assertRaisesRegex(ValueError, 'share a resource namespace'):
+                monitor_projects(root / 'One.app')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows network category guard')
+    def test_public_network_is_rejected_before_any_project_command(self):
+        from .network import monitor_change
+        with TemporaryDirectory() as directory, patch('config.network.monitor_projects', return_value={'app': Path(directory)}), patch('config.network.subprocess.check_output', side_effect=['app\n', '']), patch('config.network.subprocess.run') as command:
+            with self.assertRaisesRegex(ValueError, 'Public'):
+                monitor_change(directory, directory, 'on')
+            command.assert_not_called()
+
+    def test_failed_enable_rolls_back_new_opt_ins_and_never_runs_other_workspaces(self):
+        from .network import monitor_change
+        with TemporaryDirectory() as directory:
+            roots = {name: Path(directory) / name for name in ('one', 'two')}
+            for root in roots.values():
+                root.mkdir()
+            inventories = ['one\ntwo\nunrelated\n'] + (['3'] if os.name == 'nt' else [])
+            results = [subprocess.CompletedProcess([], code, '', 'failed' if code else '') for code in (0, 1, 0, 0)]
+            with patch('config.network.monitor_projects', return_value=roots), patch('config.network.subprocess.check_output', side_effect=inventories), patch('config.network.subprocess.run', side_effect=results) as command:
+                with self.assertRaisesRegex(ValueError, 'failed'):
+                    monitor_change(directory, directory, 'on')
+            self.assertEqual(command.call_count, 4)
+            self.assertEqual([call.kwargs['cwd'].name for call in command.call_args_list], ['one', 'two', 'one', 'two'])
+
+    def test_off_revokes_all_projects_even_when_a_launcher_fails(self):
+        from .network import configure, monitor_change, enabled_hosts
+        with TemporaryDirectory() as directory:
+            roots = {name: Path(directory) / name for name in ('one', 'two')}
+            routing = Path(directory) / 'routing'
+            for root in roots.values():
+                root.mkdir()
+                configure(root, 'on', routing)
+            with patch('config.network.monitor_projects', return_value=roots), patch('config.network.subprocess.check_output', return_value='one\ntwo\n'), patch('config.network.subprocess.run', return_value=subprocess.CompletedProcess([], 1, '', 'failed')):
+                with self.assertRaisesRegex(ValueError, 'failed'):
+                    monitor_change(directory, routing, 'off')
+            self.assertEqual(enabled_hosts(routing), set())
+            self.assertEqual(list(routing.glob('*-lan.yml')), [])
+
+
 class ProjectIsolationTests(SimpleTestCase):
     def test_checkout_identity_is_separate_from_accessible_source_bridge(self):
         from .project_config import check_project_isolation

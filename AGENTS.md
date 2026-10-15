@@ -104,6 +104,12 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - `dev.sh lan on|off|status` and `dev.ps1 lan on|off|status` control only this
   project's ingress. LAN starts off; tunnel state is independent. Revoking access
   must also close existing relay connections. Never share application ports.
+- The monitor's Infrastructure LAN link controls running checkouts in its workspace.
+  Keep its controller on loopback only, with exact Host/Origin checks and a random
+  session token. GET and link previews never mutate sharing; changes use POST.
+  Serialize changes across monitors, fail closed on enable errors, and retain the
+  native Windows trusted-network/firewall checks. Never expose the controller
+  through Traefik, a tunnel or the LAN listener.
 - Phones need multicast DNS support on their Wi-Fi and must trust the public
   local CA. `dev.ps1 lan certificate` exports only rootCA.pem to Downloads as
   ProjectLocalCA.crt. Never export rootCA-key.pem. Wi-Fi client isolation can

@@ -4557,6 +4557,13 @@ _draw_status_live() {
           _header_color=$'\033[33m'
         fi
       fi
+      # OSC 8 opens a loopback-only controller; app/tunnel routes never expose it.
+      local _lan_url="" _lan_label='LAN OFF'
+      if [[ -n "${DEV_LAN_CONTROL_STATE:-}" && -s "$DEV_LAN_CONTROL_STATE" ]]; then
+        _lan_url=$(python3 "$ROOT_DIR/backend/config/network.py" monitor-link --control-state "$DEV_LAN_CONTROL_STATE" 2>/dev/null || true)
+        [[ "$_lan_url" == *'&action=off' ]] && _lan_label='LAN ON'
+        [[ -n "$_lan_url" ]] && _infra_links="  $(_hyperlink "$_lan_url" "[${_lan_label}]")${_infra_links}"
+      fi
       printf '  \033[1;35m%s%s\033[35m infrastructure\033[0m\033[37m%s\033[0m\n\n' "$_header_color" "$_header_icon" "$_infra_links"
       cat "$_core_rows"
       echo ""
@@ -4976,6 +4983,21 @@ live_monitor() {
 
   _wire_podman_socket 2>/dev/null || true
 
+  # Native Windows hosts the controller because enabling LAN also needs its
+  # firewall and mDNS listener. Unix keeps this helper in the monitor's session.
+  local _lan_control_pid="" _lan_control_dir=""
+  if [[ -z "${DEV_LAN_CONTROL_STATE:-}" ]] && ! grep -qi microsoft /proc/version 2>/dev/null; then
+    _lan_control_dir=$(mktemp -d /tmp/devtools-lan-control-XXXXXX)
+    export DEV_LAN_CONTROL_STATE="$_lan_control_dir/control.json"
+    python3 "$ROOT_DIR/backend/config/network.py" monitor --root "$ROOT_DIR" --control-state "$DEV_LAN_CONTROL_STATE" >"$_lan_control_dir/control.log" 2>&1 &
+    _lan_control_pid=$!
+    local _attempt
+    for _attempt in {1..20}; do
+      [[ -s "$DEV_LAN_CONTROL_STATE" ]] && break
+      sleep 0.1
+    done
+  fi
+
   local _rows_file
   _rows_file="$(mktemp /tmp/${PROJECT_NAME}-status-rows-XXXXXX)"
   local _SAVED_STTY
@@ -4985,6 +5007,11 @@ live_monitor() {
     printf '\033[?25h'
     stty "$_SAVED_STTY" 2>/dev/null || true
     rm -f "$_rows_file"
+    if [[ -n "$_lan_control_pid" ]]; then
+      kill "$_lan_control_pid" 2>/dev/null || true
+      rm -f "$_lan_control_dir/control.json" "$_lan_control_dir/control.log"
+      rmdir "$_lan_control_dir" 2>/dev/null || true
+    fi
     printf "\n\033[2m  Services keep running in the background.\033[0m\n\n"
     exit 0
   }

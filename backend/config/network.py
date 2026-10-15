@@ -4,6 +4,10 @@ The LAN entrypoint has routes only for enabled projects. Local-only routes use
 separate loopback listeners. Only the public CA certificate is exported for phones.
 """
 import argparse
+import base64
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import secrets
 import ipaddress
 import json
 import os
@@ -327,9 +331,203 @@ def serve(directory, address, upstream, port=443, network=None):
             relay.shutdown()
 
 
+
+@contextmanager
+def monitor_update_lock(directory):
+    # Separate monitors share a native-host lock; a crash releases it automatically.
+    parent = Path(os.environ['LOCALAPPDATA']) / 'ProjectDevelopment' if os.name == 'nt' else Path(directory)
+    parent.mkdir(parents=True, exist_ok=True)
+    with (parent / '.lan-control.lock').open('a+b') as handle:
+        if handle.tell() == 0:
+            handle.write(b'0')
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise ValueError('Another monitor is updating LAN access. Wait for it to finish.') from error
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == 'nt':
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def monitor_projects(root):
+    """Only checkouts in this workspace can be controlled; never accept shell paths."""
+    from config.project_config import resource_namespace
+    projects = {}
+    for candidate in Path(root).resolve().parent.iterdir():
+        if not (candidate / 'dev.sh').is_file() or not (candidate / 'backend/project.py').is_file():
+            continue
+        namespace = resource_namespace(candidate)
+        if namespace in projects:
+            raise ValueError('Two checkouts share a resource namespace; resolve the collision first')
+        projects[namespace] = candidate
+    return projects
+
+
+def monitor_change(root, directory, action):
+    if action not in ('on', 'off'):
+        raise ValueError('Choose LAN on or off')
+    projects = monitor_projects(root)
+    command = ['podman', 'ps', '--format', '{{index .Labels "com.docker.compose.project"}}']
+    native = os.name == 'nt'
+    if native:
+        command = ['wsl.exe', '-d', 'Ubuntu', '--cd', '/', '--', *command]
+    options = {'creationflags': subprocess.CREATE_NO_WINDOW} if native else {}
+    running = set(subprocess.check_output(command, text=True, timeout=15, **options).split()) if action == 'on' else set()
+    enabled = {path.name[:-len('-lan.state')] for path in Path(directory).glob('*-lan.state')}
+    selected = sorted((running if action == 'on' else running | enabled) & projects.keys())
+    if not selected:
+        if action == 'off':
+            return 'LAN is already off for this workspace.'
+        raise ValueError('No running projects were found in this workspace')
+    if action == 'on' and native:
+        # Refuse before preparing any routes or displaying elevation prompts.
+        trusted = subprocess.check_output([
+            'powershell.exe', '-NoProfile', '-Command',
+            "Get-NetConnectionProfile | Where-Object {$_.IPv4Connectivity -ne 'Disconnected' -and "
+            "$_.NetworkCategory -in @('Private','DomainAuthenticated')} | Select-Object -ExpandProperty InterfaceIndex"
+        ], text=True, timeout=15, **options).strip()
+        if not trusted:
+            raise ValueError('LAN remains off. Windows marks this network as Public. Only enable sharing on a trusted Private or Domain network.')
+
+    def apply(namespace, desired):
+        checkout = projects[namespace]
+        if native:
+            script = str(checkout / 'dev.ps1').replace("'", "''")
+            source = f"& '{script}' lan {desired}; exit $LASTEXITCODE"
+            encoded = base64.b64encode(source.encode('utf-16-le')).decode('ascii')
+            command = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded]
+        else:
+            command = ['bash', str(checkout / 'dev.sh'), 'lan', desired]
+        result = subprocess.run(command, cwd=checkout, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', **options)
+        if result.returncode:
+            raise ValueError((result.stderr or result.stdout or 'LAN update failed')[-2500:])
+
+    if action == 'off':
+        # Close every selected project's existing connection before launcher cleanup.
+        for namespace in selected:
+            configure(projects[namespace], 'off', directory)
+    changed = []
+    try:
+        for namespace in selected:
+            if action == 'on' and namespace not in enabled:
+                changed.append(namespace)
+            apply(namespace, action)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # A partially enabled workspace must not silently remain shared.
+        for namespace in changed:
+            try:
+                apply(namespace, 'off')
+            except (OSError, ValueError, subprocess.SubprocessError):
+                configure(projects[namespace], 'off', directory)
+        raise
+    names = ', '.join(projects[namespace].name for namespace in selected)
+    return f'LAN {action}: {names}. Your project URLs stay the same.'
+
+
+def monitor_server(root, directory):
+    """A monitor-only loopback control, authenticated independently of app sessions."""
+    token = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(24)
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass  # Never log control tokens or app output.
+
+        def valid_host(self):
+            return self.headers.get('Host') == f'127.0.0.1:{self.server.server_port}'
+
+        def respond(self, status, body, kind='application/json'):
+            data = body.encode('utf-8')
+            self.send_response(status)
+            self.send_header('Content-Type', kind + '; charset=utf-8')
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Content-Security-Policy',
+                             "default-src 'none'; script-src 'nonce-" + nonce + "'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if not self.valid_host():
+                self.respond(403, '{}')
+                return
+            if self.path != '/':
+                self.respond(404, '{}')
+                return
+            # GET/prefetch never changes state. Only a real document executes the
+            # authenticated same-origin POST; the secret stays in the URL fragment.
+            self.respond(200, """<!doctype html><html lang="en"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Local network</title>
+<style>:root{color-scheme:dark}body{font:17px/1.6 system-ui;max-width:640px;margin:12vh auto;padding:24px;background:#15151b;color:#eee}h1{font-size:28px}p{white-space:pre-wrap;color:#bbb}</style>
+<h1>Local network</h1><p id="result">Updating LAN access…</p>
+<script nonce=""" + '"' + nonce + '"' + """>
+const parameters = new URLSearchParams(location.hash.slice(1));
+history.replaceState(null, '', '/');
+(async () => {
+  try {
+    const response = await fetch('/toggle', {method:'POST', headers:{'Content-Type':'application/json',
+      'Authorization':'Bearer ' + parameters.get('token')}, body:JSON.stringify({action:parameters.get('action')})});
+    const result = await response.json();
+    document.getElementById('result').textContent = result.message || 'Use the LAN control in your terminal to try again.';
+  } catch (_) {document.getElementById('result').textContent = 'The monitor has closed. Reopen it and try again.';}
+})();
+</script></html>""", 'text/html')
+
+        def do_POST(self):
+            origin = f'http://127.0.0.1:{self.server.server_port}'
+            if (not self.valid_host() or self.headers.get('Origin') != origin
+                    or not secrets.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + token)):
+                self.respond(403, json.dumps({'message': 'Use the LAN control in your terminal.'}))
+                return
+            if self.path != '/toggle' or self.headers.get('Content-Type') != 'application/json':
+                self.respond(400, '{}')
+                return
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 256:
+                    raise ValueError('Invalid request size')
+                self.connection.settimeout(5)
+                request = json.loads(self.rfile.read(length))
+                action = request.get('action')
+                if action not in ('on', 'off'):
+                    raise ValueError('Invalid LAN action')
+            except (ValueError, OSError, AttributeError):
+                self.respond(400, '{}')
+                return
+            if not lock.acquire(blocking=False):
+                self.respond(409, json.dumps({'message': 'A LAN update is already running. Wait for it to finish.'}))
+                return
+            try:
+                with monitor_update_lock(directory):
+                    message = monitor_change(root, directory, action)
+                self.respond(200, json.dumps({'message': message}))
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                self.respond(400, json.dumps({'message': str(error)}))
+            finally:
+                lock.release()
+
+    return ThreadingHTTPServer(('127.0.0.1', 0), Handler), token
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['on', 'off', 'status', 'serve'])
+    parser.add_argument('action', choices=['on', 'off', 'status', 'serve', 'monitor', 'monitor-link'])
     parser.add_argument('--root', default='.')
     parser.add_argument('--directory', default='/tmp/traefik-dynamic')
     parser.add_argument('--address')
@@ -337,8 +535,19 @@ if __name__ == '__main__':
     parser.add_argument('--network')
     parser.add_argument('--relay-source', action='append', default=[])
     parser.add_argument('--discover', action='store_true')
+    parser.add_argument('--control-state')
     args = parser.parse_args()
-    if args.action == 'serve':
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    if args.action == 'monitor':
+        server, token = monitor_server(args.root, args.directory)
+        with server:
+            atomic_json(args.control_state, {'url': f'http://127.0.0.1:{server.server_port}', 'token': token})
+            server.serve_forever()
+    elif args.action == 'monitor-link':
+        state = json.loads(Path(args.control_state).read_text(encoding='utf-8'))
+        action = 'off' if enabled_hosts(args.directory) else 'on'
+        print(f'{state["url"]}/#token={state["token"]}&action={action}')
+    elif args.action == 'serve':
         serve(args.directory, args.address, args.upstream, network=args.network)
     else:
         relays = ['127.0.0.1/32', '::1/128'] + args.relay_source

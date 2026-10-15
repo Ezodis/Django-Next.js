@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Windows entry point for dev.sh.
@@ -60,9 +60,6 @@ Get-NetFirewallRule -Name '$rule-HTTPS', '$rule-mDNS' -ErrorAction SilentlyConti
 New-NetFirewallRule -Name '$rule-HTTPS' -DisplayName 'Project LAN HTTPS' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 443 -LocalAddress '$lanAddress' -RemoteAddress LocalSubnet -Profile Private,Domain -InterfaceAlias '$alias' -Program '$program' | Out-Null
 New-NetFirewallRule -Name '$rule-mDNS' -DisplayName 'Project LAN discovery' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 5353 -RemoteAddress LocalSubnet -Profile Private,Domain -InterfaceAlias '$alias' -Program '$program' | Out-Null
 "@
-    $encodedRules = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($rules))
-    $setup = Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList "-NoProfile -EncodedCommand $encodedRules"
-    if ($setup.ExitCode -ne 0) { throw 'LAN firewall setup was not completed.' }
     $upstream = ((wsl.exe -d Ubuntu --cd / -- hostname -I) -split '\s+')[0]
     if (-not $upstream) { throw 'WSL is unavailable; LAN access was not enabled.' }
     $stateDirectory = '\\wsl.localhost\Ubuntu\tmp\traefik-dynamic'
@@ -79,6 +76,9 @@ New-NetFirewallRule -Name '$rule-mDNS' -DisplayName 'Project LAN discovery' -Dir
             Stop-Process -Id $old.pid -ErrorAction SilentlyContinue
         }
     }
+    $encodedRules = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($rules))
+    $setup = Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList "-NoProfile -EncodedCommand $encodedRules"
+    if ($setup.ExitCode -ne 0) { throw 'LAN firewall setup was not completed.' }
     # A new sharing session opts in only the requested project. Stale opt-ins
     # from a previous network/reboot must not silently follow this computer.
     $selectedHost = (Get-Item $ROOT_DIR).Name.ToLowerInvariant() + '.local'
@@ -938,8 +938,46 @@ Start-Process -FilePath (Get-Command wsl.exe).Source -WindowStyle Hidden -Argume
     '-d', 'Ubuntu', '--cd', '/', '--', 'bash', "`"$wslWorkspace/dev.sh`"", '_workspace-sync',
     "`"$wslRoot`"", "`"$wslWorkspace`""
 ) | Out-Null
-wsl.exe -d Ubuntu --cd / -- bash $tmpScript
-$devShExitCode = $LASTEXITCODE
+# A local terminal link can enable LAN through this native host without asking
+# WSL to access an unavailable Windows-drive mount. No sharing occurs at startup.
+$lanControlProcess = $null
+$lanControlDirectory = ''
+$lanControlLinuxState = ''
+$lanControlWindowsDirectory = ''
+if ($DevArgs.Count -eq 0 -or $DevArgs[0] -in @('status', 'monitor', 'up', 'start', 'restart')) {
+    $nativePython = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($nativePython) {
+        $lanControlDirectory = ((wsl.exe -d Ubuntu --cd / -- mktemp -d /tmp/devtools-lan-control-XXXXXX) -join '').Trim()
+        if ($LASTEXITCODE -eq 0 -and $lanControlDirectory -match '^/tmp/devtools-lan-control-[a-zA-Z0-9]+$') {
+            $lanControlLinuxState = "$lanControlDirectory/control.json"
+            $lanControlWindowsDirectory = '\\wsl.localhost\Ubuntu' + $lanControlDirectory.Replace('/', '\')
+            $controlHelper = Join-Path $ROOT_DIR 'backend\config\network.py'
+            $controlState = Join-Path $lanControlWindowsDirectory 'control.json'
+            $lanControlProcess = Start-Process -FilePath $nativePython.Source -WindowStyle Hidden -PassThru -ArgumentList @(
+                "`"$controlHelper`"", 'monitor', '--root', "`"$ROOT_DIR`"",
+                '--directory', '"\\wsl.localhost\Ubuntu\tmp\traefik-dynamic"', '--control-state', "`"$controlState`""
+            ) -RedirectStandardOutput (Join-Path $lanControlWindowsDirectory 'control.log') -RedirectStandardError (Join-Path $lanControlWindowsDirectory 'control-error.log')
+            for ($attempt = 0; $attempt -lt 20 -and -not (Test-Path -LiteralPath $controlState); $attempt++) {
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    }
+}
+
+try {
+    wsl.exe -d Ubuntu --cd / -- env "DEV_LAN_CONTROL_STATE=$lanControlLinuxState" bash $tmpScript
+    $devShExitCode = $LASTEXITCODE
+} finally {
+    if ($lanControlProcess -and -not $lanControlProcess.HasExited) {
+        Stop-Process -Id $lanControlProcess.Id -ErrorAction SilentlyContinue
+    }
+    if ($lanControlWindowsDirectory) {
+        foreach ($file in @('control.json', 'control.log', 'control-error.log')) {
+            Remove-Item -LiteralPath (Join-Path $lanControlWindowsDirectory $file) -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $lanControlWindowsDirectory -ErrorAction SilentlyContinue
+    }
+}
 wsl.exe -d Ubuntu --cd / -- rm -f $tmpScript 2>$null | Out-Null
 
 
