@@ -4,7 +4,7 @@ import time
 from email.message import EmailMessage
 
 from django.contrib.auth.models import User
-from django.test import TestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 
 from .models import ReceivedEmail
@@ -119,7 +119,7 @@ class ComposeTests(TestCase):
     def test_failure_remains_queued_and_retains_sender(self):
         from .delivery import send_pending_mail
         message = OutgoingEmail.objects.create(from_alias="orders", recipient="reader@example.test", subject="Reply", body="Hello")
-        with patch("mailroom.delivery.send_mail", side_effect=RuntimeError("secret")):
+        with patch("mailroom.delivery.EmailMessage.send", side_effect=RuntimeError("secret")):
             send_pending_mail()
         message.refresh_from_db()
         self.assertIsNone(message.sent_at)
@@ -204,7 +204,7 @@ class MailboxWorkspaceTests(TestCase):
         self.assertContains(response, 'class="mail-composer"')
         self.assertContains(response, 'value="reader@example.test"')
         self.assertContains(response, 'value="support"')
-        with patch("mailroom.delivery.send_mail") as send:
+        with patch("mailroom.delivery.EmailMessage.send") as send:
             response = self.client.post(self.url, {"action": "send", "from_alias": "support",
                 "recipient": "reader@example.test", "subject": "Re: A special edition", "body": "Hello"})
             send.assert_not_called()
@@ -245,8 +245,8 @@ class MailboxWorkspaceTests(TestCase):
         self.assertEqual(self.client.get(self.url, {"message": self.message.pk}).status_code, 404)
 
     def test_pagination_limits_rows_and_malformed_identifiers_fail_closed(self):
-        ReceivedEmail.objects.bulk_create([ReceivedEmail(sender="reader@example.test", recipient="support@example.test",
-            subject=f"Message {index}", raw_message=b"Hello", digest=f"{index:064x}") for index in range(35)])
+        [ReceivedEmail.objects.create(sender="reader@example.test", recipient="support@example.test",
+            subject=f"Message {index}", raw_message=b"Hello", digest=f"{index:064x}") for index in range(35)]
         response = self.client.get(self.url)
         self.assertEqual(len(response.context["page"].object_list), 30)
         self.assertTrue(response.context["page"].has_next())
@@ -258,3 +258,199 @@ class MailboxWorkspaceTests(TestCase):
         client = Client(enforce_csrf_checks=True)
         client.force_login(self.owner)
         self.assertEqual(client.post(self.url, {"action": "archive", "selected": self.message.pk}).status_code, 403)
+
+
+@override_settings(MAILBOX_DOMAIN="example.test", EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+class ConversationTests(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_superuser("owner", "owner@example.test", "test-pass")
+        self.client.force_login(self.owner)
+        self.url = reverse("admin:mailroom_receivedemail_changelist")
+        self.original = self.receive("<first@example.test>", "Availability", "Hello https://example.test/book?edition=1&lang=en")
+
+    def receive(self, message_id, subject, text="Hello", references="", html=None):
+        mime = EmailMessage()
+        mime["From"] = "Reader <reader@example.test>"
+        mime["To"] = "support@example.test"
+        mime["Cc"] = "Friend <friend@example.test>"
+        mime["Reply-To"] = "replies@example.test"
+        mime["Subject"] = subject
+        mime["Message-ID"] = message_id
+        if references:
+            mime["References"] = references
+        mime.set_content(text)
+        if html:
+            mime.add_alternative(html, subtype="html")
+        raw = mime.as_bytes()
+        return ReceivedEmail.objects.create(sender="reader@example.test", recipient="support@example.test", subject=subject,
+            message_id=message_id, text_body=text, raw_message=raw, digest=hashlib.sha256(raw).hexdigest())
+
+    def test_rfc_threading_includes_sent_replies_and_preserves_external_headers(self):
+        from .delivery import send_pending_mail
+        from django.core import mail
+        response = self.client.post(self.url, {"action": "send", "mode": "reply", "source_type": "incoming",
+            "source_id": self.original.pk, "from_alias": "support", "recipient": "reader@example.test",
+            "subject": "Re: Availability", "body": "Yes, it is available."})
+        self.assertEqual(response.status_code, 302)
+        reply = OutgoingEmail.objects.get()
+        self.assertEqual(reply.thread_id, self.original.thread_id)
+        send_pending_mail()
+        sent = mail.outbox[0]
+        self.assertEqual(sent.extra_headers["In-Reply-To"], self.original.message_id)
+        self.assertIn(self.original.message_id, sent.extra_headers["References"])
+        self.assertEqual(sent.extra_headers["Message-ID"], reply.message_id)
+        followup = self.receive("<followup@example.test>", "A changed subject", references=self.original.message_id + " " + reply.message_id)
+        self.assertEqual(followup.thread_id, reply.thread_id)
+        response = self.client.get(self.url, {"thread": reply.thread_id})
+        self.assertEqual(response.context["page"].paginator.count, 1)
+        self.assertEqual(len(response.context["conversation"]), 3)
+        self.assertContains(response, "Yes, it is available.")
+
+    def test_duplicate_subjects_are_separate_but_out_of_order_replies_join(self):
+        separate = self.receive("<new@example.test>", "Availability")
+        self.assertNotEqual(separate.thread_id, self.original.thread_id)
+        child = self.receive("<child@example.test>", "Re: Another conversation", references="<missing@example.test>")
+        parent = self.receive("<missing@example.test>", "Another conversation")
+        self.assertEqual(child.thread_id, parent.thread_id)
+
+    def test_links_and_html_are_clickable_without_executable_or_remote_content(self):
+        message = self.receive("<html@example.test>", "Your confirmation", html='''<html><head><style>body{display:none}</style></head><body>
+            <p>Confirm your address <a href="https://example.test/confirm?token=abc&amp;lang=en" onclick="steal()">Confirm email</a></p>
+            <img src="https://tracker.example.test/pixel"><script>steal()</script><iframe src="https://evil.test"></iframe>
+            <a href="javascript:steal()">Bad</a><svg onload="steal()"></svg><form action="https://evil.test"><input name="password"></form>
+            <b>Thanks!</b></body></html>''')
+        response = self.client.get(self.url, {"thread": message.thread_id})
+        self.assertContains(response, 'href="https://example.test/confirm?token=abc&amp;lang=en" target="_blank" rel="noopener noreferrer"')
+        self.assertContains(response, "<b>Thanks!</b>")
+        for unsafe in ('onclick=', 'javascript:', '<iframe', '<form action="https://evil', 'tracker.example.test', 'steal()'):
+            self.assertNotContains(response, unsafe)
+        response = self.client.get(self.url, {"thread": self.original.thread_id})
+        self.assertContains(response, 'href="https://example.test/book?edition=1&amp;lang=en"')
+
+    def test_reply_all_uses_reply_to_and_excludes_own_address(self):
+        response = self.client.get(self.url, {"reply_all": self.original.pk})
+        initial = response.context["compose_form"].initial
+        self.assertEqual(initial["recipient"], "replies@example.test")
+        self.assertEqual(initial["cc"], "friend@example.test")
+        response = self.client.get(self.url, {"forward": self.original.pk})
+        self.assertEqual(response.context["compose_form"].initial["recipient"], "")
+        self.assertIn("Forwarded message", response.context["compose_form"].initial["body"])
+
+    def test_partial_drafts_are_private_and_never_sent_until_explicitly_queued(self):
+        from .delivery import send_pending_mail
+        from django.core import mail
+        self.client.post(self.url, {"action": "save_draft", "from_alias": "support", "body": "Unfinished"})
+        draft = OutgoingEmail.objects.get()
+        self.assertTrue(draft.is_draft)
+        send_pending_mail()
+        self.assertEqual(len(mail.outbox), 0)
+        other = User.objects.create_superuser("other", "other@example.test", "test-pass")
+        self.client.force_login(other)
+        self.assertNotContains(self.client.get(self.url, {"folder": "drafts"}), "Unfinished")
+        self.assertEqual(self.client.get(self.url, {"draft": draft.pk}).status_code, 404)
+        legacy = self.client.get(reverse("admin:mailroom_outgoingemail_change", args=[draft.pk]))
+        self.assertNotContains(legacy, "Unfinished", status_code=302)
+        self.client.force_login(self.owner)
+        self.client.post(self.url, {"action": "send", "draft": draft.pk, "from_alias": "support",
+            "recipient": "reader@example.test", "subject": "Finished", "body": "Ready"})
+        self.assertEqual(OutgoingEmail.objects.count(), 1)
+        draft.refresh_from_db()
+        self.assertFalse(draft.is_draft)
+        send_pending_mail()
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(self.client.post(self.url, {"action": "send", "draft": draft.pk}).status_code, 404)
+
+    def test_cc_bcc_and_attachments_deliver_with_private_downloads(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from django.core import mail
+        from .delivery import send_pending_mail
+        response = self.client.post(self.url, {"action": "send", "from_alias": "support", "subject": "Details", "body": "Attached",
+            "recipient": "One <one@example.test>, two@example.test", "cc": "friend@example.test", "bcc": "private@example.test",
+            "attachments": SimpleUploadedFile("details.txt", b"the details", content_type="text/plain")})
+        self.assertEqual(response.status_code, 302)
+        email = OutgoingEmail.objects.get()
+        send_pending_mail()
+        self.assertEqual(mail.outbox[0].to, ["one@example.test", "two@example.test"])
+        self.assertEqual(mail.outbox[0].cc, ["friend@example.test"])
+        self.assertEqual(mail.outbox[0].bcc, ["private@example.test"])
+        self.assertNotIn("Bcc", mail.outbox[0].message())
+        self.assertEqual(mail.outbox[0].attachments[0].filename, "details.txt")
+        url = reverse("admin:mailroom_outgoing_attachment", args=[email.attachments.get().pk])
+        response = self.client.get(url)
+        self.assertEqual(b"".join(response.streaming_content), b"the details")
+        self.assertIn("no-store", response["Cache-Control"])
+        self.client.force_login(User.objects.create_user("staff", is_staff=True))
+        self.assertEqual(self.client.get(url).status_code, 403)
+
+    def test_bulk_thread_actions_trash_restore_and_worker_hold(self):
+        from .delivery import send_pending_mail
+        from django.core import mail
+        self.receive("<second@example.test>", "Re: Availability", references=self.original.message_id)
+        queued = OutgoingEmail.objects.create(thread=self.original.thread, from_alias="support", recipient="reader@example.test", subject="Re: Availability", body="Hi")
+        for action in ("read", "star", "archive"):
+            self.client.post(self.url, {"action": action, "threads": self.original.thread_id})
+        self.assertFalse(ReceivedEmail.objects.filter(is_read=False).exists())
+        self.assertEqual(self.client.get(self.url, {"folder": "starred"}).context["page"].paginator.count, 1)
+        self.assertEqual(self.client.get(self.url).context["page"].paginator.count, 0)
+        self.client.post(self.url, {"action": "trash", "threads": self.original.thread_id})
+        self.assertEqual(self.client.get(self.url, {"folder": "trash"}).context["page"].paginator.count, 1)
+        send_pending_mail()
+        self.assertEqual(len(mail.outbox), 0)
+        self.client.post(self.url, {"action": "restore", "threads": self.original.thread_id})
+        self.assertEqual(self.client.get(self.url).context["page"].paginator.count, 1)
+        send_pending_mail()
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_thread_permissions_and_csrf_protect_hidden_messages(self):
+        from django.contrib.auth.models import Permission
+        outgoing = OutgoingEmail.objects.create(thread=self.original.thread, from_alias="support", recipient="reader@example.test", subject="Reply", body="Outgoing content")
+        staff = User.objects.create_user("outgoing", is_staff=True)
+        staff.user_permissions.add(Permission.objects.get(codename="view_outgoingemail"))
+        self.client.force_login(staff)
+        response = self.client.get(self.url, {"folder": "outbox", "thread": outgoing.thread_id})
+        self.assertContains(response, "Outgoing content")
+        self.assertNotContains(response, "edition=1")
+        self.assertEqual(len(response.context["conversation"]), 1)
+        self.assertEqual(self.client.post(self.url, {"action": "trash", "threads": outgoing.thread_id}).status_code, 403)
+        self.assertEqual(self.client.get(self.url, {"thread": "invalid"}).status_code, 404)
+
+    def test_upload_limit_and_header_injection_do_not_queue_mail(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        data = {"action": "send", "from_alias": "support", "recipient": "reader@example.test", "subject": "Hi", "body": "Hello"}
+        response = self.client.post(self.url, {**data, "attachments": [SimpleUploadedFile(str(i) + ".txt", b"x") for i in range(11)]})
+        self.assertContains(response, "Attach up to 10 files")
+        response = self.client.post(self.url, {**data, "cc": "friend@example.test\nBcc: attacker@example.test"})
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(OutgoingEmail.objects.exists())
+
+
+class MailboxMigrationTests(TransactionTestCase):
+    def test_existing_mail_is_preserved_and_threaded_during_upgrade(self):
+        from django.db import connection
+        from django.db.migrations.executor import MigrationExecutor
+        old = [("mailroom", "0003_project_sender")]
+        new = [("mailroom", "0004_mailbox_threads_and_drafts")]
+        executor = MigrationExecutor(connection)
+        executor.migrate(old)
+        apps = executor.loader.project_state(old).apps
+        Received = apps.get_model("mailroom", "ReceivedEmail")
+        Outgoing = apps.get_model("mailroom", "OutgoingEmail")
+        raw = b"Message-ID: <historic@example.test>\nSubject: Original\n\nStored content"
+        first = Received.objects.create(sender="reader@example.test", recipient="support@example.test", subject="Original",
+            message_id="<historic@example.test>", raw_message=raw, text_body="Stored content", digest="a" * 64, is_read=True, is_archived=True)
+        sent = Outgoing.objects.create(from_alias="support", sender="support@example.test", recipient="reader@example.test",
+            subject="Re: Original", body="Historic reply")
+        try:
+            executor = MigrationExecutor(connection)
+            executor.migrate(new)
+            first = ReceivedEmail.objects.get(pk=first.pk)
+            sent = OutgoingEmail.objects.get(pk=sent.pk)
+            self.assertEqual(first.thread_id, sent.thread_id)
+            self.assertEqual(bytes(first.raw_message), raw)
+            self.assertTrue(first.is_read)
+            self.assertTrue(first.is_archived)
+            self.assertEqual(sent.body, "Historic reply")
+            self.assertFalse(sent.is_draft)
+            self.assertTrue(sent.message_id)
+        finally:
+            MigrationExecutor(connection).migrate(new)

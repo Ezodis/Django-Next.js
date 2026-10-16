@@ -209,12 +209,17 @@ New-NetFirewallRule -Name '$rule-HTTPS' -DisplayName 'Project LAN HTTPS' -Direct
         (Get-FileHash -LiteralPath (Join-Path $ROOT_DIR $_) -Algorithm SHA256).Hash
     }) -join ':'
     $running = $null
+    $preserveSharingSession = $false
     if (Test-Path -LiteralPath $pidFile) {
         $old = Get-Content -LiteralPath $pidFile -Raw | ConvertFrom-Json
         $running = Get-CimInstance Win32_Process -Filter "ProcessId=$($old.pid)" -ErrorAction SilentlyContinue
         if ($running -and $running.CommandLine -like '*config*network.py*serve*') {
-            if ($old.address -eq $lanAddress -and $old.upstream -eq $upstream -and $old.network -eq $networkId -and [bool]$old.allowPublic -eq [bool]$AllowPublic -and $old.revision -eq $helperRevision -and
-                (Test-ProjectLanListenerReady -ProcessId $old.pid -Address $lanAddress)) { return }
+            $sameSession = $old.address -eq $lanAddress -and $old.upstream -eq $upstream -and $old.network -eq $networkId -and [bool]$old.allowPublic -eq [bool]$AllowPublic
+            $readySession = $sameSession -and (Test-ProjectLanListenerReady -ProcessId $old.pid -Address $lanAddress)
+            if ($readySession -and $old.revision -eq $helperRevision) { return }
+            # A code refresh may keep this verified live session's opt-ins. An
+            # unready helper or changed network/address/trust is a new session.
+            $preserveSharingSession = $readySession -and -not [string]::IsNullOrWhiteSpace([string]$old.revision) -and $old.revision -ne $helperRevision
             Stop-Process -Id $old.pid -ErrorAction SilentlyContinue
         }
     }
@@ -223,13 +228,16 @@ New-NetFirewallRule -Name '$rule-HTTPS' -DisplayName 'Project LAN HTTPS' -Direct
     if ($setup.ExitCode -ne 0) { throw 'LAN firewall setup was not completed.' }
     # A new sharing session opts in only the requested project. Stale opt-ins
     # from a previous network/reboot must not silently follow this computer.
-    $selectedHost = Get-ProjectDevelopmentHostname
-    foreach ($state in Get-ChildItem -LiteralPath $stateDirectory -Filter '*-lan.state') {
-        $entry = Get-Content -LiteralPath $state.FullName -Raw | ConvertFrom-Json
-        if ($entry.host -ne $selectedHost) {
-            Remove-Item -LiteralPath $state.FullName
-            $route = [IO.Path]::ChangeExtension($state.FullName, '.yml')
-            if (Test-Path -LiteralPath $route) { Remove-Item -LiteralPath $route }
+    # Replacing only the code of a ready same-network helper keeps its opt-ins.
+    if (-not $preserveSharingSession) {
+        $selectedHost = Get-ProjectDevelopmentHostname
+        foreach ($state in Get-ChildItem -LiteralPath $stateDirectory -Filter '*-lan.state') {
+            $entry = Get-Content -LiteralPath $state.FullName -Raw | ConvertFrom-Json
+            if ($entry.host -ne $selectedHost) {
+                Remove-Item -LiteralPath $state.FullName
+                $route = [IO.Path]::ChangeExtension($state.FullName, '.yml')
+                if (Test-Path -LiteralPath $route) { Remove-Item -LiteralPath $route }
+            }
         }
     }
     $helper = Join-Path $ROOT_DIR 'backend\config\network.py'

@@ -6,12 +6,12 @@ from email.parser import BytesParser
 
 from django.conf import settings
 from django.http import JsonResponse
-from django.utils.html import strip_tags
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from .models import ReceivedEmail
 from .configuration import inbound_domains, inbound_secret
+from .content import html_text
 
 MAX_MESSAGE_BYTES = 10 * 1024 * 1024
 
@@ -54,7 +54,7 @@ def receive_email(request):
         except (LookupError, UnicodeError):
             text = (body.get_payload(decode=True) or b"").decode("utf-8", errors="replace")
         if body.get_content_type() == "text/html":
-            text = strip_tags(text)
+            text = html_text(text)
     digest = hashlib.sha256(recipient.lower().encode() + b"\0" + sender.encode() + b"\0" + raw).hexdigest()
     email, created = ReceivedEmail.objects.get_or_create(digest=digest, defaults={
         "sender": sender, "recipient": recipient, "subject": str(message.get("Subject", ""))[:1000],

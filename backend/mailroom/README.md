@@ -3,7 +3,7 @@
 This app is discovered automatically in each project. Inbox lives at
 `/admin/mailroom/receivedemail/`; Compose and sent mail supports sending and replies.
 Read/unread, archive, MIME and attachment downloads require mailbox permissions.
-Bodies render as escaped text without remote HTML resources. Mail lives in each
+Bodies render with linked plain text or an allowlisted HTML reader. Mail lives in each
 project's own database and is included in its database backups.
 
 ## Configuration
@@ -57,17 +57,50 @@ and sending each require per-project provider/domain activation.
 ## Unified admin workspace
 
 Admin shows one Inbox entry for the mailbox. Its workspace contains Inbox,
-Unread, Sent, Outbox and Archive, a searchable message list, a reading pane,
-attachments, compose and reply. Search covers subject, addresses and message text;
-results are paginated in batches of 30 without loading full MIME payloads.
-Bulk read/unread/archive controls and delivery retry require the corresponding
-model change permissions. Compose requires outgoing add permission. All writes
-require CSRF protection; viewing a message does not change it through a GET.
-Outgoing-only users cannot see received mail. Legacy admin URLs remain available
-for bookmarked forms but are hidden from navigation.
+Unread, Starred, Sent, Outbox, Drafts, Archive, All mail and recoverable Trash.
+Incoming messages and outgoing replies share collapsible conversations. Standard
+Message-ID, In-Reply-To and References headers connect replies, including replies
+received before their parent. Headerless replies use matching subjects and both
+correspondents as a fallback; independent new messages with the same subject stay
+separate. Reply, Reply all and Forward share the composer. Reply-To is honored;
+Reply all excludes the receiving address. Forwarding copies the message text;
+download and reattach any original attachments that should accompany it.
+
+Search covers subject, addresses, Cc and message text; results paginate by 30
+conversations. Lists defer MIME payloads and full bodies until the reader opens.
+Plain URLs and HTML buttons/links are clickable. The HTML reader reconstructs a
+small formatting vocabulary, strips scripts, forms, CSS and embedded resources,
+and does not load remote images or tracking pixels. Links open a separate tab with
+noopener/noreferrer. Original MIME and attachments remain downloadable.
+
+The composer supports multiple To/Cc/Bcc addresses, up to 10 attachments totaling
+10 MiB, and explicitly saved drafts. Drafts belong to their author, remain editable,
+and are excluded from delivery and other users' views. Sending a saved draft queues
+that same record once. Bcc recipients are not included in the delivered MIME headers.
+Attachments stay in the project database and its backups. Sending uses the existing
+Django provider, with stable Message-ID and reply headers on retries.
+
+Bulk read/unread/archive and retry use the corresponding model change permissions.
+Star/trash changes that affect both incoming and outgoing mail require change access
+to both. Trash is reversible; it pauses queued mail until restored. No automatic
+purge is performed. Compose requires outgoing add permission. All writes require
+CSRF protection. Opening a conversation marks it read through an explicit browser
+POST; GET requests remain read-only. Outgoing-only users cannot see received mail,
+even within a shared conversation. Legacy admin URLs remain permission-checked.
 
 The interface follows Django admin's light/dark theme and adapts to small screens.
-`/` focuses search; `c` opens compose outside input fields. Edited compose forms
-warn before leaving the page; Discard explicitly abandons the current form.
-Drafts are not stored automatically. Authored labels use Django template i18n;
+`/` focuses search; `c` composes; `r` replies; `j`/`k` navigate conversations and
+Escape returns to the list outside input fields. Edited compose forms warn before
+leaving; Save draft stores them on the server. Authored labels use Django template i18n;
 message content is never sent to the web interface translation provider.
+
+Migration `0004_mailbox_threads_and_drafts` groups existing mail while retaining
+raw messages, delivery state and read/archive flags. Run `python manage.py migrate
+mailroom` before starting updated web and mail-worker processes. Normal project
+startup already runs migrations. This app is part of `SHARED_PATHS`, so new projects
+and template sync receive the same functionality without sharing databases, domains,
+credentials or mail-provider settings.
+
+The conversation and folder interaction patterns were informed by the MIT-licensed
+[Zero](https://github.com/Mail-0/Zero) email client. This implementation stays inside
+the existing Django admin and does not require a second application or OAuth service.

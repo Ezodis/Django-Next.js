@@ -5336,7 +5336,7 @@ live_monitor() {
     trap 'exit 0' HUP INT TERM
     while true; do
       _draw_status_live "$_rows_file" > "${_frame_file}.raw" 2>/dev/null || true
-      python3 "$ROOT_DIR/backend/config/network.py" monitor-frame --frame "${_frame_file}.raw" --controls "$_rows_file" --output "$_frame_file" 2>/dev/null || true
+      python3 "$ROOT_DIR/backend/config/network.py" monitor-frame --root "$ROOT_DIR" --frame "${_frame_file}.raw" --controls "$_rows_file" --output "$_frame_file" 2>/dev/null || true
       sleep 3
     done
   ) </dev/null &
