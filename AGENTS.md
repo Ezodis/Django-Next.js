@@ -105,8 +105,8 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   project's ingress. LAN defaults on for running projects on trusted networks;
   remember explicit global/per-project off choices. Tunnel state is independent. Revoking access
   must also close existing relay connections. Never share application ports.
-- The monitor's Infrastructure power button controls running checkouts in its workspace;
-  each project's power button controls only that project. Red/green reflects actual
+- The monitor's Infrastructure LAN button controls running checkouts in its workspace;
+  each project's LAN button controls only that project. Red/green reflects actual
   sharing, not the saved preference. Startup defaults never bypass network trust
   checks or repeatedly request elevation after a failure.
   Keep its controller on loopback only, with exact Host/Origin checks and a random

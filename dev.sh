@@ -4531,19 +4531,20 @@ _draw_status_live() {
     printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$_url" "$_label"
   }
 
-  # A tiny power button; terminal backgrounds use a muted tint rather than alpha.
+  # Explicit LAN state with terminal-theme colors and no forced background.
   _lan_button() {
     [[ -n "${DEV_LAN_CONTROL_STATE:-}" && -s "$DEV_LAN_CONTROL_STATE" ]] || return 0
-    local _url _scope=()
+    local _url _label='[LAN OFF]' _scope=()
     [[ -n "${1:-}" ]] && _scope=(--project "$1")
     _url=$(python3 "$ROOT_DIR/backend/config/network.py" monitor-link --root "$ROOT_DIR" --control-state "$DEV_LAN_CONTROL_STATE" "${_scope[@]}" 2>/dev/null || true)
     [[ -n "$_url" ]] || return 0
     if [[ "$_url" == *'&action=off' ]]; then
-      printf '\033[48;2;27;52;40m\033[38;2;107;188;139m'
+      _label='[LAN ON]'
+      printf '\033[32m'
     else
-      printf '\033[48;2;59;31;35m\033[38;2;218;119;127m'
+      printf '\033[31m'
     fi
-    _hyperlink "$_url" ' ⏻ '
+    _hyperlink "$_url" "$_label"
     printf '\033[0m'
   }
 
