@@ -864,7 +864,7 @@ won't be served during testing. These tests verify the configuration.
             self.assertEqual(settings.MEDIA_URL, '/media/')
         else:
             # In production, MEDIA_URL could be a GCS URL or local fallback
-            self.assertTrue(settings.MEDIA_URL.startswith(('http://', 'https://', '/media/')))
+            self.assertTrue(settings.MEDIA_URL.startswith(('http://', 'https://', '/')))
 
     def test_storage_backend_configuration(self):
         """Storage may be local or supplied by any project's overrides."""

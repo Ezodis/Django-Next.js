@@ -213,6 +213,7 @@ class MailboxWorkspaceTests(TestCase):
         self.assertContains(self.client.get(self.url, {"folder": "outbox"}), "Queued")
         self.assertNotContains(self.client.get(self.url, {"folder": "sent"}), "Re: A special edition")
 
+    @override_settings(LANGUAGE_CODE="en")
     def test_invalid_compose_retains_form_errors_without_queuing(self):
         response = self.client.post(self.url, {"action": "send", "from_alias": "other@foreign.test",
             "recipient": "not-an-email", "subject": "Test", "body": "Body"})
