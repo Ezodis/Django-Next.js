@@ -8,7 +8,16 @@ SYNC_PROJECT_PATHS = []
 SYNC_TEMPLATE_REPO = "Ezodis/Django-Next.js"
 MOBILE_APP_ORDER = []
 MOBILE_ANDROID_METADATA = {}
-ENV_DEFAULTS = {}
+ENV_DEFAULTS = {
+    'PROJECT_ACCOUNT_EMAIL': '',
+    'DEFAULT_FROM_EMAIL': '',
+    'EMAIL_BACKEND': '',
+    'MAILBOX_DOMAIN': '',
+    'CLOUDFLARE_ACCOUNT_ID': '',
+    'CLOUDFLARE_EMAIL_API_TOKEN': '',
+    'BREVO_API_KEY': '',
+    'EMAIL_USE_SSL': '',
+}
 COMPOSE_SERVICES = """
 services:
   mail-worker:
@@ -33,3 +42,8 @@ services:
         condition: service_healthy
     restart: unless-stopped
 """
+
+
+# Shared mailbox behavior, with identity and credentials owned by this project.
+from mailroom.configuration import project_email_settings as _project_email_settings
+globals().update(_project_email_settings())

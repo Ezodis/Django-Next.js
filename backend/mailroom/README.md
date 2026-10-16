@@ -9,12 +9,21 @@ project's own database and is included in its database backups.
 ## Configuration
 
 `MAILBOX_DOMAIN` overrides this project's `DOMAIN`. The default alias is taken
-from `DEFAULT_FROM_EMAIL` when its domain matches, otherwise it is `support`.
+from `DEFAULT_FROM_EMAIL` when its domain matches, otherwise it is `$`.
 Existing messages and saved sender aliases are preserved. Credentials belong in
 this project's root `.env` or deployment variables; never copy another project's
 credentials. Django email backend/provider configuration stays in `backend/project.py`.
-Existing project email integrations are unchanged. Console, dummy and file
-backends leave messages queued instead of claiming actual delivery.
+Projects opt in with `project_email_settings()` from `mailroom.configuration`
+in their `backend/project.py`. `PROJECT_ACCOUNT_EMAIL` and `DEFAULT_FROM_EMAIL`
+default to `$@<MAILBOX_DOMAIN or DOMAIN>`. Explicit environment overrides win.
+The helper chooses Cloudflare HTTPS when `CLOUDFLARE_EMAIL_API_TOKEN` is set
+(also requires `CLOUDFLARE_ACCOUNT_ID`), Brevo HTTPS when `BREVO_API_KEY` is set,
+or the project's SMTP configuration. `EMAIL_BACKEND` can explicitly select a
+provider. Console, dummy and file backends leave messages queued instead of
+claiming actual delivery. The address identifies the project; it does not create
+provider accounts or supply credentials. Each project needs its own activated
+sending domain and provider credentials. Stripe accounts likewise retain their
+own API keys, webhook secrets, payment-method activation and payout setup.
 
 During a domain move, `MAILBOX_LEGACY_DOMAINS` can contain a comma-separated list
 of previous domains accepted by the signed inbound endpoint. Outgoing messages
