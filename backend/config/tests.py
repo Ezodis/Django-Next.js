@@ -54,10 +54,47 @@ class LocalNetworkTests(SimpleTestCase):
         host = 'project.app.local'
         answer = mdns_answer(query(host), {host}, '192.168.1.2')
         self.assertEqual(dns_name(answer, 12)[0], host)
-        self.assertEqual(answer[-4:], bytes([192, 168, 1, 2]))
+        _, end = dns_name(answer, 12)
+        self.assertEqual(answer[end + 10:end + 14], bytes([192, 168, 1, 2]))
         self.assertIsNone(mdns_answer(query('other.app.local'), {host}, '192.168.1.2'))
         self.assertIsNone(mdns_answer(query(host), set(), '192.168.1.2'))
         self.assertIsNone(mdns_answer(b'bad', {host}, '192.168.1.2'))
+
+    def test_mdns_safari_https_and_ipv6_queries_get_negative_records_and_ipv4(self):
+        import struct
+        from .network import mdns_answer, dns_name, mdns_destination
+        host = 'project.app.local'
+        encoded = b''.join(bytes([len(label)]) + label.encode() for label in host.split('.')) + b'\0'
+        # Safari sends multiquestion HTTPS + address queries, with compressed
+        # names and the QU bit after waking or joining a wireless network.
+        packet = (struct.pack('!HHHHHH', 123, 0, 2, 0, 0, 0) + encoded
+                  + struct.pack('!HH', 65, 32769) + b'\xc0\x0c' + struct.pack('!HH', 28, 32769))
+        peer = ('192.168.1.3', 5353)
+        self.assertEqual(mdns_destination(packet, {host}, peer), peer)
+        answer = mdns_answer(packet, {host}, '192.168.1.2')
+        self.assertEqual(struct.unpack('!HHHHHH', answer[:12]), (0, 0x8400, 0, 1, 0, 1))
+        name, end = dns_name(answer, 12)
+        kind, klass, ttl, size = struct.unpack('!HHIH', answer[end:end + 10])
+        self.assertEqual((name, kind, klass, ttl), (host, 47, 32769, 30))
+        next_name, bitmap = dns_name(answer, end + 10)
+        self.assertEqual(next_name, host)
+        self.assertEqual(answer[bitmap:bitmap + 3], b'\x00\x01\x40')
+        name, end = dns_name(answer, end + 10 + size)
+        self.assertEqual(struct.unpack('!HHIH', answer[end:end + 10]), (1, 32769, 30, 4))
+        self.assertEqual(answer[end + 10:end + 14], bytes([192, 168, 1, 2]))
+        self.assertIsNone(mdns_answer(packet, set(), '192.168.1.2'))
+        multicast = packet.replace(struct.pack('!HH', 28, 32769), struct.pack('!HH', 28, 1))
+        self.assertEqual(mdns_destination(multicast, {host}, peer), ('224.0.0.251', 5353))
+        legacy = mdns_answer(packet, {host}, '192.168.1.2', legacy=True)
+        self.assertEqual(struct.unpack('!HHHHHH', legacy[:12])[:3], (123, 0x8400, 2))
+        offset = 12
+        for _ in range(2):
+            _, offset = dns_name(legacy, offset)
+            offset += 4
+        _, offset = dns_name(legacy, offset)
+        self.assertEqual(struct.unpack('!HHIH', legacy[offset:offset + 10])[:3], (47, 1, 10))
+        self.assertEqual(mdns_destination(packet, {host}, (peer[0], 54321)), (peer[0], 54321))
+        self.assertIsNone(mdns_answer(packet[:-1], {host}, '192.168.1.2'))
 
     def test_tls_hostname_uses_real_clienthello_and_rejects_incomplete_input(self):
         import ssl

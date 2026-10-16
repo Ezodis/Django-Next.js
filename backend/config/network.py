@@ -248,26 +248,60 @@ def dns_name(packet, offset):
         offset += size
 
 
-def mdns_answer(packet, hosts, address):
+def mdns_questions(packet):
     if len(packet) < 12 or packet[2] & 128:
-        return None
+        return []
     count = int.from_bytes(packet[4:6], 'big')
     if count > 64:
-        return None
-    p, answers = 12, []
+        return []
+    p, questions = 12, []
     try:
         for _ in range(count):
             name, p = dns_name(packet, p)
             kind, klass = struct.unpack('!HH', packet[p:p + 4])
             p += 4
-            if name in hosts and kind in (1, 255) and klass & 32767 in (1, 255):
-                encoded = b''.join(bytes([len(label)]) + label.encode() for label in name.split('.')) + b'\0'
-                answers.append(encoded + struct.pack('!HHIH', 1, 32769, 30, 4) + socket.inet_aton(address))
+            questions.append((name, kind, klass))
     except (ValueError, IndexError, UnicodeError, struct.error):
+        return []
+    return questions
+
+
+def mdns_destination(packet, hosts, sender):
+    # QU questions request a unicast reply, including Safari's first lookup.
+    matching = [klass for name, _, klass in mdns_questions(packet)
+                if name in hosts and klass & 32767 in (1, 255)]
+    return sender if sender[1] != 5353 or matching and all(klass & 32768 for klass in matching) else ('224.0.0.251', 5353)
+
+
+def mdns_answer(packet, hosts, address, legacy=False):
+    questions = mdns_questions(packet)
+    matching = [(name, kind) for name, kind, klass in questions
+                if name in hosts and klass & 32767 in (1, 255)]
+    if not matching:
         return None
-    if not answers:
-        return None
-    return struct.pack('!HHHHHH', 0, 0x8400, 0, len(answers), 0, 0) + b''.join(answers)
+
+    def encoded_name(name):
+        return b''.join(bytes([len(label)]) + label.encode('ascii') for label in name.split('.')) + b'\0'
+
+    def record(name, kind):
+        encoded = encoded_name(name)
+        # This relay publishes IPv4 HTTPS only. NSEC explicitly tells clients
+        # there is no AAAA or HTTPS/SVCB record instead of making them time out.
+        data = socket.inet_aton(address) if kind == 1 else encoded + b'\x00\x01\x40'
+        return encoded + struct.pack('!HHIH', kind, 1 if legacy else 32769,
+                                     10 if legacy else 30, len(data)) + data
+
+    answers = dict.fromkeys((name, 1 if kind in (1, 255) else 47) for name, kind in matching)
+    additional = dict.fromkeys((name, kind) for name, _ in matching for kind in (1, 47)
+                               if (name, kind) not in answers)
+    # Legacy unicast DNS replies echo the ID and the decoded question section;
+    # do not copy compressed names whose offsets belonged to the query packet.
+    echoed = b''.join(encoded_name(name) + struct.pack('!HH', kind, klass & 32767)
+                      for name, kind, klass in questions) if legacy else b''
+    return (struct.pack('!HHHHHH', int.from_bytes(packet[:2], 'big') if legacy else 0,
+                        0x8400, len(questions) if legacy else 0, len(answers), 0, len(additional))
+            + echoed + b''.join(record(*item) for item in answers)
+            + b''.join(record(*item) for item in additional))
 
 
 class Relay(socketserver.ThreadingTCPServer):
@@ -329,22 +363,27 @@ def serve(directory, address, upstream, port=443, network=None, allow_public=Fal
                             socket.inet_aton('224.0.0.251') + socket.inet_aton(address))
             mdns.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(address))
             mdns.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+            mdns.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 255)
             mdns.settimeout(1)
             while enabled_hosts(directory):
                 if time.monotonic() - checked >= 10:
                     try:
-                        if network_signature(address, allow_public) != signature:
+                        current_signature = network_signature(address, allow_public)
+                        if current_signature != signature:
+                            print('LAN stopped: network identity changed: ' + current_signature, file=sys.stderr, flush=True)
                             revoke_all(directory)
                             break
-                    except (OSError, ValueError, subprocess.SubprocessError):
+                    except (OSError, ValueError, subprocess.SubprocessError) as error:
+                        print('LAN stopped: network verification failed: ' + type(error).__name__ + ': ' + str(error), file=sys.stderr, flush=True)
                         revoke_all(directory)
                         break
                     checked = time.monotonic()
                 try:
                     packet, sender = mdns.recvfrom(9000)
-                    answer = mdns_answer(packet, enabled_hosts(directory), address)
+                    hosts = enabled_hosts(directory)
+                    answer = mdns_answer(packet, hosts, address, legacy=sender[1] != 5353)
                     if answer:
-                        mdns.sendto(answer, ('224.0.0.251', 5353) if sender[1] == 5353 else sender)
+                        mdns.sendto(answer, mdns_destination(packet, hosts, sender))
                 except socket.timeout:
                     pass
             relay.shutdown()
