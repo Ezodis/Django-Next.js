@@ -110,7 +110,8 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   sharing, not the saved preference. Startup defaults never bypass network trust
   checks or repeatedly request elevation after a failure.
   Controls are handled inside the terminal: Tab/arrows select, Space/Enter toggle,
-  L toggles all, and VT mouse clicks activate the displayed hit regions. Keep
+  Ctrl+C exits, and VT mouse clicks activate the displayed hit regions. The
+  Infrastructure button is the master control; do not bind letter keys L or Q. Keep
   keyboard control available when a terminal has no mouse support. Restore terminal
   modes on exit and keep slow rendering separate from responsive input handling.
   The native host controller uses authenticated file IPC in the private monitor

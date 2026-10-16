@@ -22,6 +22,7 @@ import struct
 import subprocess
 import sys
 import threading
+import textwrap
 import time
 
 
@@ -469,7 +470,7 @@ def monitor_change(root, directory, action, project=None, remember=True):
             "$_.NetworkCategory -in @('Private','DomainAuthenticated')} | Select-Object -ExpandProperty InterfaceIndex"
         ], text=True, timeout=15, **options).strip()
         if not trusted:
-            raise ValueError('LAN remains off. Windows marks this network as Public. Only enable sharing on a trusted Private or Domain network.')
+            raise ValueError('LAN blocked: this Windows network is Public. If you trust it, set its network profile to Private in Windows Settings, then try again.')
 
     def apply(namespace, desired):
         checkout = projects[namespace]
@@ -706,7 +707,10 @@ def monitor_terminal(frame, state):
                 size = os.get_terminal_size(sys.stdout.fileno())
             except OSError:
                 size = shutil.get_terminal_size((100, 30))
-            height = max(1, size.lines - 3)
+            clean_message = ' '.join(re.sub(r'[\x00-\x1f\x7f]', '', ANSI.sub('', message)).split())
+            message_lines = textwrap.wrap(clean_message, width=max(1, size.columns - 1)) or ['']
+            message_lines = message_lines[:max(1, min(3, size.lines - 4))]
+            height = max(1, size.lines - len(message_lines) - 2)
             lines = text.splitlines() or ['Loading services…']
             offset = max(0, min(offset, len(lines) - height))
             paint = signature, selected, offset, message, pending, size
@@ -728,9 +732,9 @@ def monitor_terminal(frame, state):
                         line = LAN_LABEL.sub(lambda match: '\x1b[7m' + match.group() + '\x1b[27m', line, count=1)
                     output.append(line + '\x1b[0m')
                 output.extend([''] * (height - len(output)))
-                clean_message = ' '.join(re.sub(r'[\x00-\x1f\x7f]', '', ANSI.sub('', message)).split())[:max(1, size.columns - 1)]
-                help_text = 'Tab/arrows select | Space/Enter toggle | L all | Q quit | Shift to select text'
-                output.extend(['\x1b[2m' + help_text[:max(1, size.columns - 1)] + '\x1b[0m', clean_message])
+                help_text = 'Tab/arrows select | Space/Enter toggle | Ctrl+C exit | Shift to select text'
+                output.append('\x1b[2m' + help_text[:max(1, size.columns - 1)] + '\x1b[0m')
+                output.extend(message_lines)
                 sys.stdout.write('\x1b[H\x1b[2J' + '\n'.join(output))
                 sys.stdout.flush()
                 last_paint = paint
@@ -754,16 +758,12 @@ def monitor_terminal(frame, state):
                                        if button['row'] == y + offset and button['column'] <= x < min(size.columns, button['column'] + button['width'])), None)
                 elif event[0] == 'key':
                     key = event[1]
-                    if key.lower() == 'q':
-                        return
                     if key in ('\t', 'down', 'up', 'backtab') and controls:
                         selected = (selected + (-1 if key in ('up', 'backtab') else 1)) % len(controls)
                         offset = min(offset, controls[selected]['row'])
                         offset = max(offset, controls[selected]['row'] - height + 1)
                     elif key in (' ', '\r', '\n') and controls:
                         target = selected
-                    elif key.lower() == 'l':
-                        target = next((i for i, button in enumerate(controls) if button['project'] is None), None)
                     elif key in ('pageup', 'pagedown'):
                         offset += -height if key == 'pageup' else height
                 if target is not None and not pending and metadata:
