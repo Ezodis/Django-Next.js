@@ -282,9 +282,21 @@ function sharedRoutingModule(){
  loaded.filename=file;loaded.paths=Module._nodeModulePaths(__dirname);
  const original=loaded.require.bind(loaded);
  loaded.require=id=>id==='./localization/prepare.cjs'?{prepare:()=>{},verify:()=>{}}:original(id);
- loaded._compile(ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,esModuleInterop:true}}).outputText,file);
+ loaded._compile(ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,esModuleInterop:true}}).outputText,file);
  return loaded.exports;
 }
+test('development origins use the canonical domain independently of resource names',()=>{
+ const routing=sharedRoutingModule(),before={...process.env};
+ try{
+  process.env.DEV_HOST='dev.example.com';process.env.PROJECT_HOST='legacyresources';
+  process.env.NEXT_PUBLIC_URL='https://dev.example.com';
+  process.env.CLOUDFLARE_TUNNEL_URL='https://public.example.net';
+  assert.deepEqual(routing.buildAllowedDevOrigins(),['*.trycloudflare.com','dev.example.com','public.example.net']);
+  delete process.env.DEV_HOST;delete process.env.NEXT_PUBLIC_URL;delete process.env.CLOUDFLARE_TUNNEL_URL;
+  assert.deepEqual(routing.buildAllowedDevOrigins(),['*.trycloudflare.com']);
+ }finally{process.env=before;}
+});
+
 test('admin proxy is project-independent and preserves custom rewrites',async()=>{
  const routing=sharedRoutingModule(),before={...process.env};
  try{

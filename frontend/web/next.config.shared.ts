@@ -5,17 +5,17 @@ import {prepare, verify} from './localization/prepare.cjs';
 // Development infrastructure shared by every template project.
 // Keep routing, integrations, plugins, and application options in next.config.ts.
 export function buildAllowedDevOrigins(): string[] {
-  const origins = new Set(['**.local', '*.trycloudflare.com']);
-  const projectHost = process.env.PROJECT_HOST?.trim();
-  if (projectHost) {
-    origins.add(projectHost.endsWith('.local') ? projectHost : `${projectHost}.local`);
+  const origins = new Set(['*.trycloudflare.com']);
+  const developmentHost = process.env.DEV_HOST?.trim();
+  if (developmentHost) {
+    origins.add(developmentHost);
   }
   for (const value of [process.env.NEXT_PUBLIC_URL, process.env.CLOUDFLARE_TUNNEL_URL]) {
     if (!value) continue;
     try {
       origins.add(new URL(value).hostname);
     } catch {
-      // Ignore malformed optional URLs; local wildcard coverage remains available.
+      // Ignore malformed optional URLs; only configured development hosts apply.
     }
   }
   return [...origins];

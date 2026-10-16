@@ -37,6 +37,113 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Get-ProjectDevelopmentHostname {
+    $nativePython = Get-Command python.exe -ErrorAction SilentlyContinue
+    if (-not $nativePython) { throw 'Install native Python 3 to resolve the development domain and run LAN setup.' }
+    $resolved = & $nativePython.Source (Join-Path $ROOT_DIR 'backend\config\project_config.py') $ROOT_DIR dev-host
+    if ($LASTEXITCODE -ne 0 -or -not $resolved) { throw 'Could not resolve this project development hostname.' }
+    return (($resolved | Out-String).Trim())
+}
+
+function Get-ProjectDevelopmentTlsMode {
+    $nativePython = Get-Command python.exe -ErrorAction SilentlyContinue
+    if (-not $nativePython) { throw 'Install native Python 3 to start the development workspace.' }
+    $reader = @"
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(sys.argv[1]) / 'backend'))
+from config.project_config import environment_values
+mode = environment_values(Path(sys.argv[1])).get('DEV_TLS_MODE', 'local').strip().lower()
+if mode not in ('local', 'public'):
+    raise SystemExit('DEV_TLS_MODE must be local or public.')
+print(mode)
+"@
+    $resolved = $reader | & $nativePython.Source - $ROOT_DIR
+    if ($LASTEXITCODE -ne 0 -or -not $resolved) { throw 'Could not resolve development HTTPS mode.' }
+    return (($resolved | Out-String).Trim())
+}
+
+function Sync-ProjectDevelopmentCredentials {
+    param([switch]$Optional)
+    # Validate one private host credential, then transfer it over stdin into WSL.
+    # Neither the token nor its contents enter Git, process arguments or logs.
+    $nativePython = Get-Command python.exe -ErrorAction SilentlyContinue
+    if (-not $nativePython) { throw 'Install native Python 3, then run .\dev.ps1 lan setup.' }
+    $mirror = @"
+import json, re, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'backend'))
+from config.development_dns import prepare_host, host_token_file
+try:
+    if sys.argv[2] == 'optional' and not host_token_file().is_file():
+        raise SystemExit(0)
+    token_path = prepare_host(Path(sys.argv[1]))
+    email_path = token_path.parent / 'acme-email'
+    if email_path.exists():
+        email = email_path.read_text(encoding='utf-8-sig').strip()
+    else:
+        result = subprocess.run(['git', 'config', '--global', 'user.email'], capture_output=True, text=True)
+        email = result.stdout.strip() if result.returncode == 0 else ''
+        print('Trusted HTTPS uses the global Git email for ACME registration; override it in the private host acme-email file.')
+    if not re.fullmatch(r'[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+', email):
+        raise ValueError('Run .\\dev.ps1 lan setup to configure the host HTTPS contact email.')
+    writer = r"""
+import json, os, sys, tempfile
+from pathlib import Path
+payload = json.load(sys.stdin)
+directory = Path.home() / '.config' / 'project-development'
+if directory.is_symlink():
+    raise SystemExit('Private host directory must not be a symlink.')
+directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+directory.chmod(0o700)
+for name, content in payload.items():
+    if name not in ('cloudflare-token', 'acme-email'):
+        raise SystemExit('Unexpected private host setting.')
+    target = directory / name
+    if target.is_symlink():
+        raise SystemExit('Private host file must not be a symlink.')
+    data = (content.strip() + '\n').encode('utf-8')
+    if target.is_file() and target.read_bytes() == data:
+        target.chmod(0o600)
+        continue
+    fd, temporary = tempfile.mkstemp(prefix='.' + name + '.', dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+"""
+    payload = {'cloudflare-token': token_path.read_text(encoding='utf-8-sig').strip(), 'acme-email': email}
+    copied = subprocess.run(['wsl.exe', '-d', 'Ubuntu', '--cd', '/', '--', 'python3', '-c', writer],
+                            input=json.dumps(payload).encode('utf-8'), capture_output=True)
+    if copied.returncode:
+        raise ValueError('Could not prepare the private WSL HTTPS credential; existing services were left running.')
+except (OSError, ValueError, RuntimeError) as error:
+    raise SystemExit(str(error))
+"@
+    $requirement = if ($Optional) { 'optional' } else { 'required' }
+    $mirror | & $nativePython.Source - $ROOT_DIR $requirement
+    if ($LASTEXITCODE -ne 0) { throw 'Trusted development HTTPS setup is incomplete. Run .\dev.ps1 lan setup, then retry.' }
+}
+
+function Test-ProjectLanListenerReady {
+    param([int]$ProcessId, [string]$Address)
+    # The helper publishes readiness after initializing its listeners. A live
+    # process alone does not mean the selected LAN interface is accepting HTTPS.
+    $readyPath = Join-Path $env:LOCALAPPDATA 'ProjectDevelopment\lan-ready.json'
+    try {
+        $ready = Get-Content -LiteralPath $readyPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($ready.pid -ne $ProcessId -or $ready.address -ne $Address) { return $false }
+    } catch { return $false }
+    $listeners = @(Get-NetTCPConnection -OwningProcess $ProcessId -State Listen -ErrorAction SilentlyContinue | Where-Object {
+        $_.LocalAddress -eq $Address -and $_.LocalPort -eq 443
+    })
+    return [bool]($listeners.Count -eq 1)
+}
+
 function Start-ProjectLanListener {
     param([switch]$AllowPublic)
     # Explicit Public sessions expose only project HTTPS on the selected subnet.
@@ -54,9 +161,27 @@ function Start-ProjectLanListener {
     } | Select-Object -First 1
     if (-not $address) { throw 'No IPv4 address is available on the trusted network.' }
     $python = Get-Command python.exe -ErrorAction SilentlyContinue
-    if (-not $python) { throw 'Install native Python 3 to advertise .local names on the Windows network.' }
+    if (-not $python) { throw 'Install native Python 3 to run the Windows LAN listener.' }
     $pythonPath = $python.Source
     $lanAddress = $address.IPAddress
+    # Choose and authorize the real Windows interface before DNS publication.
+    Sync-ProjectDevelopmentCredentials
+    & $pythonPath (Join-Path $ROOT_DIR 'backend\config\development_dns.py') $ROOT_DIR sync --address $lanAddress
+    if ($LASTEXITCODE -ne 0) { throw 'Development DNS was not updated; LAN access was not enabled.' }
+    $leaf = ((Get-Item -LiteralPath $ROOT_DIR).Name -replace '[^a-zA-Z0-9._-]', '-').ToLowerInvariant()
+    $runtimeRoot = "/root/.codex-workspaces/$leaf"
+    $runtimeWindows = '\\wsl.localhost\Ubuntu' + $runtimeRoot.Replace('/', '\')
+    $modeWriter = @"
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(sys.argv[1]) / 'backend'))
+from config.development_dns import set_public_mode
+set_public_mode(Path(sys.argv[2]))
+"@
+    $modeWriter | & $pythonPath - $ROOT_DIR $runtimeWindows
+    if ($LASTEXITCODE -ne 0) { throw 'Could not update the runtime HTTPS mode; LAN access was not enabled.' }
+    wsl.exe -d Ubuntu --cd / -- env 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin' bash "$runtimeRoot/dev.sh" lan on
+    if ($LASTEXITCODE -ne 0) { throw 'Trusted HTTPS is not ready; LAN access was not enabled.' }
     $alias = $profile.InterfaceAlias.Replace("'", "''")
     $program = $pythonPath.Replace("'", "''")
     $rule = "Devtools-LAN-$($profile.InterfaceIndex)"
@@ -65,9 +190,9 @@ function Start-ProjectLanListener {
     $firewallProfiles = if ($profile.NetworkCategory -eq 'Public') { 'Public' } else { 'Private,Domain' }
     $rules = @"
 `$ErrorActionPreference = 'Stop'
-Get-NetFirewallRule -Name '$rule-HTTPS', '$rule-mDNS' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+# Remove obsolete owned mDNS/certificate-bootstrap rules; only HTTPS is exposed.
+Get-NetFirewallRule -Name '$rule-HTTPS', '$rule-mDNS', '$rule-Certificate' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 New-NetFirewallRule -Name '$rule-HTTPS' -DisplayName 'Project LAN HTTPS' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 443 -LocalAddress '$lanAddress' -RemoteAddress '$lanSubnet' -Profile $firewallProfiles -InterfaceAlias '$alias' -Program '$program' | Out-Null
-New-NetFirewallRule -Name '$rule-mDNS' -DisplayName 'Project LAN discovery' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 5353 -RemoteAddress '$lanSubnet' -Profile $firewallProfiles -InterfaceAlias '$alias' -Program '$program' | Out-Null
 "@
     $upstream = ((wsl.exe -d Ubuntu --cd / -- hostname -I) -split '\s+')[0]
     if (-not $upstream) { throw 'WSL is unavailable; LAN access was not enabled.' }
@@ -75,14 +200,21 @@ New-NetFirewallRule -Name '$rule-mDNS' -DisplayName 'Project LAN discovery' -Dir
     $stateRoot = Join-Path $env:LOCALAPPDATA 'ProjectDevelopment'
     New-Item -ItemType Directory -Path $stateRoot -Force | Out-Null
     $pidFile = Join-Path $stateRoot 'lan-listener.json'
+    $readyFile = Join-Path $stateRoot 'lan-ready.json'
     $gateway = Get-NetRoute -InterfaceIndex $profile.InterfaceIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Select-Object -First 1 -ExpandProperty NextHop
     $networkId = "$($profile.InterfaceIndex)|$($profile.Name)|$($profile.NetworkCategory)|$lanAddress|$($address.PrefixLength)|$gateway"
+    # Reuse only the implementation that was actually launched. Hash shared
+    # bytes, not checkout paths, so switching projects keeps one healthy relay.
+    $helperRevision = (@('backend\config\network.py', 'backend\config\project_config.py', 'dev.ps1') | ForEach-Object {
+        (Get-FileHash -LiteralPath (Join-Path $ROOT_DIR $_) -Algorithm SHA256).Hash
+    }) -join ':'
     $running = $null
     if (Test-Path -LiteralPath $pidFile) {
         $old = Get-Content -LiteralPath $pidFile -Raw | ConvertFrom-Json
         $running = Get-CimInstance Win32_Process -Filter "ProcessId=$($old.pid)" -ErrorAction SilentlyContinue
         if ($running -and $running.CommandLine -like '*config*network.py*serve*') {
-            if ($old.address -eq $lanAddress -and $old.upstream -eq $upstream -and $old.network -eq $networkId -and [bool]$old.allowPublic -eq [bool]$AllowPublic) { return }
+            if ($old.address -eq $lanAddress -and $old.upstream -eq $upstream -and $old.network -eq $networkId -and [bool]$old.allowPublic -eq [bool]$AllowPublic -and $old.revision -eq $helperRevision -and
+                (Test-ProjectLanListenerReady -ProcessId $old.pid -Address $lanAddress)) { return }
             Stop-Process -Id $old.pid -ErrorAction SilentlyContinue
         }
     }
@@ -91,7 +223,7 @@ New-NetFirewallRule -Name '$rule-mDNS' -DisplayName 'Project LAN discovery' -Dir
     if ($setup.ExitCode -ne 0) { throw 'LAN firewall setup was not completed.' }
     # A new sharing session opts in only the requested project. Stale opt-ins
     # from a previous network/reboot must not silently follow this computer.
-    $selectedHost = (Get-Item $ROOT_DIR).Name.ToLowerInvariant() + '.local'
+    $selectedHost = Get-ProjectDevelopmentHostname
     foreach ($state in Get-ChildItem -LiteralPath $stateDirectory -Filter '*-lan.state') {
         $entry = Get-Content -LiteralPath $state.FullName -Raw | ConvertFrom-Json
         if ($entry.host -ne $selectedHost) {
@@ -105,14 +237,26 @@ New-NetFirewallRule -Name '$rule-mDNS' -DisplayName 'Project LAN discovery' -Dir
     $stderr = Join-Path $stateRoot 'lan-error.log'
     $listenerArgs = @(
         "`"$helper`"", 'serve', '--directory', "`"$stateDirectory`"", '--address', $lanAddress,
-        '--network', "$lanAddress/$($address.PrefixLength)", '--upstream', $upstream
+        '--network', "$lanAddress/$($address.PrefixLength)", '--upstream', $upstream,
+        '--ready-file', "`"$readyFile`""
     )
     if ($AllowPublic) { $listenerArgs += '--allow-public' }
     $listener = Start-Process -FilePath $pythonPath -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr -ArgumentList $listenerArgs
-    @{pid=$listener.Id; address=$lanAddress; upstream=$upstream; network=$networkId; allowPublic=[bool]$AllowPublic} | ConvertTo-Json | Set-Content -LiteralPath $pidFile
-    Start-Sleep -Milliseconds 700
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    do {
+        $listener.Refresh()
+        if ($listener.HasExited) { throw "LAN listener could not start. See $stderr" }
+        if (Test-ProjectLanListenerReady -ProcessId $listener.Id -Address $lanAddress) { break }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if (-not (Test-ProjectLanListenerReady -ProcessId $listener.Id -Address $lanAddress)) {
+        Stop-Process -Id $listener.Id -ErrorAction SilentlyContinue
+        throw "LAN listener did not become ready. See $stderr"
+    }
+    $listener.Refresh()
     if ($listener.HasExited) { throw "LAN listener could not start. See $stderr" }
-    Write-Host "LAN enabled on $($profile.InterfaceAlias): $lanAddress. Trust the public local CA certificate on your phone." -ForegroundColor Green
+    @{pid=$listener.Id; address=$lanAddress; upstream=$upstream; network=$networkId; allowPublic=[bool]$AllowPublic; revision=$helperRevision} | ConvertTo-Json | Set-Content -LiteralPath $pidFile
+    Write-Host "LAN enabled on $($profile.InterfaceAlias): $lanAddress." -ForegroundColor Green
 }
 if ($DevArgs.Count -gt 0 -and ($DevArgs[0] -eq 'watchos' -or
     ($DevArgs.Count -gt 2 -and $DevArgs[0] -eq 'build' -and $DevArgs[2] -eq 'watchos'))) {
@@ -133,8 +277,6 @@ if ($DevArgs.Count -gt 1 -and $DevArgs[0] -eq 'lan' -and $DevArgs[1] -eq 'on') {
     if (-not (Test-Path -LiteralPath (Join-Path $runtimeWindows 'dev.sh'))) {
         throw 'Start this project first, then enable LAN access.'
     }
-    wsl.exe -d Ubuntu --cd / -- env 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin' bash "$runtimeRoot/dev.sh" lan on
-    if ($LASTEXITCODE -ne 0) { throw 'Could not prepare this project for LAN access.' }
     try {
         Start-ProjectLanListener -AllowPublic:($DevArgs -contains '--allow-public')
     } catch {
@@ -148,13 +290,38 @@ if ($DevArgs.Count -gt 1 -and $DevArgs[0] -eq 'lan' -and $DevArgs[1] -eq 'on') {
 if ($DevArgs.Count -gt 0 -and $DevArgs[0] -eq 'lan' -and ($DevArgs.Count -eq 1 -or $DevArgs[1] -ne 'on')) {
     $nativePython = Get-Command python.exe -ErrorAction Stop
     $action = if ($DevArgs.Count -gt 1) { $DevArgs[1] } else { 'status' }
+    if ($action -eq 'setup') {
+        if ($DevArgs -contains '--local') {
+            if ([Console]::IsInputRedirected -or $env:DEV_LAN_CONTROLLED -eq '1') { throw 'Local certificate trust requires an interactive terminal and explicit confirmation.' }
+            Write-Host 'This enrolls the development certificate authority in the Windows CurrentUser Root and WSL trust stores. It is for computer-only HTTPS; no phone configuration is required.'
+            $confirmation = Read-Host 'Type TRUST to approve this persistent computer trust change, or press Enter to cancel'
+            if ($confirmation -cne 'TRUST') { Write-Host 'Local trust setup cancelled.'; exit 1 }
+            wsl.exe -d Ubuntu --cd / -- mkcert -install
+            if ($LASTEXITCODE -ne 0) { throw 'Local trust setup failed in WSL. Install mkcert there, then retry.' }
+            $caRoot = (wsl.exe -d Ubuntu --cd / -- mkcert -CAROOT).Trim()
+            if ($LASTEXITCODE -ne 0 -or -not $caRoot.StartsWith('/')) { throw 'Could not locate the public local CA certificate.' }
+            $publicCA = '\\wsl.localhost\Ubuntu' + $caRoot.Replace('/', '\') + '\rootCA.pem'
+            $pem = [IO.File]::ReadAllText($publicCA)
+            $certificateBytes = [Convert]::FromBase64String(($pem -replace '-----BEGIN CERTIFICATE-----|-----END CERTIFICATE-----|\s', ''))
+            $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certificateBytes)
+            $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
+            try {
+                $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                if (-not ($store.Certificates | Where-Object { $_.Thumbprint -eq $certificate.Thumbprint })) { $store.Add($certificate) }
+            } finally { $store.Close(); $certificate.Dispose() }
+            Write-Host 'Computer-only HTTPS trust is configured. No LAN sharing was enabled.'
+            exit 0
+        }
+        & $nativePython.Source (Join-Path $ROOT_DIR 'backend\config\development_dns.py') $ROOT_DIR setup
+        exit $LASTEXITCODE
+    }
     if ($action -eq 'certificate') {
         $caRoot = (wsl.exe -d Ubuntu --cd / -- mkcert -CAROOT).Trim()
         if ($LASTEXITCODE -ne 0 -or -not $caRoot.StartsWith('/')) { throw 'Start a project first to create its local HTTPS authority.' }
         $publicCA = '\\wsl.localhost\Ubuntu' + $caRoot.Replace('/', '\') + '\rootCA.pem'
         $destination = Join-Path $env:USERPROFILE 'Downloads\ProjectLocalCA.crt'
         Copy-Item -LiteralPath $publicCA -Destination $destination -Force
-        Write-Host "Public CA certificate: $destination. Install and trust it on your phone; never share rootCA-key.pem."
+        Write-Host "Public local CA certificate: $destination. Use only for explicit computer trust setup; never share rootCA-key.pem."
         exit 0
     }
     & $nativePython.Source (Join-Path $ROOT_DIR 'backend\config\network.py') $action --root $ROOT_DIR --directory '\\wsl.localhost\Ubuntu\tmp\traefik-dynamic'
@@ -378,9 +545,8 @@ function Ensure-WSLPortForwarding {
         }
     }
 
-    # Only the repository-derived canonical hostname is registered.
-    $projectFolder = (Get-Item $ROOT_DIR).Name
-    $projectHost = ($projectFolder -replace '[^a-zA-Z0-9.-]', '').ToLowerInvariant() + '.local'
+    # The shared resolver reads only this project's domain configuration.
+    $projectHost = Get-ProjectDevelopmentHostname
     $hostsPath = Join-Path $env:WINDIR 'System32\drivers\etc\hosts'
     $hostsContent = Get-Content -LiteralPath $hostsPath -ErrorAction SilentlyContinue
     $missingHosts = @(@($projectHost) | Select-Object -Unique | Where-Object {
@@ -861,32 +1027,11 @@ if ($DevArgs.Count -gt 1 -and $DevArgs[0] -eq 'build' -and $DevArgs -notcontains
 }
 
 Ensure-WslSourceAccess
+$developmentTlsMode = Get-ProjectDevelopmentTlsMode
+Sync-ProjectDevelopmentCredentials -Optional:($developmentTlsMode -eq 'local')
 
 # ── Fix WSL2 port forwarding if needed ────────────────────────────────────────
 Ensure-WSLPortForwarding
-
-# Trust the existing local authority before the long-running terminal monitor.
-$caRoot = (wsl.exe -d Ubuntu --cd / -- mkcert -CAROOT 2>$null).Trim()
-if ($caRoot -and $caRoot.StartsWith('/')) {
-    $publicCA = '\\wsl.localhost\Ubuntu' + $caRoot.Replace('/', '\') + '\rootCA.pem'
-    if (Test-Path -LiteralPath $publicCA) {
-        # Use the certificate API directly: Windows PowerShell launched from a
-        # newer shell can lack the Cert: provider even when the store exists.
-        $pem = [IO.File]::ReadAllText($publicCA)
-        $certificateBytes = [Convert]::FromBase64String(($pem -replace '-----BEGIN CERTIFICATE-----|-----END CERTIFICATE-----|\s', ''))
-        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certificateBytes)
-        $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
-        try {
-            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-            if (-not ($store.Certificates | Where-Object { $_.Thumbprint -eq $certificate.Thumbprint })) {
-                $store.Add($certificate)
-            }
-        } finally {
-            $store.Close()
-            $certificate.Dispose()
-        }
-    }
-}
 
 # ── 5. Mirror the Windows workspace into WSL and hand off ───────────────────
 # Podman running inside WSL cannot reliably bind-mount files from C:\.  The

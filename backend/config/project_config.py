@@ -318,6 +318,52 @@ def environment_values(root, include_environment=False):
     return values
 
 
+def development_hostname(root):
+    """Return the checkout's canonical dev.<domain> without importing its apps.
+
+    DEV_DOMAIN is the project's registered base domain, not a URL. A root .env
+    override wins over project.py's literal default. Non-domain folder names
+    get a computer-only localhost address without needing a DNS account.
+    Inherited environment and compact Compose namespaces never define routing.
+    """
+    value = environment_values(root).get('DEV_DOMAIN') or project_option(root, 'DEV_DOMAIN')
+    if value is not None and value != '':
+        return development_hostname_for_domain(value)
+    folder = Path(root).name
+    try:
+        return development_hostname_for_domain(folder)
+    except ValueError:
+        # A clean template checkout needs no registered domain or DNS account.
+        # localhost is computer-only; LAN setup still requires an owned domain.
+        try:
+            folder = folder.lower().encode('idna').decode('ascii')
+        except UnicodeError:
+            folder = folder.lower()
+        slug = re.sub(r'[^a-z0-9-]+', '-', folder).strip('-')[:63].rstrip('-')
+        if not slug:
+            raise ValueError('Choose a project folder with letters or digits, or set DEV_DOMAIN')
+        return f'dev.{slug}.localhost'
+
+
+def development_hostname_for_domain(value):
+    """Validate a bare project domain and return its canonical dev hostname."""
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError('DEV_DOMAIN must be a bare registered domain without whitespace')
+    try:
+        domain = value.lower().encode('idna').decode('ascii')
+    except UnicodeError as error:
+        raise ValueError('DEV_DOMAIN must be a valid DNS domain') from error
+    labels = domain.split('.')
+    if (len(labels) < 2 or len('dev.' + domain) > 253
+            or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
+                   for label in labels)
+            or not re.fullmatch(r'(?:[a-z]{2,63}|xn--[a-z0-9-]+)', labels[-1])
+            or labels[-1] in {'local', 'localhost', 'test', 'invalid', 'example', 'internal', 'arpa'}):
+        raise ValueError('Set DEV_DOMAIN to a registered domain in root .env or backend/project.py; '
+                         'URLs, ports, IP addresses and local-only names are not supported')
+    return f'dev.{domain}'
+
+
 def project_environment(root):
     """Keep host tooling paths, replacing application inputs with this .env."""
     keys = environment_keys(root) - {'DEV_SOURCE_DIR', 'DEV_CHECKOUT_DIR'}
@@ -729,6 +775,12 @@ if __name__ == '__main__':
         print('\n'.join(mobile_apps(root)))
     elif option == 'resource-namespace':
         print(resource_namespace(root))
+    elif option == 'dev-host':
+        try:
+            print(development_hostname(root))
+        except (ValueError, OSError) as error:
+            print(f'Development hostname unavailable: {error}', file=sys.stderr)
+            raise SystemExit(1)
     elif option == 'sync-paths':
         print('\n'.join(sync_paths(root)))
     elif option == 'exposure-check-command':

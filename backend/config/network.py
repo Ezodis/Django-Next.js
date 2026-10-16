@@ -1,7 +1,8 @@
-"""Controlled LAN ingress and mDNS discovery; no app ports or data stores exposed.
+"""Controlled LAN HTTPS ingress; no app ports or data stores exposed.
 
-The LAN entrypoint has routes only for enabled projects. Local-only routes use
-separate loopback listeners. Only the public CA certificate is exported for phones.
+Public DNS and ACME certificates serve dev.<domain> without device setup.
+The LAN entrypoint has routes only for enabled projects; computer-only routes
+use separate loopback listeners. Network changes revoke the sharing session.
 """
 import argparse
 import base64
@@ -27,13 +28,6 @@ import tempfile
 import time
 
 
-def identity(root):
-    name = re.sub(r'[^a-z0-9.-]', '', Path(root).name.lower())
-    if not name or '..' in name or name.startswith(('.', '-')) or name.endswith(('.', '-')):
-        raise ValueError('The project folder must be a DNS-compatible name')
-    return name, re.sub(r'[^a-z0-9]', '', name)
-
-
 def atomic_json(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,7 +43,7 @@ def lan_routes(project, host, relays=('127.0.0.1/32', '::1/128')):
                          ('static', '/static'), ('media', '/media')]:
         route = {'entryPoints': ['lan'], 'rule': f'Host(`{host}`)',
                  'service': f'{project}-{"frontend" if kind == "frontend" else "backend"}@docker',
-                 'priority': 10 if kind == 'frontend' else 100, 'tls': {}}
+                 'priority': 10 if kind == 'frontend' else 100, 'tls': {'certResolver': 'dev'}}
         route['middlewares'] = [f'{project}-lan-relay']
         if prefix:
             route['rule'] += f' && (Path(`{prefix}`) || PathPrefix(`{prefix}/`))'
@@ -84,16 +78,18 @@ def discovered_routes(project, host):
                 if len(set(services)) != 1:
                     raise ValueError('Optional LAN router must declare its service explicitly')
                 service = services[0]
-            route = {'entryPoints': ['lan'], 'rule': rule,
+            # Project-owned expressions may contain OR branches. Keep every
+            # cloned branch inside this project's exact hostname boundary.
+            route = {'entryPoints': ['lan'], 'rule': f'Host(`{host}`) && ({rule})',
                      'service': service if '@' in service else service + '@docker',
-                     'priority': int(labels.get(prefix + 'priority', '10')), 'tls': {},
+                     'priority': int(labels.get(prefix + 'priority', '10')), 'tls': {'certResolver': 'dev'},
                      'middlewares': [f'{project}-lan-relay']}
             for item in labels.get(prefix + 'middlewares', '').split(','):
                 if item:
                     route['middlewares'].append(item if '@' in item else item + '@docker')
             routes[router + '-lan'] = route
     if not routes:
-        raise ValueError('Restart the project with its .local hostname before enabling LAN')
+        raise ValueError('Restart the project with its canonical dev hostname before enabling LAN')
     return routes
 
 
@@ -111,23 +107,30 @@ def remove_lan_file(path):
 
 
 def configure(root, action, directory, relays=('127.0.0.1/32', '::1/128'), discover=False):
-    name, project = identity(root)
-    from config.project_config import resource_namespace
+    from config.project_config import development_hostname, resource_namespace
     project = resource_namespace(root)
-    host = name + '.local'
     directory = Path(directory)
     route = directory / f'{project}-lan.yml'
     state = directory / f'{project}-lan.state'
+    # Always revoke first, even if the project domain was removed or mistyped.
+    if action == 'off':
+        remove_lan_file(state)
+        remove_lan_file(route)
+    try:
+        host = development_hostname(root)
+    except (ValueError, OSError):
+        if action != 'off':
+            raise
+        return {'host': '', 'enabled': False, 'url': str(Path(root).name)}
     if action == 'on':
+        from config.project_config import development_hostname_for_domain
+        if development_hostname_for_domain(host.removeprefix('dev.')) != host:
+            raise ValueError('LAN HTTPS requires an owned development domain; local-only projects remain available on this computer')
         config = lan_routes(project, host, relays)
         if discover:
             config['http']['routers'] = discovered_routes(project, host)
         atomic_json(route, config)
         atomic_json(state, {'host': host, 'checkout': str(Path(root).resolve())})
-    elif action == 'off':
-        # Revoke the relay first, including established WebSocket connections.
-        remove_lan_file(state)
-        remove_lan_file(route)
     return {'host': host, 'enabled': state.exists(), 'url': f'https://{host}'}
 
 
@@ -135,8 +138,13 @@ def enabled_hosts(directory):
     result = set()
     for path in Path(directory).glob('*-lan.state'):
         try:
-            host = json.loads(path.read_text(encoding='utf-8'))['host']
-            if re.fullmatch(r'[a-z0-9][a-z0-9.-]*\.local', host):
+            value = json.loads(path.read_text(encoding='utf-8'))
+            if not isinstance(value, dict):
+                continue
+            host = value.get('host')
+            # A stale .local state must never re-enable an old alias.
+            from config.project_config import development_hostname_for_domain
+            if isinstance(host, str) and host.startswith('dev.') and development_hostname_for_domain(host[4:]) == host:
                 result.add(host)
         except (OSError, ValueError, KeyError):
             continue
@@ -146,6 +154,8 @@ def enabled_hosts(directory):
 def network_signature(address, allow_public=False):
     """Windows Wi-Fi/profile changes revoke the current sharing session."""
     if os.name != 'nt':
+        # Unix currently relies on the bound interface/subnet and explicit off;
+        # it cannot detect a Wi-Fi change that preserves the same private IP.
         return None
     # A manual Public session remains pinned to this exact interface/network.
     guard = '' if allow_public else "if($p.NetworkCategory -eq 'Public'){throw 'Untrusted network'}; "
@@ -224,89 +234,27 @@ def hello_hostname(data):
     return None
 
 
-def dns_name(packet, offset):
-    labels, visited = [], set()
-    end = None
-    while True:
-        if offset in visited or offset >= len(packet):
-            raise ValueError('Invalid DNS name')
-        visited.add(offset)
-        size = packet[offset]
-        if size & 192 == 192:
-            if offset + 1 >= len(packet):
-                raise ValueError('Truncated DNS pointer')
-            if end is None:
-                end = offset + 2
-            offset = ((size & 63) << 8) | packet[offset + 1]
-            continue
-        offset += 1
-        if size == 0:
-            return '.'.join(labels).lower(), end or offset
-        if size > 63 or offset + size > len(packet):
-            raise ValueError('Invalid DNS label')
-        labels.append(packet[offset:offset + size].decode('ascii'))
-        offset += size
-
-
-def mdns_questions(packet):
-    if len(packet) < 12 or packet[2] & 128:
-        return []
-    count = int.from_bytes(packet[4:6], 'big')
-    if count > 64:
-        return []
-    p, questions = 12, []
-    try:
-        for _ in range(count):
-            name, p = dns_name(packet, p)
-            kind, klass = struct.unpack('!HH', packet[p:p + 4])
-            p += 4
-            questions.append((name, kind, klass))
-    except (ValueError, IndexError, UnicodeError, struct.error):
-        return []
-    return questions
-
-
-def mdns_destination(packet, hosts, sender):
-    # QU questions request a unicast reply, including Safari's first lookup.
-    matching = [klass for name, _, klass in mdns_questions(packet)
-                if name in hosts and klass & 32767 in (1, 255)]
-    return sender if sender[1] != 5353 or matching and all(klass & 32768 for klass in matching) else ('224.0.0.251', 5353)
-
-
-def mdns_answer(packet, hosts, address, legacy=False):
-    questions = mdns_questions(packet)
-    matching = [(name, kind) for name, kind, klass in questions
-                if name in hosts and klass & 32767 in (1, 255)]
-    if not matching:
-        return None
-
-    def encoded_name(name):
-        return b''.join(bytes([len(label)]) + label.encode('ascii') for label in name.split('.')) + b'\0'
-
-    def record(name, kind):
-        encoded = encoded_name(name)
-        # This relay publishes IPv4 HTTPS only. NSEC explicitly tells clients
-        # there is no AAAA or HTTPS/SVCB record instead of making them time out.
-        data = socket.inet_aton(address) if kind == 1 else encoded + b'\x00\x01\x40'
-        return encoded + struct.pack('!HHIH', kind, 1 if legacy else 32769,
-                                     10 if legacy else 30, len(data)) + data
-
-    answers = dict.fromkeys((name, 1 if kind in (1, 255) else 47) for name, kind in matching)
-    additional = dict.fromkeys((name, kind) for name, _ in matching for kind in (1, 47)
-                               if (name, kind) not in answers)
-    # Legacy unicast DNS replies echo the ID and the decoded question section;
-    # do not copy compressed names whose offsets belonged to the query packet.
-    echoed = b''.join(encoded_name(name) + struct.pack('!HH', kind, klass & 32767)
-                      for name, kind, klass in questions) if legacy else b''
-    return (struct.pack('!HHHHHH', int.from_bytes(packet[:2], 'big') if legacy else 0,
-                        0x8400, len(questions) if legacy else 0, len(answers), 0, len(additional))
-            + echoed + b''.join(record(*item) for item in answers)
-            + b''.join(record(*item) for item in additional))
-
-
 class Relay(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._hosts_lock = threading.Lock()
+        self._hosts = frozenset()
+        self._hosts_until = 0
+        super().__init__(*args, **kwargs)
+
+    def allowed_hosts(self):
+        """Share one short-lived snapshot across sockets, including WSL UNC reads."""
+        if time.monotonic() >= self._hosts_until:
+            with self._hosts_lock:
+                if time.monotonic() >= self._hosts_until:
+                    try:
+                        self._hosts = frozenset(enabled_hosts(self.directory))
+                    except OSError:
+                        self._hosts = frozenset()
+                    self._hosts_until = time.monotonic() + 0.25
+        return self._hosts
 
 
 class Forward(socketserver.BaseRequestHandler):
@@ -325,15 +273,15 @@ class Forward(socketserver.BaseRequestHandler):
                 if len(data) >= 5 and len(data) >= 5 + int.from_bytes(data[3:5], 'big'):
                     break
             host = hello_hostname(data)
-            if host not in enabled_hosts(server.directory):
+            if host not in server.allowed_hosts():
                 return
             with socket.create_connection(server.upstream, timeout=5) as target:
                 target.sendall(data)
                 self.request.settimeout(2)
                 target.settimeout(2)
                 peers = [self.request, target]
-                while host in enabled_hosts(server.directory):
-                    readable, _, _ = select.select(peers, [], [], 1)
+                while host in server.allowed_hosts():
+                    readable, _, _ = select.select(peers, [], [], 0.25)
                     for source in readable:
                         block = source.recv(65536)
                         if not block:
@@ -343,7 +291,23 @@ class Forward(socketserver.BaseRequestHandler):
             return
 
 
-def serve(directory, address, upstream, port=443, network=None, allow_public=False):
+@contextmanager
+def listener_readiness(path, address):
+    if path:
+        atomic_json(path, {'pid': os.getpid(), 'address': address})
+    try:
+        yield
+    finally:
+        if path:
+            try:
+                target = Path(path)
+                if json.loads(target.read_text(encoding='utf-8'))['pid'] == os.getpid():
+                    target.unlink(missing_ok=True)
+            except (OSError, ValueError, KeyError):
+                pass
+
+
+def serve(directory, address, upstream, port=443, network=None, allow_public=False, ready_file=None):
     ip = ipaddress.ip_address(address)
     if ip.version != 4 or not ip.is_private or ip.is_loopback or ip.is_link_local:
         raise ValueError('Select an IPv4 address on the trusted local network')
@@ -356,36 +320,23 @@ def serve(directory, address, upstream, port=443, network=None, allow_public=Fal
         relay.directory = directory
         relay.upstream = (upstream, 8443)
         threading.Thread(target=relay.serve_forever, daemon=True).start()
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as mdns:
-            mdns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            mdns.bind(('', 5353))
-            mdns.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                            socket.inet_aton('224.0.0.251') + socket.inet_aton(address))
-            mdns.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(address))
-            mdns.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
-            mdns.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 255)
-            mdns.settimeout(1)
-            while enabled_hosts(directory):
-                if time.monotonic() - checked >= 10:
-                    try:
-                        current_signature = network_signature(address, allow_public)
-                        if current_signature != signature:
-                            print('LAN stopped: network identity changed: ' + current_signature, file=sys.stderr, flush=True)
+        try:
+            with listener_readiness(ready_file, address):
+                while relay.allowed_hosts():
+                    if time.monotonic() - checked >= 10:
+                        try:
+                            current_signature = network_signature(address, allow_public)
+                            if current_signature != signature:
+                                print('LAN stopped: network identity changed', file=sys.stderr, flush=True)
+                                revoke_all(directory)
+                                break
+                        except (OSError, ValueError, subprocess.SubprocessError) as error:
+                            print('LAN stopped: network verification failed: ' + type(error).__name__, file=sys.stderr, flush=True)
                             revoke_all(directory)
                             break
-                    except (OSError, ValueError, subprocess.SubprocessError) as error:
-                        print('LAN stopped: network verification failed: ' + type(error).__name__ + ': ' + str(error), file=sys.stderr, flush=True)
-                        revoke_all(directory)
-                        break
-                    checked = time.monotonic()
-                try:
-                    packet, sender = mdns.recvfrom(9000)
-                    hosts = enabled_hosts(directory)
-                    answer = mdns_answer(packet, hosts, address, legacy=sender[1] != 5353)
-                    if answer:
-                        mdns.sendto(answer, mdns_destination(packet, hosts, sender))
-                except socket.timeout:
-                    pass
+                        checked = time.monotonic()
+                    time.sleep(0.5)
+        finally:
             relay.shutdown()
 
 
@@ -534,7 +485,13 @@ def monitor_change(root, directory, action, project=None, remember=True):
         # A detached Windows/WSL worker can inherit pipe handles. Waiting for
         # capture_output EOF would then hang after the launcher itself exited.
         with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
-            result = subprocess.run(command, cwd=checkout, stdout=output, stderr=errors, **child_options)
+            try:
+                result = subprocess.run(command, cwd=checkout, stdout=output, stderr=errors,
+                                        timeout=180, **child_options)
+            except subprocess.TimeoutExpired:
+                # This bounds the launcher wait, not detached Windows/WSL
+                # descendants. The caller revokes opt-ins before cleanup.
+                raise ValueError('LAN update timed out after 180 seconds; newly enabled access is being revoked.') from None
             if result.returncode:
                 errors.seek(0)
                 output.seek(0)
@@ -554,6 +511,13 @@ def monitor_change(root, directory, action, project=None, remember=True):
             apply(namespace, action)
     except (OSError, ValueError, subprocess.SubprocessError):
         # A partially enabled workspace must not silently remain shared.
+        # Revoke every new opt-in before waiting for any launcher cleanup.
+        for namespace in changed:
+            try:
+                configure(projects[namespace], 'off', directory)
+            except (OSError, ValueError):
+                # Continue revoking the others, then retry through their launchers.
+                pass
         for namespace in changed:
             try:
                 apply(namespace, 'off')
@@ -765,7 +729,7 @@ def monitor_terminal(frame, state):
             message_lines = textwrap.wrap(clean_message, width=max(1, size.columns - 1)) or ['']
             message_lines = message_lines[:max(1, min(3, size.lines - 4))]
             height = max(1, size.lines - len(message_lines) - 2)
-            lines = text.splitlines() or ['Loading services…']
+            lines = text.splitlines() or ['Loading servicesÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦']
             offset = max(0, min(offset, len(lines) - height))
             paint = signature, selected, offset, message, pending, size
             if paint != last_paint:
@@ -781,7 +745,7 @@ def monitor_terminal(frame, state):
                             if column > size.columns - 1:
                                 break
                             shortened += char
-                        line = shortened + '…'
+                        line = shortened + 'ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦'
                     elif controls and row == controls[selected]['row']:
                         line = LAN_LABEL.sub(lambda match: '\x1b[7m' + match.group() + '\x1b[27m', line, count=1)
                     output.append(line + '\x1b[0m')
@@ -831,7 +795,7 @@ def monitor_terminal(frame, state):
                     pending = secrets.token_hex(16)
                     atomic_json(Path(state).parent / 'request.json', {'id': pending, 'token': metadata['token'],
                                 'action': button['action'], 'project': button['project']})
-                    message = 'Updating LAN access…'
+                    message = 'Updating LAN accessÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦'
     except KeyboardInterrupt:
         pass
     finally:
@@ -851,6 +815,7 @@ if __name__ == '__main__':
     parser.add_argument('--upstream', default='127.0.0.1')
     parser.add_argument('--network')
     parser.add_argument('--allow-public', action='store_true')
+    parser.add_argument('--ready-file', help='Private process readiness marker written after all sockets bind')
     parser.add_argument('--relay-source', action='append', default=[])
     parser.add_argument('--discover', action='store_true')
     parser.add_argument('--control-state')
@@ -876,7 +841,7 @@ if __name__ == '__main__':
     elif args.action == 'monitor-terminal':
         monitor_terminal(args.frame, args.control_state)
     elif args.action == 'serve':
-        serve(args.directory, args.address, args.upstream, network=args.network, allow_public=args.allow_public)
+        serve(args.directory, args.address, args.upstream, network=args.network, allow_public=args.allow_public, ready_file=args.ready_file)
     else:
         relays = ['127.0.0.1/32', '::1/128'] + args.relay_source
         for source in relays:

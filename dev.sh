@@ -136,8 +136,24 @@ if [[ "${1:-}" == "sync" ]]; then
   exec python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" sync "${@:2}"
 fi
 
+if [[ "${1:-}" == lan && "${2:-status}" == setup ]]; then
+  command -v python3 >/dev/null 2>&1 || { echo 'Python 3 is required for development HTTPS setup.'; exit 1; }
+  if [[ "${3:-}" == --local ]]; then
+    [[ -t 0 && -t 1 && "${DEV_LAN_CONTROLLED:-}" != 1 ]] || { echo 'Local certificate trust requires an interactive terminal and explicit confirmation.' >&2; exit 1; }
+    command -v mkcert >/dev/null 2>&1 || { echo 'Install mkcert before configuring computer-only HTTPS trust.' >&2; exit 1; }
+    echo 'This enrolls the development certificate authority in this computer trust store for computer-only HTTPS.'
+    printf 'Type TRUST to approve this persistent computer trust change, or press Enter to cancel: '
+    IFS= read -r _trust_confirmation
+    [[ "$_trust_confirmation" == TRUST ]] || { echo 'Local trust setup cancelled.'; exit 1; }
+    mkcert -install || exit 1
+    echo 'Computer-only HTTPS trust is configured. No LAN sharing was enabled.'
+    exit 0
+  fi
+  exec python3 "$ROOT_DIR/backend/config/development_dns.py" "$ROOT_DIR" setup
+fi
+
 if [[ "${1:-}" == lan && "${2:-status}" == certificate ]]; then
-  echo "Public phone HTTPS certificate: $(mkcert -CAROOT)/rootCA.pem"
+  echo "Public computer-only HTTPS certificate: $(mkcert -CAROOT)/rootCA.pem"
   exit 0
 fi
 if [[ "${1:-}" == lan && "${2:-status}" != on ]]; then
@@ -246,10 +262,16 @@ _sed_inplace() {
   fi
 }
 
-# Get LAN IP: macOS uses ipconfig getifaddr, Linux/Windows uses hostname -I
+# Prefer the default-route interface so virtual adapters do not choose the LAN URL.
 _get_lan_ip() {
   case "$OS" in
     mac)
+      local _lan_interface _lan_address
+      _lan_interface=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2; exit}' || true)
+      if [[ -n "$_lan_interface" ]]; then
+        _lan_address=$(ipconfig getifaddr "$_lan_interface" 2>/dev/null || true)
+        if [[ -n "$_lan_address" ]]; then echo "$_lan_address"; return; fi
+      fi
       ipconfig getifaddr en0 2>/dev/null \
         || ipconfig getifaddr en1 2>/dev/null \
         || echo "localhost"
@@ -262,6 +284,12 @@ _get_lan_ip() {
         local _win_lan_ip
         _win_lan_ip=$(/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -Command '$ip = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" -and $_.InterfaceAlias -notmatch "WSL|vEthernet|Loopback" } | Select-Object -First 1 -ExpandProperty IPAddress; Write-Output $ip' 2>/dev/null | tr -d '\r' | tail -1)
         [[ "$_win_lan_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && { echo "$_win_lan_ip"; return; }
+      fi
+      local _lan_interface _lan_address
+      _lan_interface=$(ip -4 route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' || true)
+      if [[ -n "$_lan_interface" ]]; then
+        _lan_address=$(ip -o -4 address show dev "$_lan_interface" scope global 2>/dev/null | awk '{split($4, address, "/"); print address[1]; exit}' || true)
+        if [[ -n "$_lan_address" ]]; then echo "$_lan_address"; return; fi
       fi
       hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost"
       ;;
@@ -337,13 +365,36 @@ export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 # Display name preserves original capitalization and dots for UI/status display
 # PROJECT_DISPLAY_NAME was also declared above for early callers.
 
-# Local URLs preserve the repository's dots and hyphens. Container/volume
-# namespaces continue using PROJECT_NAME so existing resources are reused.
+# Resource identities remain separate from the canonical development domain.
+# Container/volume namespaces continue using PROJECT_NAME to preserve data.
 _project_host() {
   basename "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9.-'
 }
 PROJECT_HOST="$(_project_host "$ROOT_DIR")"
-export PROJECT_HOST
+_development_host() {
+  python3 "$ROOT_DIR/backend/config/project_config.py" "$1" dev-host
+}
+DEV_HOST="$(_development_host "$ROOT_DIR")" || exit 1
+_development_tls_mode() {
+  python3 - "$1" <<'DEVELOPMENT_TLS_MODE'
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(sys.argv[1]) / 'backend'))
+from config.project_config import environment_values
+mode = environment_values(Path(sys.argv[1])).get('DEV_TLS_MODE', 'local').strip().lower()
+if mode not in ('local', 'public'):
+    raise SystemExit('DEV_TLS_MODE must be local or public.')
+print(mode)
+DEVELOPMENT_TLS_MODE
+}
+DEV_TLS_MODE="$(_development_tls_mode "$ROOT_DIR")" || exit 1
+# An explicit LAN activation first authorizes owned-domain DNS below. Its routes
+# must request public certificates even before the persisted mode is reread.
+if [[ "${1:-}" == lan && "${2:-}" == on ]]; then DEV_TLS_MODE=public; fi
+DEV_TLS_RESOLVER=""
+[[ "$DEV_TLS_MODE" == public ]] && DEV_TLS_RESOLVER=dev
+export DEV_TLS_MODE DEV_TLS_RESOLVER
+export PROJECT_HOST DEV_HOST
 
 # ── OS detection ──────────────────────────────────────────────────────────────
 _UNAME="$(uname -s)"
@@ -357,14 +408,24 @@ case "$_UNAME" in
   *) OS="unknown" ;;
 esac
 
-# Write PROJECT_HOST and COMPOSE_PROJECT_NAME to .env so podman-compose always
-# resolves them correctly even when invoked outside of dev.sh.
+# Persist the derived origin and resource identities for direct Compose calls.
+# DEV_DOMAIN remains the project-owned input; DEV_HOST is its canonical result.
 _env_file="$ROOT_DIR/.env"
 if [[ -f "$_env_file" ]]; then
   if grep -q "^PROJECT_HOST=" "$_env_file" 2>/dev/null; then
     _sed_inplace "s|^PROJECT_HOST=.*|PROJECT_HOST=$PROJECT_HOST|" "$_env_file"
   else
     printf '\nPROJECT_HOST=%s\n' "$PROJECT_HOST" >> "$_env_file"
+  fi
+  if grep -q "^DEV_HOST=" "$_env_file" 2>/dev/null; then
+    _sed_inplace "s|^DEV_HOST=.*|DEV_HOST=$DEV_HOST|" "$_env_file"
+  else
+    printf 'DEV_HOST=%s\n' "$DEV_HOST" >> "$_env_file"
+  fi
+  if grep -q "^DEV_TLS_RESOLVER=" "$_env_file" 2>/dev/null; then
+    _sed_inplace "s|^DEV_TLS_RESOLVER=.*|DEV_TLS_RESOLVER=$DEV_TLS_RESOLVER|" "$_env_file"
+  else
+    printf 'DEV_TLS_RESOLVER=%s\n' "$DEV_TLS_RESOLVER" >> "$_env_file"
   fi
   if grep -q "^COMPOSE_PROJECT_NAME=" "$_env_file" 2>/dev/null; then
     _sed_inplace "s|^COMPOSE_PROJECT_NAME=.*|COMPOSE_PROJECT_NAME=$PROJECT_NAME|" "$_env_file"
@@ -1904,7 +1965,7 @@ _start_cloudflare_tunnel() {
 
   local tunnel_log="/tmp/${PROJECT_NAME}-tunnel.log"
   local tunnel_pid_file="/tmp/${PROJECT_NAME}-tunnel.pid"
-  local _local_host="${PROJECT_HOST}.local"
+  local _local_host="${DEV_HOST}"
 
   # A failed HTTP/DNS/metrics probe is not proof that a tunnel lease died.
   # Let cloudflared reconnect using its existing identity after network loss.
@@ -2032,7 +2093,7 @@ _start_cloudflare_tunnel() {
       echo "⚠️  Cloudflare rate-limited tunnel creation (429 Too Many Requests)"
       echo "   Too many tunnels were created in a short period."
       echo "   ⏳ Wait ~10 minutes, then run ./dev.sh again."
-      echo "   ℹ️  App is still accessible at https://${PROJECT_HOST}.local"
+      echo "   ℹ️  App is still accessible at https://${DEV_HOST}"
     else
       echo "⚠️  Tunnel did not start in time — running without tunnel"
       echo "   Check: tail -f $tunnel_log"
@@ -2059,11 +2120,11 @@ _start_cloudflare_tunnel() {
 
 # ── Per-project tunnel proxy ──────────────────────────────────────────────────
 # Listens on 127.0.0.1:$proxy_port, rewrites the Host header to $local_host
-# (e.g. myproject.com.local), and forwards to Traefik on port 80.
+# (e.g. dev.example.com), and forwards to Traefik on port 80.
 #
 # This is the key piece that makes multi-project tunnels work without DNS:
 #   cloudflared → localhost:$proxy_port → proxy rewrites Host → Traefik:80
-#   Traefik sees Host: myproject.com.local and routes to the right containers.
+#   Traefik sees Host: dev.example.com and routes to the right containers.
 #   The trycloudflare.com hostname only needs to resolve on Cloudflare's edge.
 _start_tunnel_proxy() {
   local proxy_port="$1"
@@ -2247,7 +2308,7 @@ http:
     ${_proj}-tunnel-origin:
       headers:
         customRequestHeaders:
-          Host: "${PROJECT_HOST}.local"
+          Host: "${DEV_HOST}"
     ${_proj}-tunnel-strip-api:
       stripPrefix:
         prefixes: ["/api"]
@@ -2446,33 +2507,28 @@ detect_compose() {
   DC_CMD="podman-compose"
   # Fail before Compose can reuse another checkout's containers or host routes.
   python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" check-isolation \
-    "$PROJECT_NAME" "${PROJECT_HOST}.local" || exit 1
+    "$PROJECT_NAME" "${DEV_HOST}" || exit 1
   _wire_podman_socket
   export CONTAINER_RUNTIME="podman"
 }
 
 # ── Global Traefik — shared across all projects on this machine ───────────────
-# One Traefik instance on port 80 routes to all projects by hostname:
-#   http://myproject.local  → MyProject
-#   http://otherapp.local   → OtherApp
-#   http://<any>.local      → whichever project registered that host
+# One Traefik instance routes each project through its exact canonical hostname:
+#   https://dev.<project-domain> → that project's registered services
 #
 # Traefik watches the shared "traefik" Podman network for container labels.
 # Each project's dev.yml joins that network and sets traefik.enable=true labels.
 # This function is idempotent — safe to call from every project's dev.sh.
 
-# ── Ensure PROJECT_HOST.local resolves locally ────────────────────────────
-# Plain single-label subdomains like myapp.local resolve automatically on
-# macOS and modern Linux. But if PROJECT_HOST contains a dot (e.g. myapp.io),
-# the resulting hostname myapp.io.local is a multi-level name that the
-# system resolver won't auto-resolve — it needs an /etc/hosts entry.
-# This function adds the entry idempotently using sudo (prompts once if needed).
+# ── Keep the canonical development hostname on loopback on this computer ──
+# LAN DNS can point other devices to the selected interface while this override
+# preserves the same local URL with LAN sharing off. No spelling aliases are added.
 _ensure_hosts_entry() {
   # Windows host resolution is handled by dev.ps1; /etc/hosts in WSL would
   # not change the Windows browser's resolver.
   [[ "$OS" == "wsl" ]] && return 0
   local _local_host
-  for _local_host in "${PROJECT_HOST}.local"; do
+  for _local_host in "${DEV_HOST}"; do
     grep -qF "$_local_host" /etc/hosts 2>/dev/null && continue
     echo "🔧 Adding ${_local_host} to /etc/hosts so browsers can resolve it..."
     printf '127.0.0.1  %s\n' "$_local_host" | sudo tee -a /etc/hosts >/dev/null \
@@ -2481,13 +2537,13 @@ _ensure_hosts_entry() {
 }
 
 _ensure_local_tls() {
-  local certdir="/tmp/traefik-dynamic/certs" host="${PROJECT_HOST}.local"
+  local certdir="/tmp/traefik-dynamic/certs" host="${DEV_HOST}"
   if ! command -v mkcert >/dev/null; then
     echo "Install mkcert to enable trusted local HTTPS." >&2
     return 1
   fi
   mkdir -p "$certdir"
-  mkcert -install >/dev/null 2>&1
+  # Trust-store enrollment is an explicit machine setup step, never startup.
   # Only the canonical local hostname is routed.
   # Renew existing certificates when a hostname is added or the local CA changes.
   if [[ ! -s "$certdir/${PROJECT_NAME}.pem" || ! -s "$certdir/${PROJECT_NAME}-key.pem" ]] \
@@ -2510,12 +2566,221 @@ _ensure_local_tls() {
   else
     printf '%b' "$config" > "/tmp/traefik-dynamic/${PROJECT_NAME}-tls.yml"
   fi
-  # WSL's CA store is separate from the Windows browser's current-user store.
-  if grep -qi microsoft /proc/version 2>/dev/null; then
-    local certutil="/mnt/c/Windows/System32/certutil.exe"
-    if [[ -x "$certutil" ]]; then
-      "$certutil" -user -addstore Root "$(wslpath -w "$(mkcert -CAROOT)/rootCA.pem")" >/dev/null
-    fi
+}
+
+_prepare_development_tls() {
+  # Every checkout uses the same private host credential and ACME account.
+  # Validate before touching the shared router; credentials never enter .env.
+  _acme_token_path=$(python3 "$ROOT_DIR/backend/config/development_dns.py" "$ROOT_DIR" token-path) || return 1
+  _acme_token_revision=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_ino}:{s.st_size}:{s.st_mtime_ns}")' "$_acme_token_path") || return 1
+  _acme_email=$(python3 - "$_acme_token_path" <<'ACME_EMAIL'
+from pathlib import Path
+import re, subprocess, sys
+path = Path(sys.argv[1]).parent / 'acme-email'
+if path.exists():
+    email = path.read_text(encoding='utf-8-sig').strip()
+else:
+    result = subprocess.run(['git', 'config', '--global', 'user.email'], capture_output=True, text=True)
+    email = result.stdout.strip() if result.returncode == 0 else ''
+if not re.fullmatch(r'[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+', email):
+    raise SystemExit('Set the host ACME contact in ' + str(path) + ' or configure git --global user.email before starting trusted HTTPS.')
+print(email)
+ACME_EMAIL
+  ) || return 1
+  if [[ ! -f "$(dirname "$_acme_token_path")/acme-email" ]]; then
+    echo 'Trusted HTTPS uses the global Git email for ACME registration; override it in the private host acme-email file.'
+  fi
+  if [[ "$OS" == mac ]]; then
+    # The API socket and file provider run inside the Podman machine. Copy only
+    # this validated credential over stdin, retaining it privately outside Git.
+    local _vm_token
+    _vm_token=$(podman machine ssh 'printf "%s/.config/project-development/cloudflare-token" "$HOME"' 2>/dev/null) || return 1
+    [[ "$_vm_token" == /* && "$_vm_token" != *$'\n'* ]] || return 1
+    podman machine ssh 'sh -c '\''set -e; umask 077; d="$HOME/.config/project-development"; mkdir -p "$d"; chmod 700 "$d"; t=$(mktemp "$d/.cloudflare-token.XXXXXX"); trap "rm -f \"$t\"" EXIT; cat > "$t"; if ! cmp -s "$t" "$d/cloudflare-token"; then mv "$t" "$d/cloudflare-token"; fi; chmod 600 "$d/cloudflare-token"'\''' < "$_acme_token_path" || return 1
+    _acme_token_path="$_vm_token"
+  fi
+}
+
+_wait_development_tls() {
+  # Validate the actual served certificate using the OS trust store and exact
+  # canonical SNI, independently of public DNS and before enabling LAN routes.
+  local _local_ca="" _known_local_ca=""
+  if command -v mkcert >/dev/null 2>&1; then _known_local_ca="$(mkcert -CAROOT)/rootCA.pem"; fi
+  if [[ "$DEV_TLS_MODE" == local ]]; then _local_ca="$_known_local_ca"; fi
+  python3 - "$DEV_HOST" "$_local_ca" "$_known_local_ca" <<'CHECK_DEVELOPMENT_TLS'
+from pathlib import Path
+import socket, ssl, sys, time
+host, local_ca, known_local_ca = sys.argv[1:]
+context = ssl.create_default_context(cafile=local_ca or None)
+# An OS trust store may already include mkcert. Public mode must not accept
+# that certificate while Traefik is reloading the retired local configuration.
+local_only = ssl.create_default_context(cafile=known_local_ca) if not local_ca and known_local_ca and Path(known_local_ca).is_file() else None
+deadline = time.monotonic() + 150
+announced = False
+last = 'certificate unavailable'
+while time.monotonic() < deadline:
+    try:
+        with socket.create_connection(('127.0.0.1', 443), timeout=3) as raw:
+            with context.wrap_socket(raw, server_hostname=host):
+                pass
+        if local_only is not None:
+            still_local = False
+            try:
+                with socket.create_connection(('127.0.0.1', 443), timeout=3) as raw:
+                    with local_only.wrap_socket(raw, server_hostname=host):
+                        still_local = True
+            except (OSError, ssl.SSLError):
+                pass
+            if still_local:
+                raise ssl.SSLCertVerificationError('The computer-only certificate is still being served; waiting for public HTTPS.')
+        raise SystemExit(0)
+    except (OSError, ssl.SSLError) as error:
+        last = str(error)
+        if not announced:
+            print('Waiting for ' + ('computer-only' if local_ca else 'publicly trusted') + ' HTTPS for ' + host + '…', flush=True)
+            announced = True
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+raise SystemExit('HTTPS is not ready for ' + host + '. ' + ('Check mkcert and Traefik local TLS configuration. ' if local_ca else 'Check Traefik ACME logs and host DNS-token permissions, then retry. ') + last)
+CHECK_DEVELOPMENT_TLS
+}
+
+_reconcile_development_host() {
+  # An already healthy container can still carry the previous hostname. Update
+  # only affected application services; Compose preserves their named volumes.
+  local _services=() _changed=() _service _result
+  while IFS=' ' read -r _service _rest; do
+    [[ -n "$_service" ]] && _services+=("$_service")
+  done < <(_parse_compose_services)
+  _result=$(python3 - "$PROJECT_NAME" "$DEV_HOST" "$DEV_TLS_RESOLVER" "${_services[@]}" <<'RECONCILE_DEVELOPMENT_HOST'
+import json, subprocess, sys
+project, host, resolver, *allowed = sys.argv[1:]
+try:
+    ids = subprocess.check_output(['podman', 'ps', '-a', '--filter', 'label=com.docker.compose.project=' + project, '-q'], text=True).split()
+    containers = json.loads(subprocess.check_output(['podman', 'inspect', *ids], text=True)) if ids else []
+except (OSError, ValueError, subprocess.SubprocessError):
+    raise SystemExit('Could not inspect existing development routes; no services were changed.')
+changed = set()
+for item in containers:
+    config = item.get('Config') or {}
+    labels = config.get('Labels') or {}
+    service = labels.get('com.docker.compose.service')
+    if service not in allowed:
+        continue
+    env = dict(value.split('=', 1) for value in config.get('Env', []) if '=' in value)
+    stale = ('DEV_HOST' in env or 'PROJECT_HOST' in env) and env.get('DEV_HOST') != host
+    for key, value in labels.items():
+        if key.startswith('traefik.http.routers.') and key.endswith('.entrypoints') and value == 'websecure':
+            prefix = key[:-len('entrypoints')]
+            if 'Host(`' + host + '`)' not in labels.get(prefix + 'rule', '') or labels.get(prefix + 'tls.certresolver', '') != resolver:
+                stale = True
+    if stale:
+        changed.add(service)
+print('\n'.join(sorted(changed)))
+RECONCILE_DEVELOPMENT_HOST
+  ) || return 1
+  while IFS= read -r _service; do
+    [[ -n "$_service" ]] && _changed+=("$_service")
+  done <<< "$_result"
+  if [[ ${#_changed[@]} -gt 0 ]]; then
+    echo "Updating development routes for ${_changed[*]}..."
+    "$DC_CMD" -p "$PROJECT_NAME" "${COMPOSE_F[@]}" up -d --no-deps --force-recreate "${_changed[@]}" \
+      >> "/tmp/${PROJECT_NAME}-compose.log" 2>&1 || { echo "Development route update failed; see /tmp/${PROJECT_NAME}-compose.log" >&2; return 1; }
+    _start_created_containers
+  fi
+}
+
+_ensure_unix_lan_listener() {
+  local _address="$1" _runtime="$HOME/.config/project-development/lan-runtime"
+  mkdir -p "$_runtime" || return 1
+  chmod 700 "$_runtime" || return 1
+  if [[ "${DEV_LAN_CONTROLLED:-}" == 1 ]]; then sudo -n -v || return 1; else sudo -v || return 1; fi
+  sudo -n python3 - "$_address" "$ROOT_DIR/backend/config/network.py" "$_runtime" "$DEV_HOST" <<'UNIX_LAN_READINESS'
+import hashlib, json, os, signal, socket, ssl, subprocess, sys, time
+from pathlib import Path
+address, helper, runtime, host = sys.argv[1:]
+ready = Path(runtime) / 'lan-ready.json'
+state = Path(runtime) / 'lan-listener.json'
+helper_path = Path(helper)
+# Identity depends on shared implementation bytes, never the checkout path.
+revision = ':'.join(hashlib.sha256(path.read_bytes()).hexdigest() for path in
+                    (helper_path, helper_path.with_name('project_config.py'), helper_path.parents[2] / 'dev.sh'))
+context = ssl.create_default_context()
+def listener():
+    try:
+        value = json.loads(ready.read_text(encoding='utf-8'))
+        pid = value['pid']
+        if not isinstance(pid, int) or pid <= 1:
+            return None
+        os.kill(pid, 0)
+        command = subprocess.check_output(['ps', '-p', str(pid), '-o', 'args='], text=True)
+        if 'network.py' not in command or ' serve ' not in command or str(ready) not in command:
+            return None
+        return value
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return None
+def reachable():
+    try:
+        with socket.create_connection((address, 443), timeout=2) as raw:
+            with context.wrap_socket(raw, server_hostname=host):
+                return True
+    except (OSError, ssl.SSLError):
+        return False
+current = listener()
+if current and current.get('address') != address:
+    raise SystemExit('A LAN session is still bound to another network. Turn LAN off for all projects before enabling this network.')
+if current:
+    try:
+        previous = json.loads(state.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        previous = {}
+    if previous.get('pid') != current['pid'] or previous.get('revision') != revision:
+        # The readiness marker and command were verified above. Retire only
+        # that owned helper, including an older HTTP/mDNS implementation.
+        old_pid = current['pid']
+        os.kill(old_pid, signal.SIGTERM)
+        stop_deadline = time.monotonic() + 5
+        while time.monotonic() < stop_deadline:
+            live = listener()
+            if not live or live['pid'] != old_pid:
+                break
+            time.sleep(0.1)
+        else:
+            raise SystemExit('The previous LAN helper did not stop; access was not enabled.')
+        current = None
+process = None
+if not current:
+    with (Path(runtime) / 'lan.log').open('ab') as log:
+        process = subprocess.Popen([sys.executable, helper, 'serve', '--address', address,
+                                    '--ready-file', str(ready)], stdin=subprocess.DEVNULL,
+                                   stdout=log, stderr=log, start_new_session=True)
+deadline = time.monotonic() + 20
+while time.monotonic() < deadline:
+    if process and process.poll() is not None:
+        raise SystemExit('LAN listener could not start. See ' + str(Path(runtime) / 'lan.log'))
+    current = listener()
+    if current and current.get('address') == address and (not process or current['pid'] == process.pid) and reachable():
+        temporary = state.with_suffix('.pending')
+        temporary.write_text(json.dumps({'pid': current['pid'], 'address': address, 'revision': revision}), encoding='utf-8')
+        temporary.chmod(0o600)
+        temporary.replace(state)
+        raise SystemExit(0)
+    time.sleep(0.2)
+if process and process.poll() is None:
+    process.terminate()
+raise SystemExit('LAN listener did not become ready. See ' + str(Path(runtime) / 'lan.log'))
+UNIX_LAN_READINESS
+}
+
+_retire_project_local_tls() {
+  # Preserve the old generated certificate files for recovery, but stop loading
+  # a local CA certificate as a fallback for this project's public dev hostname.
+  local _legacy="/tmp/traefik-dynamic/${PROJECT_NAME}-tls.yml"
+  if [[ "$OS" == mac ]]; then
+    podman machine ssh "if test -f '$_legacy'; then mv '$_legacy' '${_legacy}.legacy'; fi" || return 1
+    printf 'tls:\n  options:\n    default:\n      sniStrict: true\n' | podman machine ssh "cat > /tmp/traefik-dynamic/development-tls.yml" || return 1
+  else
+    if [[ -f "$_legacy" ]]; then mv "$_legacy" "${_legacy}.legacy"; fi
+    printf 'tls:\n  options:\n    default:\n      sniStrict: true\n' > /tmp/traefik-dynamic/development-tls.yml
   fi
 }
 
@@ -2574,6 +2839,30 @@ PY
 _ensure_global_traefik() {
   command -v podman &>/dev/null || return 0
   podman ps >/dev/null 2>&1 || return 0
+
+  local _acme_token_path="" _acme_token_revision="" _acme_email="" _acme_enabled=false
+  local _acme_mounts=() _acme_flags=()
+  # A host can serve local-only and public-TLS projects together. Merely having
+  # another local project must never disable the host's configured resolver.
+  if python3 - "$ROOT_DIR" <<'HAS_HOST_DNS_CREDENTIAL'
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(sys.argv[1]) / 'backend'))
+from config.development_dns import host_token_file
+raise SystemExit(0 if host_token_file().is_file() else 1)
+HAS_HOST_DNS_CREDENTIAL
+  then
+    _prepare_development_tls || { echo 'Host HTTPS credentials need attention. Existing services were left running.' >&2; return 1; }
+    _acme_enabled=true
+    _acme_mounts=(-v traefik-development-acme:/acme -v "${_acme_token_path}:/run/secrets/cloudflare-token:ro,Z" -e CF_DNS_API_TOKEN_FILE=/run/secrets/cloudflare-token)
+    _acme_flags=(--certificatesresolvers.dev.acme.storage=/acme/acme.json
+      "--certificatesresolvers.dev.acme.email=${_acme_email}"
+      --certificatesresolvers.dev.acme.dnschallenge.provider=cloudflare
+      --certificatesresolvers.dev.acme.dnschallenge.resolvers=1.1.1.1:53,1.0.0.1:53)
+  elif [[ "$DEV_TLS_MODE" == public ]]; then
+    echo 'Run ./dev.sh lan setup to configure public HTTPS on this computer. Existing services were left running.' >&2
+    return 1
+  fi
 
   # Ensure the Docker-compatible API exists before deciding how to launch
   # Traefik. This is required on WSL installations that do not run systemd.
@@ -2665,8 +2954,6 @@ _ensure_global_traefik() {
     _endpoint_args=("--providers.docker.endpoint=unix://${_vm_sock}")
   fi
 
-  _ensure_local_tls
-
   # Windows portproxy reaches the WSL VM address, not its loopback interface.
   # Keep the Windows listeners loopback-only; expose no physical Linux NICs.
   local _web_ports=(-p 127.0.0.1:80:80 -p 127.0.0.1:443:443 -p 127.0.0.1:8443:8443)
@@ -2687,8 +2974,8 @@ _ensure_global_traefik() {
   # recreated before it can discover routes again.
   local _sock_inode=""
   [[ -S "$_sock" ]] && _sock_inode=$(ls -i "$_sock" 2>/dev/null | awk '{print $1}')
-  _config_sig=$(echo "traefik:v3.6.5-local-lan-v3 ${_vm_sock_real:-$_sock} ${_sock_inode} ${_net} ${_wsl_bind}" | md5 -q 2>/dev/null \
-             || echo "traefik:v3.6.5-local-lan-v3 ${_vm_sock_real:-$_sock} ${_sock_inode} ${_net} ${_wsl_bind}" | md5sum 2>/dev/null | cut -d' ' -f1)
+  _config_sig=$(echo "traefik:v3.6.5-public-dev-dns01-v1 ${_vm_sock_real:-$_sock} ${_sock_inode} ${_net} ${_wsl_bind} ${_acme_token_path} ${_acme_token_revision} ${_acme_email}" | md5 -q 2>/dev/null \
+             || echo "traefik:v3.6.5-public-dev-dns01-v1 ${_vm_sock_real:-$_sock} ${_sock_inode} ${_net} ${_wsl_bind} ${_acme_token_path} ${_acme_token_revision} ${_acme_email}" | md5sum 2>/dev/null | cut -d' ' -f1)
   local _sig_label
   _sig_label=$(podman inspect "$_cname" \
     --format '{{index .Config.Labels "dev.kiro.config-sig"}}' 2>/dev/null || true)
@@ -2705,6 +2992,14 @@ _ensure_global_traefik() {
   if [[ "$_needs_recreate" == "true" ]]; then
     [[ "$_needs_recreate" == "true" && "$_sig_label" == "$_config_sig" ]] || \
       echo "🚦 Starting global Traefik (shared router for all projects)..."
+    # Persistent certificates and account keys survive router recreation. Prepare
+    # the volume before stopping a working router, with the mode ACME requires.
+    if $_acme_enabled; then
+      podman volume create --ignore traefik-development-acme >/dev/null || return 1
+      podman run --rm --network none --entrypoint /bin/sh \
+        -v traefik-development-acme:/acme traefik:v3.6.5 \
+        -c 'umask 077; touch /acme/acme.json; chmod 600 /acme/acme.json' >/dev/null || return 1
+    fi
     podman rm -f "$_cname" 2>/dev/null || true
 
     mkdir -p /tmp/traefik-dynamic
@@ -2718,6 +3013,7 @@ _ensure_global_traefik() {
       "${_web_ports[@]}" \
       -p 127.0.0.1:8080:8080 \
       -v /tmp/traefik-dynamic:/traefik-dynamic:ro \
+      "${_acme_mounts[@]}" \
       --label "dev.kiro.config-sig=${_config_sig}" \
       --label "traefik.enable=true" \
       --label "traefik.docker.network=${_net}" \
@@ -2740,6 +3036,7 @@ _ensure_global_traefik() {
         --entrypoints.web.address=:80 \
         --entrypoints.websecure.address=:443 \
         --entrypoints.lan.address=:8443 \
+        "${_acme_flags[@]}" \
         --entrypoints.traefik.address=:8080 \
         --entrypoints.web.transport.respondingTimeouts.readTimeout=0 \
         --entrypoints.web.transport.respondingTimeouts.writeTimeout=0 \
@@ -2752,9 +3049,15 @@ _ensure_global_traefik() {
         "${_endpoint_args[@]}" \
         --global.checknewversion=false \
         --global.sendanonymoususage=false \
-      >/dev/null 2>&1 && echo "✅ Global Traefik started → http://traefik.local" || echo "⚠️  Global Traefik failed to start (non-fatal)"
+      >/dev/null 2>&1 || { echo 'Global Traefik could not start; inspect its container logs.' >&2; return 1; }
+    echo "✅ Global Traefik started → http://traefik.local"
   fi
 
+  if [[ "$DEV_TLS_MODE" == public ]]; then
+    _retire_project_local_tls || return 1
+  else
+    _ensure_local_tls || return 1
+  fi
   _repair_traefik_hostports
 }
 
@@ -3997,6 +4300,7 @@ dc_up_ordered() {
     podman ps --filter "label=com.docker.compose.project=${PROJECT_NAME}" -q 2>/dev/null | grep -q . && break
     sleep 1; _fi=$((_fi + 1))
   done
+  _wait_development_tls || return 1
 }
 
 dc_with_mobile() {
@@ -4291,13 +4595,13 @@ QR_SCHEME
 }
 
 _qr_page_link() {
-  local root="$1" app="${2:-}" project state url host config dest port
+  local root="$1" app="${2:-}" project state url host config dest port resolver=""
+  [[ "$(_development_tls_mode "$root")" == public ]] && resolver=dev
   [[ -d "$root/frontend/mobile" ]] || return 1
   project=$(basename "$root" | tr -cd 'a-zA-Z0-9' | tr '[:upper:]' '[:lower:]')
-  host=$(_project_host "$root")
-  host="${host}.local"
+  host=$(_development_host "$root") || return 1
   # The link is stable even while the local QR service is recovering.
-  printf 'http://%s/qr' "$host"
+  printf 'https://%s/qr' "$host"
   if [[ -n "$app" ]]; then
     printf '/%s' "$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1].lower().replace(" ", "-"), safe=""))' "$app")"
   fi
@@ -4423,7 +4727,9 @@ http:
   routers:
     ${project}-qr:
       rule: 'Host(\`${host}\`) && (Path(\`/qr\`) || PathPrefix(\`/qr/\`))'
-      entryPoints: [web]
+      entryPoints: [websecure]
+      tls:
+        certResolver: "${resolver}"
       priority: 1000
       service: ${project}-qr
   services:
@@ -4583,10 +4889,10 @@ _draw_status_live() {
     for _proj in "${_projects[@]}"; do
       local _display _root _host _tunnel _seen="|" _project_rows="" _label _cn _p _svc
       if [[ "$_proj" == "$PROJECT_NAME" ]]; then
-        _display="$PROJECT_DISPLAY_NAME"; _root="$ROOT_DIR"; _host="${PROJECT_HOST}.local"
+        _display="$PROJECT_DISPLAY_NAME"; _root="$ROOT_DIR"; _host="${DEV_HOST}"
       else
         _resolve_proj "$_proj" _display _root
-        _host="$(_project_host "${_root:-$_display}").local"
+        _host=$(_development_host "${_root:-$_display}" 2>/dev/null || true)
       fi
       # Keep control bytes in paths/configuration out of terminal headers.
       _display=$(printf '%s' "$_display" | tr -d '[:cntrl:]')
@@ -4840,7 +5146,7 @@ _draw_status_live_row() {
 print_status() {
   _wire_podman_socket 2>/dev/null || true
 
-  local _local_host="${PROJECT_HOST}.local"
+  local _local_host="${DEV_HOST}"
   local _tunnel_url
   _tunnel_url=$(grep "^CLOUDFLARE_TUNNEL_URL=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2 || echo "")
 
@@ -4991,7 +5297,7 @@ live_monitor() {
   _wire_podman_socket 2>/dev/null || true
 
   # Native Windows hosts the controller because enabling LAN also needs its
-  # firewall and mDNS listener. Unix keeps this helper in the monitor's session.
+  # firewall and HTTPS relay. Unix keeps this helper in the monitor's session.
   local _lan_control_pid="" _lan_control_dir=""
   if [[ -z "${DEV_LAN_CONTROL_STATE:-}" ]] && ! grep -qi microsoft /proc/version 2>/dev/null; then
     _lan_control_dir=$(mktemp -d /tmp/devtools-lan-control-XXXXXX)
@@ -5267,7 +5573,7 @@ _start_tunnel_watchdog() {
   local _pname="$PROJECT_NAME"
   local _rdir="$ROOT_DIR"
   local _sdir="${DEV_SOURCE_DIR:-$ROOT_DIR}"
-  local _lhost="${PROJECT_HOST}.local"
+  local _lhost="${DEV_HOST}"
   local _tlog="/tmp/${PROJECT_NAME}-tunnel.log"
   local _tpid="/tmp/${PROJECT_NAME}-tunnel.pid"
   local _wpid="$watchdog_pid_file"
@@ -5685,7 +5991,7 @@ _open_safari() {
   if [[ -n "$_tunnel_url" ]]; then
     _open_url="$_tunnel_url"
   else
-    _open_url="https://${PROJECT_HOST}.local"
+    _open_url="https://${DEV_HOST}"
   fi
 
   case "$OS" in
@@ -5736,8 +6042,8 @@ _print_access_urls() {
   local _tunnel_url
   _tunnel_url=$(grep "^CLOUDFLARE_TUNNEL_URL=" "$ROOT_DIR/.env" 2>/dev/null | cut -d'=' -f2 || echo "")
 
-  # PROJECT_HOST is already the correct lowercase+dots form (e.g. myproject.com)
-  local _local_host="${PROJECT_HOST}.local"
+  # Use the same canonical hostname as routing, certificates and the monitor.
+  local _local_host="${DEV_HOST}"
 
   echo "   🏠 Local (zero latency):"
   echo "      Web app:  https://${_local_host}"
@@ -6739,12 +7045,12 @@ _setup_physical_devices() {
 }
 
 # ── Backend proxy: localhost:8000 → Traefik → Django ─────────────────────────
-# Listens on 127.0.0.1:8000, rewrites Host → PROJECT_HOST.local, forwards
+# Listens on 127.0.0.1:8000, rewrites Host → DEV_HOST, forwards
 # to Traefik on port 80. This lets the Android emulator reach the backend via
 # adb reverse tcp:8000 tcp:8000 without needing privileged port 80.
 _start_backend_proxy() {
   local proxy_port=8000
-  local target_host="${PROJECT_HOST}.local"
+  local target_host="${DEV_HOST}"
   local pid_file="/tmp/${PROJECT_NAME}-backend-proxy.pid"
   local proxy_script="/tmp/${PROJECT_NAME}-backend-proxy.py"
   local proxy_log="/tmp/${PROJECT_NAME}-backend-proxy.log"
@@ -6999,6 +7305,7 @@ smart_launch() {
   # Auto-restart any project containers that are in "exited" or "created" state.
   # "exited" = machine was stopped and restarted (macOS sleep/reboot).
   # "created" = podman-compose 1.5.x bug where up -d creates but doesn't start.
+  _reconcile_development_host || return 1
   _auto_restart_exited_containers
   _start_created_containers
   _apply_restart_policy
@@ -7063,6 +7370,7 @@ smart_launch() {
 
   # ── Everything running → check if tunnel URLs changed, then show status ───
   if [[ ${#broken_services[@]} -eq 0 && ${#missing_services[@]} -eq 0 && ${#mobile_broken[@]} -eq 0 && ${#mobile_missing[@]} -eq 0 ]]; then
+    _wait_development_tls || return 1
     echo "✅ All services are running"
 
     # Start Cloudflare Tunnel if not already running
@@ -7249,6 +7557,7 @@ smart_launch() {
   fi
 
   echo ""
+  _wait_development_tls || return 1
   echo "✅ Service rebuild complete!"
   echo ""
 
@@ -8337,7 +8646,14 @@ case "$CMD" in
       if python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" has-exposure-check; then
         bash "$ROOT_DIR/dev.sh" _exposure_check_only || exit 1
       fi
+      if [[ "$OS" != wsl ]]; then
+        _lan_ip=$(_get_lan_ip)
+        python3 "$ROOT_DIR/backend/config/development_dns.py" "$ROOT_DIR" token-path >/dev/null || exit 1
+        python3 "$ROOT_DIR/backend/config/development_dns.py" "$ROOT_DIR" sync --address "$_lan_ip" || exit 1
+      fi
       _ensure_global_traefik || exit 1
+      _reconcile_development_host || exit 1
+      _wait_development_tls || exit 1
     fi
     _lan_relays=()
     _lan_gateway=$(podman network inspect traefik --format '{{range .Subnets}}{{.Gateway}}{{end}}' 2>/dev/null || true)
@@ -8346,20 +8662,22 @@ case "$CMD" in
       _lan_gateway=$(ip route show default | awk 'NR==1 {print $3}')
       [[ -n "$_lan_gateway" ]] && _lan_relays+=(--relay-source "${_lan_gateway}/32")
     fi
-    python3 "$ROOT_DIR/backend/config/network.py" "$_lan_action" --root "$ROOT_DIR" "${_lan_relays[@]}" --discover || exit 1
+    python3 "$ROOT_DIR/backend/config/network.py" "$_lan_action" --root "$ROOT_DIR" "${_lan_relays[@]}" --discover >/dev/null || exit 1
     if [[ "$OS" == mac ]]; then
-      podman machine ssh "cat > '/tmp/traefik-dynamic/${PROJECT_NAME}-lan.yml'" < "/tmp/traefik-dynamic/${PROJECT_NAME}-lan.yml" || exit 1
+      if ! podman machine ssh "cat > '/tmp/traefik-dynamic/${PROJECT_NAME}-lan.yml'" < "/tmp/traefik-dynamic/${PROJECT_NAME}-lan.yml"; then
+        python3 "$ROOT_DIR/backend/config/network.py" off --root "$ROOT_DIR" >/dev/null
+        exit 1
+      fi
     fi
     if [[ "$_lan_action" == on && "$OS" != wsl ]]; then
-      _lan_ip=$(_get_lan_ip)
-      if [[ "${DEV_LAN_CONTROLLED:-}" == 1 ]]; then
-        sudo -n -v || exit 1
-      else
-        sudo -v || exit 1
+      if ! _ensure_unix_lan_listener "$_lan_ip"; then
+        python3 "$ROOT_DIR/backend/config/network.py" off --root "$ROOT_DIR" >/dev/null
+        if [[ "$OS" == mac ]]; then
+          podman machine ssh "rm -f '/tmp/traefik-dynamic/${PROJECT_NAME}-lan.yml'" || true
+        fi
+        exit 1
       fi
-      sudo -n -b python3 "$ROOT_DIR/backend/config/network.py" serve --address "$_lan_ip" \
-        --root "$ROOT_DIR" >/tmp/devtools-lan.log 2>&1
-      echo 'LAN discovery requires multicast on the Wi-Fi network. Trust the public mkcert rootCA.pem on your phone.'
+      echo "LAN enabled on $_lan_ip for https://${DEV_HOST}."
     elif [[ "$_lan_action" == on ]]; then
       echo 'Windows: use .\dev.ps1 lan on to start the native LAN listener.'
     fi

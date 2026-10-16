@@ -3,7 +3,6 @@ from django.conf import settings
 from django.urls import reverse, resolve
 import os
 import json
-import plistlib
 import unittest
 import subprocess
 from pathlib import Path
@@ -29,84 +28,124 @@ class LocalNetworkTests(SimpleTestCase):
             (root / 'backend/project.py').write_text("DEV_RESOURCE_NAMESPACE = 'existingdata'\n")
             directory = Path(temporary) / 'routing'
             result = configure(root, 'on', directory)
-            self.assertEqual(result['host'], 'renamed.app.local')
+            self.assertEqual(result['host'], 'dev.renamed.app')
             self.assertTrue((directory / 'existingdata-lan.yml').exists())
             configure(root, 'off', directory)
             self.assertEqual(list(directory.iterdir()), [])
 
     def test_lan_routes_are_scoped_and_do_not_publish_backend_or_dashboard_ports(self):
         from .network import lan_routes
-        config = lan_routes('project', 'project.app.local')
+        config = lan_routes('project', 'dev.project.app')
         for router in config['http']['routers'].values():
             self.assertEqual(router['entryPoints'], ['lan'])
-            self.assertIn('Host(`project.app.local`)', router['rule'])
+            self.assertEqual(router['tls'], {'certResolver': 'dev'})
+            self.assertIn('Host(`dev.project.app`)', router['rule'])
             self.assertIn('project-lan-relay', router['middlewares'])
             self.assertNotIn('api@internal', router['service'])
         self.assertEqual(config['http']['middlewares']['project-lan-relay']['ipAllowList']['sourceRange'],
                          ['127.0.0.1/32', '::1/128'])
 
-    def test_mdns_answers_only_enabled_names_and_never_claims_other_projects(self):
-        import struct
-        from .network import mdns_answer, dns_name
-        def query(host):
-            encoded = b''.join(bytes([len(label)]) + label.encode() for label in host.split('.')) + b'\0'
-            return struct.pack('!HHHHHH', 0, 0, 1, 0, 0, 0) + encoded + struct.pack('!HH', 1, 1)
-        host = 'project.app.local'
-        answer = mdns_answer(query(host), {host}, '192.168.1.2')
-        self.assertEqual(dns_name(answer, 12)[0], host)
-        _, end = dns_name(answer, 12)
-        self.assertEqual(answer[end + 10:end + 14], bytes([192, 168, 1, 2]))
-        self.assertIsNone(mdns_answer(query('other.app.local'), {host}, '192.168.1.2'))
-        self.assertIsNone(mdns_answer(query(host), set(), '192.168.1.2'))
-        self.assertIsNone(mdns_answer(b'bad', {host}, '192.168.1.2'))
+    def test_development_hostname_uses_only_selected_checkout_settings(self):
+        from .project_config import development_hostname
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / 'My-Project.app'
+            (root / 'backend').mkdir(parents=True)
+            with patch.dict(os.environ, {'DEV_DOMAIN': 'wrong.example.com', 'DEV_HOST': 'wrong.example.com'}):
+                self.assertEqual(development_hostname(root), 'dev.my-project.app')
+                (root / 'backend/project.py').write_text("DEV_DOMAIN = 'owned.example.com'\nraise RuntimeError('must not import')\n")
+                self.assertEqual(development_hostname(root), 'dev.owned.example.com')
+                (root / '.env').write_text('DEV_DOMAIN="buecher.example.com"\n')
+                self.assertEqual(development_hostname(root), 'dev.buecher.example.com')
+                (root / '.env').write_text('DEV_DOMAIN=bücher.de\n', encoding='utf-8')
+                self.assertEqual(development_hostname(root), 'dev.xn--bcher-kva.de')
+                for invalid in ['https://owned.example.com', 'owned.example.com:443', 'foo.local', '127.0.0.1', '../other', 'foo..com', '*.example.com']:
+                    (root / '.env').write_text('DEV_DOMAIN=' + invalid + '\n')
+                    with self.subTest(domain=invalid), self.assertRaises(ValueError):
+                        development_hostname(root)
 
-    def test_mdns_safari_https_and_ipv6_queries_get_negative_records_and_ipv4(self):
-        import struct
-        from .network import mdns_answer, dns_name, mdns_destination
-        host = 'project.app.local'
-        encoded = b''.join(bytes([len(label)]) + label.encode() for label in host.split('.')) + b'\0'
-        # Safari sends multiquestion HTTPS + address queries, with compressed
-        # names and the QU bit after waking or joining a wireless network.
-        packet = (struct.pack('!HHHHHH', 123, 0, 2, 0, 0, 0) + encoded
-                  + struct.pack('!HH', 65, 32769) + b'\xc0\x0c' + struct.pack('!HH', 28, 32769))
-        peer = ('192.168.1.3', 5353)
-        self.assertEqual(mdns_destination(packet, {host}, peer), peer)
-        answer = mdns_answer(packet, {host}, '192.168.1.2')
-        self.assertEqual(struct.unpack('!HHHHHH', answer[:12]), (0, 0x8400, 0, 1, 0, 1))
-        name, end = dns_name(answer, 12)
-        kind, klass, ttl, size = struct.unpack('!HHIH', answer[end:end + 10])
-        self.assertEqual((name, kind, klass, ttl), (host, 47, 32769, 30))
-        next_name, bitmap = dns_name(answer, end + 10)
-        self.assertEqual(next_name, host)
-        self.assertEqual(answer[bitmap:bitmap + 3], b'\x00\x01\x40')
-        name, end = dns_name(answer, end + 10 + size)
-        self.assertEqual(struct.unpack('!HHIH', answer[end:end + 10]), (1, 32769, 30, 4))
-        self.assertEqual(answer[end + 10:end + 14], bytes([192, 168, 1, 2]))
-        self.assertIsNone(mdns_answer(packet, set(), '192.168.1.2'))
-        multicast = packet.replace(struct.pack('!HH', 28, 32769), struct.pack('!HH', 28, 1))
-        self.assertEqual(mdns_destination(multicast, {host}, peer), ('224.0.0.251', 5353))
-        legacy = mdns_answer(packet, {host}, '192.168.1.2', legacy=True)
-        self.assertEqual(struct.unpack('!HHHHHH', legacy[:12])[:3], (123, 0x8400, 2))
-        offset = 12
-        for _ in range(2):
-            _, offset = dns_name(legacy, offset)
-            offset += 4
-        _, offset = dns_name(legacy, offset)
-        self.assertEqual(struct.unpack('!HHIH', legacy[offset:offset + 10])[:3], (47, 1, 10))
-        self.assertEqual(mdns_destination(packet, {host}, (peer[0], 54321)), (peer[0], 54321))
-        self.assertIsNone(mdns_answer(packet[:-1], {host}, '192.168.1.2'))
+    def test_off_revokes_routes_even_after_domain_configuration_breaks(self):
+        from .network import configure
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / 'project.app'
+            root.mkdir()
+            state = Path(directory) / 'routing'
+            configure(root, 'on', state)
+            (root / '.env').write_text('DEV_DOMAIN=broken\n')
+            self.assertFalse(configure(root, 'off', state)['enabled'])
+            self.assertEqual(list(state.iterdir()), [])
+
+    def test_clean_non_domain_checkout_starts_locally_without_dns_configuration(self):
+        from .project_config import development_hostname
+        from .network import configure
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / 'My New Project'
+            root.mkdir()
+            self.assertEqual(development_hostname(root), 'dev.my-new-project.localhost')
+            state = Path(directory) / 'routing'
+            with self.assertRaises(ValueError):
+                configure(root, 'on', state)
+            self.assertFalse(configure(root, 'off', state)['enabled'])
+            self.assertFalse(state.exists())
+
+    def test_enabled_hosts_rejects_old_aliases_and_malformed_state(self):
+        from .network import enabled_hosts
+        with TemporaryDirectory() as directory:
+            for number, host in enumerate(['dev.project.app', 'project.app.local', 'dev.foo.local', 'dev.a..com', 'elsewhere.app', None]):
+                (Path(directory) / f'{number}-lan.state').write_text(json.dumps({'host': host}))
+            for number, value in enumerate([None, [], 'string', 7], start=10):
+                (Path(directory) / f'{number}-lan.state').write_text(json.dumps(value))
+            self.assertEqual(enabled_hosts(directory), {'dev.project.app'})
+
+    def test_discovered_or_routes_cannot_escape_the_project_hostname(self):
+        from .network import discovered_routes
+        rule = 'Host(`dev.project.app`) || PathPrefix(`/socket`)'
+        labels = {'traefik.http.routers.project-games.rule': rule,
+                  'traefik.http.routers.project-games.entrypoints': 'websecure',
+                  'traefik.http.routers.project-games.service': 'project-games'}
+        with patch('config.network.subprocess.check_output', side_effect=['id\n', json.dumps([{'Config': {'Labels': labels}}])]):
+            routes = discovered_routes('project', 'dev.project.app')
+        self.assertEqual(routes['project-games-lan']['rule'], f'Host(`dev.project.app`) && ({rule})')
+
+    def test_relay_shares_a_short_host_snapshot_and_fails_closed_on_read_failure(self):
+        from .network import Relay
+        with Relay(('127.0.0.1', 0), None) as relay:
+            relay.directory = 'unused'
+            with patch('config.network.time.monotonic', return_value=10) as clock, \
+                    patch('config.network.enabled_hosts', return_value={'dev.project.app'}) as read:
+                self.assertEqual(relay.allowed_hosts(), {'dev.project.app'})
+                for _ in range(50):
+                    self.assertEqual(relay.allowed_hosts(), {'dev.project.app'})
+                read.assert_called_once_with('unused')
+                clock.return_value = 10.26
+                read.return_value = set()
+                self.assertEqual(relay.allowed_hosts(), set())
+                self.assertEqual(read.call_count, 2)
+                clock.return_value = 10.52
+                read.side_effect = OSError('temporarily unavailable')
+                self.assertEqual(relay.allowed_hosts(), set())
+
+    def test_listener_readiness_is_removed_on_exit_and_preserves_a_replacement(self):
+        from .network import listener_readiness
+        with TemporaryDirectory() as temporary:
+            marker = Path(temporary) / 'ready.json'
+            with listener_readiness(marker, '192.168.1.2'):
+                self.assertEqual(json.loads(marker.read_text()), {'pid': os.getpid(), 'address': '192.168.1.2'})
+            self.assertFalse(marker.exists())
+            with listener_readiness(marker, '192.168.1.2'):
+                marker.write_text(json.dumps({'pid': os.getpid() + 1}))
+            self.assertTrue(marker.exists())
 
     def test_tls_hostname_uses_real_clienthello_and_rejects_incomplete_input(self):
         import ssl
         from .network import hello_hostname
         incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
-        connection = ssl.create_default_context().wrap_bio(incoming, outgoing, server_hostname='project.app.local')
+        connection = ssl.create_default_context().wrap_bio(incoming, outgoing, server_hostname='dev.project.app')
         try:
             connection.do_handshake()
         except ssl.SSLWantReadError:
             pass
         packet = outgoing.read()
-        self.assertEqual(hello_hostname(packet), 'project.app.local')
+        self.assertEqual(hello_hostname(packet), 'dev.project.app')
         self.assertIsNone(hello_hostname(packet[:30]))
         self.assertIsNone(hello_hostname(b'GET / HTTP/1.1'))
 
@@ -116,6 +155,7 @@ class LocalNetworkTests(SimpleTestCase):
         import socketserver
         import ssl
         import threading
+        import time
         from .network import Relay, Forward, configure
         class Upstream(socketserver.BaseRequestHandler):
             def handle(self):
@@ -129,7 +169,7 @@ class LocalNetworkTests(SimpleTestCase):
             state = Path(directory) / 'routing'
             configure(root, 'on', state)
             output = ssl.MemoryBIO()
-            connection = ssl.create_default_context().wrap_bio(ssl.MemoryBIO(), output, server_hostname='project.app.local')
+            connection = ssl.create_default_context().wrap_bio(ssl.MemoryBIO(), output, server_hostname='dev.project.app')
             try:
                 connection.do_handshake()
             except ssl.SSLWantReadError:
@@ -145,8 +185,10 @@ class LocalNetworkTests(SimpleTestCase):
                     with socket.create_connection(relay.server_address, timeout=4) as client:
                         client.sendall(hello)
                         self.assertEqual(client.recv(9), b'CONNECTED')
+                        revoked = time.monotonic()
                         configure(root, 'off', state)
                         self.assertEqual(client.recv(1), b'')
+                        self.assertLess(time.monotonic() - revoked, 1)
                     with socket.create_connection(relay.server_address, timeout=4) as client:
                         client.sendall(hello)
                         self.assertEqual(client.recv(1), b'')
@@ -157,7 +199,350 @@ class LocalNetworkTests(SimpleTestCase):
                         worker.join(3)
 
 
+class DevelopmentDnsTests(SimpleTestCase):
+    def setUp(self):
+        from unittest.mock import Mock
+        from . import development_dns
+        self.dns = development_dns
+        self.hostname = 'dev.example.com'
+        self.zone = {'id': 'a' * 32, 'name': 'example.com', 'status': 'active'}
+        self.marker = 'managed-by-project-development:' + self.hostname
+        self.client = Mock()
+        self.client.request.side_effect = lambda method, path, data: {'result': data}
+        self.set_public_mode = self.dns.set_public_mode
+        mode_patch = patch.object(self.dns, 'set_public_mode')
+        self.mode_write = mode_patch.start()
+        self.addCleanup(mode_patch.stop)
+
+    def context(self, records):
+        return patch.object(self.dns, '_context', return_value=(self.hostname, self.client, self.zone, records))
+
+    def record(self, **changes):
+        return {'id': 'b' * 32, 'type': 'A', 'name': self.hostname, 'content': '192.168.1.2',
+                'ttl': 60, 'proxied': False, 'comment': self.marker, **changes}
+
+    def test_creates_only_an_owned_dns_only_development_record(self):
+        with self.context([]):
+            self.assertEqual(self.dns.sync('.', '192.168.1.2')['action'], 'created')
+        method, path, payload = self.client.request.call_args.args
+        self.assertEqual(method, 'POST')
+        self.assertEqual(path, f'/zones/{self.zone["id"]}/dns_records')
+        self.assertEqual(payload, {'type': 'A', 'name': self.hostname, 'content': '192.168.1.2',
+                                  'ttl': 60, 'proxied': False, 'comment': self.marker})
+
+    def test_updates_only_the_owned_record_when_the_lan_address_changes(self):
+        with self.context([self.record()]):
+            self.assertEqual(self.dns.sync('.', '192.168.1.3')['action'], 'updated')
+        self.assertEqual(self.client.request.call_args.args[0], 'PATCH')
+        self.assertTrue(self.client.request.call_args.args[1].endswith('/' + 'b' * 32))
+
+    def test_an_unchanged_record_does_not_write_to_cloudflare(self):
+        with self.context([self.record()]):
+            self.assertEqual(self.dns.sync('.', '192.168.1.2')['action'], 'unchanged')
+        self.client.request.assert_not_called()
+
+    def test_dry_run_does_not_write_to_cloudflare(self):
+        with self.context([]):
+            self.assertEqual(self.dns.sync('.', '192.168.1.2', dry_run=True)['action'], 'would-create')
+        self.client.request.assert_not_called()
+        self.mode_write.assert_not_called()
+
+    def test_foreign_address_alias_and_https_records_are_never_overwritten(self):
+        for kind in ('A', 'AAAA', 'CNAME', 'NS', 'HTTPS', 'SVCB'):
+            with self.subTest(kind=kind), self.context([self.record(type=kind, comment='another purpose')]):
+                with self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'unowned'):
+                    self.dns.sync('.', '192.168.1.2')
+        self.client.request.assert_not_called()
+
+    def test_an_ownership_marker_for_another_hostname_is_not_accepted(self):
+        with self.context([self.record(comment='managed-by-project-development:dev.other.com')]):
+            with self.assertRaises(self.dns.DevelopmentDNSError):
+                self.dns.sync('.', '192.168.1.2')
+        self.client.request.assert_not_called()
+
+    def test_multiple_owned_addresses_or_an_owned_alias_are_not_silently_repaired(self):
+        for records in ([self.record(), self.record(content='192.168.1.3')], [self.record(type='AAAA')]):
+            with self.subTest(records=records), self.context(records):
+                with self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'conflicting'):
+                    self.dns.sync('.', '192.168.1.2')
+        self.client.request.assert_not_called()
+
+    def test_unrelated_txt_records_are_preserved(self):
+        with self.context([self.record(type='TXT', comment='another purpose')]):
+            self.assertEqual(self.dns.sync('.', '192.168.1.2')['action'], 'created')
+        self.assertEqual(self.client.request.call_count, 1)
+
+    def test_non_lan_addresses_are_rejected_before_accessing_cloudflare(self):
+        for address in ('127.0.0.1', '169.254.1.1', '0.0.0.0', '8.8.8.8', '192.0.2.1', '100.64.0.1', '::1', 'bad'):
+            with self.subTest(address=address), patch.object(self.dns, '_context') as context:
+                with self.assertRaises(self.dns.DevelopmentDNSError):
+                    self.dns.sync('.', address)
+                context.assert_not_called()
+
+    def test_credential_check_is_read_only_and_does_not_claim_dns_edit_permissions(self):
+        with self.context([self.record()]):
+            result = self.dns.check('.')
+        self.assertEqual(result['dns_access'], 'readable')
+        self.assertEqual(result['record_count'], 1)
+        self.client.request.assert_not_called()
+
+    def test_zone_discovery_uses_authorized_hostname_suffixes(self):
+        from unittest.mock import Mock
+        with patch.object(self.dns, '_read_token', return_value='test-token'):
+            client = self.dns._Cloudflare('unused')
+        client.request = Mock(side_effect=[{'result': []}, {'result': [self.zone]}])
+        self.assertEqual(client.zone(self.hostname), self.zone)
+        self.assertIn('name=dev.example.com', client.request.call_args_list[0].args[1])
+        self.assertIn('name=example.com', client.request.call_args_list[1].args[1])
+
+    def test_record_pagination_is_complete_and_does_not_match_another_host(self):
+        from unittest.mock import Mock
+        with patch.object(self.dns, '_read_token', return_value='test-token'):
+            client = self.dns._Cloudflare('unused')
+        client.request = Mock(side_effect=[
+            {'result': [self.record(name='other.example.com')], 'result_info': {'total_pages': 2}},
+            {'result': [self.record()], 'result_info': {'total_pages': 2}}])
+        self.assertEqual(client.records(self.zone['id'], self.hostname), [self.record()])
+
+    def test_http_errors_never_echo_credential_headers_or_response_bodies(self):
+        import io
+        from unittest.mock import Mock
+        from urllib.error import HTTPError
+        with patch.object(self.dns, '_read_token', return_value='test-private-token'):
+            client = self.dns._Cloudflare('unused')
+        client._opener = Mock()
+        client._opener.open.side_effect = HTTPError('https://api.cloudflare.com/client/v4/zones', 403,
+                                                   'test-private-token', {}, io.BytesIO(b'test-private-token'))
+        with self.assertRaises(self.dns.DevelopmentDNSError) as caught:
+            client.request('GET', '/zones')
+        self.assertNotIn('test-private-token', str(caught.exception))
+        self.assertIn('403', str(caught.exception))
+
+    def test_http_redirects_cannot_forward_the_api_token(self):
+        with self.assertRaises(self.dns.DevelopmentDNSError):
+            self.dns._NoRedirects().redirect_request(None, None, 302, '', {}, 'https://other.example.com')
+
+    def test_checkout_token_path_ignores_inherited_project_secrets(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '.env').write_text('DEV_DNS_TOKEN_FILE=.private/token\n', encoding='utf-8')
+            with patch.dict(os.environ, {'DEV_DNS_TOKEN_FILE': 'wrong-project', 'CF_DNS_API_TOKEN': 'never-use'}):
+                self.assertEqual(self.dns.token_file(root), root / '.private' / 'token')
+
+    def test_shared_resolver_rejects_a_different_checkout_credential_before_reading(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(self.dns, 'host_token_file', return_value=root / 'host-token'), \
+                    patch.object(self.dns, 'token_file', return_value=root / 'project-token'), \
+                    patch.object(self.dns, '_read_token') as read:
+                with self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'host-wide'):
+                    self.dns.prepare_host(root)
+                read.assert_not_called()
+
+    def test_shared_token_preflight_checks_permissions_without_network(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'host-token'
+            with patch.object(self.dns, 'host_token_file', return_value=path), \
+                    patch.object(self.dns, 'token_file', return_value=path), \
+                    patch.object(self.dns, '_read_token', return_value='private-test-token') as read, \
+                    patch.object(self.dns, '_Cloudflare') as client:
+                self.assertEqual(self.dns.prepare_host(directory), path.resolve())
+                read.assert_called_once_with(path.resolve())
+                client.assert_not_called()
+
+    def test_windows_public_token_acl_is_rejected(self):
+        from unittest.mock import Mock
+        with patch.object(self.dns.subprocess, 'run', return_value=Mock(returncode=3)):
+            with self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'readable only'):
+                self.dns._windows_private_file(Path('private-token'))
+
+    def test_windows_acl_inspection_failure_is_distinct_from_public_permissions(self):
+        from unittest.mock import Mock
+        with patch.object(self.dns.subprocess, 'run', return_value=Mock(returncode=4)):
+            with self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'Could not verify'):
+                self.dns._windows_private_file(Path('private-token'))
+
+    def test_windows_acl_uses_sids_and_fallback_powershell_ignores_ps7_modules(self):
+        import base64
+        from unittest.mock import Mock
+        with patch.object(self.dns.shutil, 'which', return_value=None), \
+                patch.dict(os.environ, {'PSModulePath': 'wrong-version-modules'}), \
+                patch.object(self.dns.subprocess, 'run', return_value=Mock(returncode=0)) as run:
+            self.dns._windows_private_file(Path('private-token'))
+        command = run.call_args.args[0]
+        script = base64.b64decode(command[-1]).decode('utf-16-le')
+        self.assertIn('GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])', script)
+        self.assertNotIn('.Translate(', script)
+        self.assertNotIn('PSModulePath', run.call_args.kwargs['env'])
+
+    def test_localhost_checkout_is_rejected_before_token_prompt_or_api(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / 'Application'
+            root.mkdir()
+            with patch.object(self.dns, '_Cloudflare') as client, patch.object(self.dns, '_prompt_token') as prompt:
+                for command in (self.dns.setup, self.dns.check):
+                    with self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'domain you own'):
+                        command(root)
+                with self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'domain you own'):
+                    self.dns.sync(root, '192.168.1.2')
+                client.assert_not_called()
+                prompt.assert_not_called()
+            self.mode_write.assert_not_called()
+
+    def test_setup_enrolls_private_host_token_then_only_checks_the_selected_zone(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'host' / 'cloudflare-token'
+            with patch.object(self.dns, '_public_hostname', return_value=self.hostname), \
+                    patch.object(self.dns, '_host_token_path', return_value=path), \
+                    patch.object(self.dns, '_prompt_token', return_value='private-test-token') as prompt, \
+                    patch.object(self.dns, '_restrict_windows_path'), \
+                    patch.object(self.dns, '_windows_private_file'), \
+                    patch.object(self.dns, 'check', return_value={'hostname': self.hostname, 'dns_access': 'readable'}) as check, \
+                    patch.object(self.dns, '_setup_contact') as contact:
+                result = self.dns.setup(directory)
+            self.assertEqual(path.read_text().strip(), 'private-test-token')
+            self.assertEqual(result['credential'], 'enrolled')
+            self.assertNotIn('private-test-token', json.dumps(result))
+            self.assertEqual(list(path.parent.iterdir()), [path])
+            prompt.assert_called_once()
+            check.assert_called_once_with(directory, path)
+            contact.assert_called_once_with(path)
+            self.mode_write.assert_called_once_with(directory)
+            if os.name != 'nt':
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_existing_token_is_preserved_and_never_reprompted(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'cloudflare-token'
+            path.write_text('existing-test-token')
+            path.chmod(0o600)
+            with patch.object(self.dns, '_public_hostname', return_value=self.hostname), \
+                    patch.object(self.dns, '_host_token_path', return_value=path), \
+                    patch.object(self.dns, '_windows_private_file'), \
+                    patch.object(self.dns, '_prompt_token') as prompt, \
+                    patch.object(self.dns, 'check', return_value={'dns_access': 'readable'}), \
+                    patch.object(self.dns, '_setup_contact'):
+                self.assertEqual(self.dns.setup(directory)['credential'], 'existing')
+            self.assertEqual(path.read_text(), 'existing-test-token')
+            prompt.assert_not_called()
+
+    def test_setup_scope_failure_preserves_token_and_does_not_enable_public_mode(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'cloudflare-token'
+            path.write_text('existing-test-token')
+            path.chmod(0o600)
+            with patch.object(self.dns, '_public_hostname', return_value=self.hostname), \
+                    patch.object(self.dns, '_host_token_path', return_value=path), \
+                    patch.object(self.dns, '_windows_private_file'), \
+                    patch.object(self.dns, 'check', side_effect=self.dns.DevelopmentDNSError('Not authorized')):
+                with self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'Zone:Read and DNS:Edit'):
+                    self.dns.setup(directory)
+            self.assertEqual(path.read_text(), 'existing-test-token')
+            self.mode_write.assert_not_called()
+
+    def test_token_prompt_refuses_redirected_input_and_getpass_fallback(self):
+        import warnings
+        with patch.object(self.dns.sys.stdin, 'isatty', return_value=False), \
+                patch.object(self.dns.getpass, 'getpass') as prompt:
+            with self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'interactive terminal'):
+                self.dns._prompt_token()
+            prompt.assert_not_called()
+        def unmasked(*args, **kwargs):
+            warnings.warn('Cannot hide input', self.dns.getpass.GetPassWarning)
+            self.fail('Unmasked fallback must not read input')
+        with patch.object(self.dns, '_require_interactive'), patch.object(self.dns.getpass, 'getpass', side_effect=unmasked):
+            with self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'cannot hide input'):
+                self.dns._prompt_token()
+
+    def test_private_enrollment_never_replaces_an_existing_file(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'host' / 'token'
+            with patch.object(self.dns, '_restrict_windows_path'):
+                self.assertTrue(self.dns._write_private_file(path, 'first-test-token'))
+                self.assertFalse(self.dns._write_private_file(path, 'second-test-token'))
+            self.assertEqual(path.read_text(), 'first-test-token\n')
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACL ordering')
+    def test_windows_temp_file_is_empty_when_acl_is_restricted(self):
+        protected = []
+        def protect(path, directory=False):
+            if not directory:
+                self.assertEqual(path.read_bytes(), b'')
+                protected.append(path)
+        with TemporaryDirectory() as directory, patch.object(self.dns, '_restrict_windows_path', side_effect=protect):
+            self.dns._write_private_file(Path(directory) / 'token', 'private-test-token')
+        self.assertEqual(len(protected), 1)
+
+    def test_contact_reuses_saved_value_or_global_git_email(self):
+        from unittest.mock import Mock
+        with TemporaryDirectory() as directory:
+            token = Path(directory) / 'token'
+            contact = token.parent / 'acme-email'
+            contact.write_text('saved@example.com\n')
+            with patch.object(self.dns.subprocess, 'run') as git, patch('builtins.input') as prompt:
+                self.dns._setup_contact(token)
+                git.assert_not_called()
+                prompt.assert_not_called()
+            contact.unlink()
+            with patch.object(self.dns.subprocess, 'run', return_value=Mock(returncode=0, stdout='global@example.com\n')) as git, \
+                    patch.object(self.dns, '_restrict_windows_path'), patch('builtins.input') as prompt:
+                self.dns._setup_contact(token)
+                self.assertEqual(contact.read_text(), 'global@example.com\n')
+                self.assertEqual(git.call_args.args[0], ['git', 'config', '--global', '--get', 'user.email'])
+                prompt.assert_not_called()
+
+    def test_public_mode_updates_only_the_exact_root_setting(self):
+        with TemporaryDirectory() as directory, patch.object(self.dns, '_restrict_windows_path'):
+            path = Path(directory) / '.env'
+            original = b'\xef\xbb\xbfSECRET="test=private"\r\n# DEV_TLS_MODE=ignore\r\nOTHER_DEV_TLS_MODE=local\r\nDEV_TLS_MODE=local\r\n'
+            path.write_bytes(original)
+            self.set_public_mode(directory)
+            self.assertEqual(path.read_bytes(), original.replace(b'\nDEV_TLS_MODE=local', b'\nDEV_TLS_MODE=public'))
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_public_mode_refuses_to_overwrite_a_concurrent_env_edit(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / '.env'
+            path.write_text('FIRST=value\n')
+            def changed_during_write(descriptor):
+                path.write_text('FIRST=new-edit\n')
+            with patch.object(self.dns, '_restrict_windows_path'), patch.object(self.dns.os, 'fsync', side_effect=changed_during_write):
+                with self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'changed during'):
+                    self.set_public_mode(directory)
+            self.assertEqual(path.read_text(), 'FIRST=new-edit\n')
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    @unittest.skipIf(os.name == 'nt', 'Unix permission bits are enforced on Unix hosts')
+    def test_unix_world_readable_token_is_rejected(self):
+        with TemporaryDirectory() as directory:
+            token = Path(directory) / 'token'
+            token.write_text('private-test-token', encoding='utf-8')
+            token.chmod(0o644)
+            with self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'private permissions'):
+                self.dns._read_token(token)
+
+    def test_incorrect_mutation_confirmation_is_not_reported_as_success(self):
+        self.client.request.side_effect = None
+        self.client.request.return_value = {'result': {'proxied': True}}
+        with self.context([]), self.assertRaisesRegex(self.dns.DevelopmentDNSError, 'did not confirm'):
+            self.dns.sync('.', '192.168.1.2')
+
+    def test_owned_records_repair_proxy_or_ttl_drift(self):
+        for change in ({'proxied': True}, {'ttl': 300}):
+            with self.subTest(change=change), self.context([self.record(**change)]):
+                self.assertEqual(self.dns.sync('.', '192.168.1.2')['action'], 'updated')
+
+
 class MonitorLanTests(SimpleTestCase):
+    def setUp(self):
+        # Native Windows locks must never touch a user's live monitor session.
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        local_data = patch.dict(os.environ, {'LOCALAPPDATA': temporary.name})
+        local_data.start()
+        self.addCleanup(local_data.stop)
+
     def test_terminal_requests_require_session_token_and_fixed_actions(self):
         from .network import monitor_request
         with TemporaryDirectory() as directory, patch('config.network.monitor_change', return_value='LAN off') as change:
@@ -198,6 +583,7 @@ class MonitorLanTests(SimpleTestCase):
             routing = Path(directory) / 'routing'
             for root in roots.values():
                 root.mkdir()
+                (root / '.env').write_text('DEV_DOMAIN=' + root.name + '.app\n')
                 configure(root, 'on', routing)
             with patch('config.network.monitor_projects', return_value=roots), patch('config.network.subprocess.run', return_value=subprocess.CompletedProcess([], 0, '', '')) as command:
                 monitor_change(directory, routing, 'off', 'one')
@@ -311,6 +697,34 @@ class MonitorLanTests(SimpleTestCase):
             self.assertEqual(command.call_count, 4)
             self.assertEqual([call.kwargs['cwd'].name for call in command.call_args_list], ['one', 'two', 'one', 'two'])
 
+    def test_timeout_revokes_all_new_opt_ins_before_any_launcher_cleanup(self):
+        from .network import configure, monitor_change, enabled_hosts
+        with TemporaryDirectory() as directory:
+            roots = {name: Path(directory) / name for name in ('one', 'two')}
+            routing = Path(directory) / 'routing'
+            for root in roots.values():
+                root.mkdir()
+                (root / '.env').write_text('DEV_DOMAIN=' + root.name + '.app\n')
+            calls = []
+            def launcher(command, **options):
+                calls.append(options)
+                self.assertEqual(options['timeout'], 180)
+                if len(calls) <= 2:
+                    configure(options['cwd'], 'on', routing)
+                    if len(calls) == 2:
+                        raise subprocess.TimeoutExpired(command, 180)
+                else:
+                    self.assertEqual(enabled_hosts(routing), set())
+                return subprocess.CompletedProcess(command, 0, '', '')
+            inventories = ['one\ntwo\n'] + (['3'] if os.name == 'nt' else [])
+            with patch('config.network.monitor_projects', return_value=roots), \
+                    patch('config.network.subprocess.check_output', side_effect=inventories), \
+                    patch('config.network.subprocess.run', side_effect=launcher):
+                with self.assertRaisesRegex(ValueError, 'timed out after 180 seconds'):
+                    monitor_change(directory, routing, 'on')
+            self.assertEqual(len(calls), 4)
+            self.assertEqual(enabled_hosts(routing), set())
+
     def test_off_revokes_all_projects_even_when_a_launcher_fails(self):
         from .network import configure, monitor_change, enabled_hosts
         with TemporaryDirectory() as directory:
@@ -318,6 +732,7 @@ class MonitorLanTests(SimpleTestCase):
             routing = Path(directory) / 'routing'
             for root in roots.values():
                 root.mkdir()
+                (root / '.env').write_text('DEV_DOMAIN=' + root.name + '.app\n')
                 configure(root, 'on', routing)
             with patch('config.network.monitor_projects', return_value=roots), patch('config.network.subprocess.check_output', return_value='one\ntwo\n'), patch('config.network.subprocess.run', return_value=subprocess.CompletedProcess([], 1, '', 'failed')):
                 with self.assertRaisesRegex(ValueError, 'failed'):

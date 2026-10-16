@@ -30,8 +30,12 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   `SHARED_PATHS` in `backend/config/project_config.py` for the sync boundary.
 - Every project route on the shared proxy must match that project's explicit
   hostname. Do not add hostless catch-all frontend/API/admin/static/media routes.
-  The sole local web origin is `https://<repository-name>.local`, preserving
-  dots and hyphens. Do not add compact spelling aliases or publish frontend/API
+  The sole development web origin is `https://dev.<project-domain>`. Resolve
+  it with `development_hostname(root)` using root `.env` DEV_DOMAIN, a literal
+  project.py DEV_DOMAIN, or the repository name, preserving dots and hyphens.
+  A non-domain repository name uses `dev.<slug>.localhost` for computer-only
+  development. Domain ownership and Cloudflare are not prerequisites for local
+  development. Do not add compact spelling aliases or publish frontend/API
   host ports. Keep simulator bridges and Metro ports limited to their tooling.
   LAN is controlled per project: preserve separate loopback and LAN
   entrypoints, bounded local relay sources, and immediate revocation on off.
@@ -99,8 +103,10 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 
 ## Local network access
 
-- Local web names end in `.local` and preserve the project folder name. The same
+- Configured owned domains use `dev.<project-domain>` and publicly trusted TLS. The same
   HTTPS address is used with LAN off (computer only) and LAN on (trusted subnet).
+  Keep the computer hosts override at loopback and publish DNS-only A records
+  to the selected LAN IPv4. Do not expose production traffic through development.
 - `dev.sh lan on|off|status` and `dev.ps1 lan on|off|status` control only this
   project's ingress. LAN defaults on for running projects on trusted networks;
   remember explicit global/per-project off choices. Tunnel state is independent. Revoking access
@@ -112,7 +118,7 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   LAN toggle may start a Public-network session using --allow-public: retain
   the Public profile, bind only the selected interface/address, scope firewall
   rules to that interface's exact subnet and the Python listener, and expose
-  only project HTTPS plus mDNS. Never change the Windows network category or
+  only project HTTPS. Never change the Windows network category or
   enable Public sharing from remembered/startup preferences. Pin the session
   to interface, profile, prefix and gateway; revoke on network change.
   Controls are handled inside the terminal: Tab/arrows select, Space/Enter toggle,
@@ -128,10 +134,30 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   launcher output in files so inherited background handles cannot hang completion.
   On Unix, foreground password prompts must occur
   outside raw input mode; background workers must never read terminal passwords.
-- Phones need multicast DNS support on their Wi-Fi and must trust the public
-  local CA. `dev.ps1 lan certificate` exports only rootCA.pem to Downloads as
-  ProjectLocalCA.crt. Never export rootCA-key.pem. Wi-Fi client isolation can
-  prevent LAN connectivity; do not bypass it or disable firewall protections.
+- Ordinary development defaults to local TLS and works without an owned domain
+  or DNS credentials. Reuse the existing computer-only mkcert/Traefik setup.
+  `dev.sh lan setup` / `dev.ps1 lan setup` enrolls a private host DNS credential
+  once and marks the selected project public only after its zone is validated.
+  `DEV_TLS_MODE=public` uses public DNS and ACME DNS-01. Local mode never claims
+  profile-free phone access. Never require phone profiles, mDNS, certificate
+  warning bypasses, or silently substitute a local certificate in public mode.
+  Keep the Cloudflare DNS credential outside Git in the private host credential
+  file. Scope Zone Read and DNS Edit to authorized domains; new domains require
+  matching authorization. Only update exact owned dev A records, never production
+  records, foreign records, wildcard records, or unimplemented IPv6 records.
+  Keep ACME state in a durable private volume with one shared Traefik writer.
+  Every public TLS router must explicitly use the dev certificate resolver. Verify the
+  public certificate chain and hostname before reporting public HTTPS/LAN ready.
+  Windows startup verifies the owned helper readiness marker and bound HTTPS
+  socket before reusing its PID. Turning LAN off revokes routes/connections
+  immediately without waiting for DNS TTLs. Remove obsolete mDNS and profile
+  bootstrap firewall rules during migration. Do not disable Wi-Fi client
+  isolation or router DNS rebinding protection; report such network limitations.
+  Use host-only, distinct development session/CSRF cookies so production cookies
+  on a parent domain cannot be mistaken for development authentication.
+  On a new computer, repeat host credential enrollment; keep tokens out of Git,
+  preserve the same development URLs, and revoke retired computer tokens.
+  Local-only projects must stay runnable without internet or a Cloudflare token.
 
 ## Backup and recovery
 

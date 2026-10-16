@@ -35,6 +35,7 @@ SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
 DEBUG = env_bool("DJANGO_DEBUG", False)
 
 DOMAIN = os.getenv("DOMAIN")
+DEV_HOST = os.getenv("DEV_HOST", "").strip()
 if not DOMAIN and not DEBUG:
     raise Exception("DOMAIN environment variable is required in production")
 
@@ -50,17 +51,13 @@ else:
     if railway_host and railway_host not in ALLOWED_HOSTS:
         ALLOWED_HOSTS.append(railway_host)
     # Any extra hosts (comma-separated) for other platforms
-    # Compose exposes only the repository-derived canonical local hostname.
-    for option in ("PROJECT_HOST",):
-        local_name = os.getenv(option, "").strip()
-        if local_name:
-            local_host = f"{local_name}.local"
-            if local_host not in ALLOWED_HOSTS:
-                ALLOWED_HOSTS.append(local_host)
-
     extra = os.getenv("EXTRA_ALLOWED_HOSTS", "")
     if extra:
         ALLOWED_HOSTS.extend([h.strip() for h in extra.split(",") if h.strip()])
+
+if DEV_HOST and DEV_HOST not in ALLOWED_HOSTS:
+    # The launcher computes this exact hostname independently of resource names.
+    ALLOWED_HOSTS.append(DEV_HOST)
 
 
 # Applications
@@ -320,11 +317,8 @@ CSRF_TRUSTED_ORIGINS.extend(
     origin.strip() for origin in os.getenv('EXTRA_CSRF_ORIGINS', '').split(',')
     if origin.strip() and origin.strip() not in CSRF_TRUSTED_ORIGINS
 )
-if DEBUG and os.getenv('PROJECT_HOST'):
-    CSRF_TRUSTED_ORIGINS.extend([
-        f"http://{os.environ['PROJECT_HOST']}.local",
-        f"https://{os.environ['PROJECT_HOST']}.local",
-    ])
+if DEV_HOST:
+    CSRF_TRUSTED_ORIGINS.append(f'https://{DEV_HOST}')
 
 CORS_EXPOSE_HEADERS = ['Content-Type', 'X-CSRFToken']
 CORS_ALLOW_HEADERS = [
@@ -415,6 +409,23 @@ else:
         else:
             globals()[_name] = _value
     MIDDLEWARE = list(dict.fromkeys(MIDDLEWARE + list(getattr(_project, 'EXTRA_MIDDLEWARE', []))))
+
+
+# Development uses a real subdomain, so production's parent-domain cookies can
+# arrive here too. Separate names and host-only secure cookies isolate both
+# sessions even when this checkout runs its production server for a tunnel.
+# DEV_HOST is injected by the launcher, never inferred from an HTTP request.
+if DEV_HOST:
+    SESSION_COOKIE_NAME = '__Host-dev-sessionid'
+    CSRF_COOKIE_NAME = '__Host-dev-csrftoken'
+    SESSION_COOKIE_DOMAIN = None
+    CSRF_COOKIE_DOMAIN = None
+    SESSION_COOKIE_PATH = '/'
+    CSRF_COOKIE_PATH = '/'
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SESSION_COOKIE_SAMESITE = 'Lax'
+    CSRF_COOKIE_SAMESITE = 'Lax'
 
 
 # Dev server autoreloader exclusions
