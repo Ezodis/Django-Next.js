@@ -38,11 +38,17 @@ param(
 $ErrorActionPreference = 'Stop'
 
 function Start-ProjectLanListener {
-    # Called through `lan on`; default-on and manual controls share this trust gate.
+    param([switch]$AllowPublic)
+    # Explicit Public sessions expose only project HTTPS on the selected subnet.
     $profile = Get-NetConnectionProfile | Where-Object {
         $_.IPv4Connectivity -ne 'Disconnected' -and $_.NetworkCategory -in @('Private', 'DomainAuthenticated')
     } | Select-Object -First 1
-    if (-not $profile) { throw 'LAN access requires a trusted Private or Domain network. It was not enabled.' }
+    if (-not $profile -and $AllowPublic) {
+        $profile = Get-NetConnectionProfile | Where-Object {
+            $_.IPv4Connectivity -ne 'Disconnected' -and $_.NetworkCategory -eq 'Public'
+        } | Select-Object -First 1
+    }
+    if (-not $profile) { throw 'No eligible LAN interface is available. Public networks require an explicit LAN toggle.' }
     $address = Get-NetIPAddress -InterfaceIndex $profile.InterfaceIndex -AddressFamily IPv4 | Where-Object {
         $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -notlike '127.*'
     } | Select-Object -First 1
@@ -54,11 +60,14 @@ function Start-ProjectLanListener {
     $alias = $profile.InterfaceAlias.Replace("'", "''")
     $program = $pythonPath.Replace("'", "''")
     $rule = "Devtools-LAN-$($profile.InterfaceIndex)"
+    $lanSubnet = (& $pythonPath -c "import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False))" "$lanAddress/$($address.PrefixLength)").Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $lanSubnet) { throw 'Could not determine the LAN subnet.' }
+    $firewallProfiles = if ($profile.NetworkCategory -eq 'Public') { 'Public' } else { 'Private,Domain' }
     $rules = @"
 `$ErrorActionPreference = 'Stop'
 Get-NetFirewallRule -Name '$rule-HTTPS', '$rule-mDNS' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-New-NetFirewallRule -Name '$rule-HTTPS' -DisplayName 'Project LAN HTTPS' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 443 -LocalAddress '$lanAddress' -RemoteAddress LocalSubnet -Profile Private,Domain -InterfaceAlias '$alias' -Program '$program' | Out-Null
-New-NetFirewallRule -Name '$rule-mDNS' -DisplayName 'Project LAN discovery' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 5353 -RemoteAddress LocalSubnet -Profile Private,Domain -InterfaceAlias '$alias' -Program '$program' | Out-Null
+New-NetFirewallRule -Name '$rule-HTTPS' -DisplayName 'Project LAN HTTPS' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 443 -LocalAddress '$lanAddress' -RemoteAddress '$lanSubnet' -Profile $firewallProfiles -InterfaceAlias '$alias' -Program '$program' | Out-Null
+New-NetFirewallRule -Name '$rule-mDNS' -DisplayName 'Project LAN discovery' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 5353 -RemoteAddress '$lanSubnet' -Profile $firewallProfiles -InterfaceAlias '$alias' -Program '$program' | Out-Null
 "@
     $upstream = ((wsl.exe -d Ubuntu --cd / -- hostname -I) -split '\s+')[0]
     if (-not $upstream) { throw 'WSL is unavailable; LAN access was not enabled.' }
@@ -66,13 +75,14 @@ New-NetFirewallRule -Name '$rule-mDNS' -DisplayName 'Project LAN discovery' -Dir
     $stateRoot = Join-Path $env:LOCALAPPDATA 'ProjectDevelopment'
     New-Item -ItemType Directory -Path $stateRoot -Force | Out-Null
     $pidFile = Join-Path $stateRoot 'lan-listener.json'
-    $networkId = "$($profile.InterfaceIndex)|$($profile.Name)|$lanAddress"
+    $gateway = Get-NetRoute -InterfaceIndex $profile.InterfaceIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Select-Object -First 1 -ExpandProperty NextHop
+    $networkId = "$($profile.InterfaceIndex)|$($profile.Name)|$($profile.NetworkCategory)|$lanAddress|$($address.PrefixLength)|$gateway"
     $running = $null
     if (Test-Path -LiteralPath $pidFile) {
         $old = Get-Content -LiteralPath $pidFile -Raw | ConvertFrom-Json
         $running = Get-CimInstance Win32_Process -Filter "ProcessId=$($old.pid)" -ErrorAction SilentlyContinue
         if ($running -and $running.CommandLine -like '*config*network.py*serve*') {
-            if ($old.address -eq $lanAddress -and $old.upstream -eq $upstream -and $old.network -eq $networkId) { return }
+            if ($old.address -eq $lanAddress -and $old.upstream -eq $upstream -and $old.network -eq $networkId -and [bool]$old.allowPublic -eq [bool]$AllowPublic) { return }
             Stop-Process -Id $old.pid -ErrorAction SilentlyContinue
         }
     }
@@ -93,11 +103,13 @@ New-NetFirewallRule -Name '$rule-mDNS' -DisplayName 'Project LAN discovery' -Dir
     $helper = Join-Path $ROOT_DIR 'backend\config\network.py'
     $stdout = Join-Path $stateRoot 'lan.log'
     $stderr = Join-Path $stateRoot 'lan-error.log'
-    $listener = Start-Process -FilePath $pythonPath -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr -ArgumentList @(
+    $listenerArgs = @(
         "`"$helper`"", 'serve', '--directory', "`"$stateDirectory`"", '--address', $lanAddress,
         '--network', "$lanAddress/$($address.PrefixLength)", '--upstream', $upstream
     )
-    @{pid=$listener.Id; address=$lanAddress; upstream=$upstream; network=$networkId} | ConvertTo-Json | Set-Content -LiteralPath $pidFile
+    if ($AllowPublic) { $listenerArgs += '--allow-public' }
+    $listener = Start-Process -FilePath $pythonPath -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr -ArgumentList $listenerArgs
+    @{pid=$listener.Id; address=$lanAddress; upstream=$upstream; network=$networkId; allowPublic=[bool]$AllowPublic} | ConvertTo-Json | Set-Content -LiteralPath $pidFile
     Start-Sleep -Milliseconds 700
     if ($listener.HasExited) { throw "LAN listener could not start. See $stderr" }
     Write-Host "LAN enabled on $($profile.InterfaceAlias): $lanAddress. Trust the public local CA certificate on your phone." -ForegroundColor Green
@@ -110,6 +122,27 @@ if ($DevArgs.Count -gt 0 -and ($DevArgs[0] -eq 'watchos' -or
 $ROOT_DIR = $PSScriptRoot
 if (-not $ROOT_DIR -or $ROOT_DIR -eq '') {
     $ROOT_DIR = Split-Path -Parent (Resolve-Path $MyInvocation.MyCommand.Path)
+}
+
+# Switching ingress reuses the running workspace. It must not restart the
+# source copier, certificate setup or dependency bootstrap inside a monitor action.
+if ($DevArgs.Count -gt 1 -and $DevArgs[0] -eq 'lan' -and $DevArgs[1] -eq 'on') {
+    $leaf = ((Get-Item -LiteralPath $ROOT_DIR).Name -replace '[^a-zA-Z0-9._-]', '-').ToLowerInvariant()
+    $runtimeRoot = "/root/.codex-workspaces/$leaf"
+    $runtimeWindows = '\\wsl.localhost\Ubuntu' + $runtimeRoot.Replace('/', '\')
+    if (-not (Test-Path -LiteralPath (Join-Path $runtimeWindows 'dev.sh'))) {
+        throw 'Start this project first, then enable LAN access.'
+    }
+    wsl.exe -d Ubuntu --cd / -- env 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin' bash "$runtimeRoot/dev.sh" lan on
+    if ($LASTEXITCODE -ne 0) { throw 'Could not prepare this project for LAN access.' }
+    try {
+        Start-ProjectLanListener -AllowPublic:($DevArgs -contains '--allow-public')
+    } catch {
+        $nativePython = Get-Command python.exe -ErrorAction Stop
+        & $nativePython.Source (Join-Path $ROOT_DIR 'backend\config\network.py') off --root $ROOT_DIR --directory '\\wsl.localhost\Ubuntu\tmp\traefik-dynamic'
+        throw
+    }
+    exit 0
 }
 
 if ($DevArgs.Count -gt 0 -and $DevArgs[0] -eq 'lan' -and ($DevArgs.Count -eq 1 -or $DevArgs[1] -ne 'on')) {
@@ -125,7 +158,21 @@ if ($DevArgs.Count -gt 0 -and $DevArgs[0] -eq 'lan' -and ($DevArgs.Count -eq 1 -
         exit 0
     }
     & $nativePython.Source (Join-Path $ROOT_DIR 'backend\config\network.py') $action --root $ROOT_DIR --directory '\\wsl.localhost\Ubuntu\tmp\traefik-dynamic'
-    exit $LASTEXITCODE
+    $lanResult = $LASTEXITCODE
+    if ($lanResult -eq 0 -and $action -eq 'off' -and -not (Get-ChildItem -LiteralPath '\\wsl.localhost\Ubuntu\tmp\traefik-dynamic' -Filter '*-lan.state')) {
+        # Finish the last sharing session synchronously, so a quick off/on cannot
+        # reuse a relay which has already decided to exit.
+        $listenerState = Join-Path $env:LOCALAPPDATA 'ProjectDevelopment\lan-listener.json'
+        if (Test-Path -LiteralPath $listenerState) {
+            $last = Get-Content -LiteralPath $listenerState -Raw | ConvertFrom-Json
+            $owned = Get-CimInstance Win32_Process -Filter "ProcessId=$($last.pid)" -ErrorAction SilentlyContinue
+            if ($owned -and $owned.CommandLine -like '*config*network.py*serve*') {
+                Stop-Process -Id $last.pid -ErrorAction SilentlyContinue
+            }
+            Remove-Item -LiteralPath $listenerState -ErrorAction SilentlyContinue
+        }
+    }
+    exit $lanResult
 }
 
 function _step { param($m) Write-Host "  >> $m" -ForegroundColor Cyan   }
@@ -823,7 +870,21 @@ $caRoot = (wsl.exe -d Ubuntu --cd / -- mkcert -CAROOT 2>$null).Trim()
 if ($caRoot -and $caRoot.StartsWith('/')) {
     $publicCA = '\\wsl.localhost\Ubuntu' + $caRoot.Replace('/', '\') + '\rootCA.pem'
     if (Test-Path -LiteralPath $publicCA) {
-        Import-Certificate -FilePath $publicCA -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+        # Use the certificate API directly: Windows PowerShell launched from a
+        # newer shell can lack the Cert: provider even when the store exists.
+        $pem = [IO.File]::ReadAllText($publicCA)
+        $certificateBytes = [Convert]::FromBase64String(($pem -replace '-----BEGIN CERTIFICATE-----|-----END CERTIFICATE-----|\s', ''))
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certificateBytes)
+        $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
+        try {
+            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            if (-not ($store.Certificates | Where-Object { $_.Thumbprint -eq $certificate.Thumbprint })) {
+                $store.Add($certificate)
+            }
+        } finally {
+            $store.Close()
+            $certificate.Dispose()
+        }
     }
 }
 
@@ -982,7 +1043,7 @@ wsl.exe -d Ubuntu --cd / -- rm -f $tmpScript 2>$null | Out-Null
 
 
 if ($devShExitCode -eq 0 -and $DevArgs.Count -gt 1 -and $DevArgs[0] -eq 'lan' -and $DevArgs[1] -eq 'on') {
-    try { Start-ProjectLanListener }
+    try { Start-ProjectLanListener -AllowPublic:($DevArgs -contains '--allow-public') }
     catch {
         # Fail closed when discovery, firewall consent or listener setup fails.
         wsl.exe -d Ubuntu --cd / -- python3 "$wslWorkspace/backend/config/network.py" off --root $wslWorkspace

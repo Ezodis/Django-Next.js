@@ -242,12 +242,23 @@ class MonitorLanTests(SimpleTestCase):
                 monitor_projects(root / 'One.app')
 
     @unittest.skipUnless(os.name == 'nt', 'Windows network category guard')
-    def test_public_network_is_rejected_before_any_project_command(self):
+    def test_automatic_public_network_sharing_is_rejected_before_any_project_command(self):
         from .network import monitor_change
         with TemporaryDirectory() as directory, patch('config.network.monitor_projects', return_value={'app': Path(directory)}), patch('config.network.subprocess.check_output', side_effect=['app\n', '']), patch('config.network.subprocess.run') as command:
             with self.assertRaisesRegex(ValueError, 'Public'):
-                monitor_change(directory, directory, 'on')
+                monitor_change(directory, directory, 'on', remember=False)
             command.assert_not_called()
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows explicit Public session')
+    def test_explicit_public_toggle_requests_only_a_scoped_session(self):
+        import base64
+        from .network import monitor_change
+        with TemporaryDirectory() as directory, patch('config.network.monitor_projects', return_value={'app': Path(directory)}), patch('config.network.subprocess.check_output', side_effect=['app\n', '']), patch('config.network.subprocess.run', return_value=subprocess.CompletedProcess([], 0, '', '')) as command:
+            message = monitor_change(directory, directory, 'on', 'app')
+            invocation = base64.b64decode(command.call_args.args[0][-1]).decode('utf-16-le')
+            self.assertIn('lan on --allow-public;', invocation)
+            self.assertNotIn('Set-NetConnectionProfile', invocation)
+            self.assertIn('current network only', message)
 
     def test_failed_enable_rolls_back_new_opt_ins_and_never_runs_other_workspaces(self):
         from .network import monitor_change

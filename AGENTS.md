@@ -108,7 +108,13 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - The monitor's Infrastructure LAN button controls running checkouts in its workspace;
   each project's LAN button controls only that project. Red/green reflects actual
   sharing, not the saved preference. Startup defaults never bypass network trust
-  checks or repeatedly request elevation after a failure.
+  checks or repeatedly request elevation after a failure. An explicit Windows
+  LAN toggle may start a Public-network session using --allow-public: retain
+  the Public profile, bind only the selected interface/address, scope firewall
+  rules to that interface's exact subnet and the Python listener, and expose
+  only project HTTPS plus mDNS. Never change the Windows network category or
+  enable Public sharing from remembered/startup preferences. Pin the session
+  to interface, profile, prefix and gateway; revoke on network change.
   Controls are handled inside the terminal: Tab/arrows select, Space/Enter toggle,
   Ctrl+C exits, and VT mouse clicks activate the displayed hit regions. The
   Infrastructure button is the master control; do not bind letter keys L or Q. Keep
@@ -117,7 +123,10 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   The native host controller uses authenticated file IPC in the private monitor
   directory; never emit LAN browser links or accept arbitrary commands/paths.
   Serialize changes across monitors, fail closed on enable errors, and retain
-  Windows trust/firewall checks. On Unix, foreground password prompts must occur
+  Windows trust/firewall checks. Windows LAN commands reuse the already-running
+  WSL workspace; never bootstrap or spawn source copiers for a toggle. Capture
+  launcher output in files so inherited background handles cannot hang completion.
+  On Unix, foreground password prompts must occur
   outside raw input mode; background workers must never read terminal passwords.
 - Phones need multicast DNS support on their Wi-Fi and must trust the public
   local CA. `dev.ps1 lan certificate` exports only rootCA.pem to Downloads as

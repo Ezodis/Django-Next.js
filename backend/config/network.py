@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import textwrap
+import tempfile
 import time
 
 
@@ -142,17 +143,19 @@ def enabled_hosts(directory):
     return result
 
 
-def network_signature(address):
+def network_signature(address, allow_public=False):
     """Windows Wi-Fi/profile changes revoke the current sharing session."""
     if os.name != 'nt':
         return None
+    # A manual Public session remains pinned to this exact interface/network.
+    guard = '' if allow_public else "if($p.NetworkCategory -eq 'Public'){throw 'Untrusted network'}; "
     # address has already been validated as an IPv4 literal, never shell input.
     command = (f"$a=Get-NetIPAddress -IPAddress '{address}' -AddressFamily IPv4 -ErrorAction Stop; "
                "$p=Get-NetConnectionProfile -InterfaceIndex $a.InterfaceIndex -ErrorAction Stop; "
-               "if($p.NetworkCategory -eq 'Public'){throw 'Untrusted network'}; "
+               + guard +
                "$g=Get-NetRoute -InterfaceIndex $a.InterfaceIndex -DestinationPrefix '0.0.0.0/0' "
                "-ErrorAction Stop | Select-Object -First 1 -ExpandProperty NextHop; "
-               "@{name=$p.Name;index=$a.InterfaceIndex;category=[string]$p.NetworkCategory;gateway=$g} | ConvertTo-Json -Compress")
+               "@{name=$p.Name;index=$a.InterfaceIndex;category=[string]$p.NetworkCategory;prefix=$a.PrefixLength;gateway=$g} | ConvertTo-Json -Compress")
     value = subprocess.check_output(['powershell.exe', '-NoProfile', '-Command', command],
                                     timeout=8, stderr=subprocess.DEVNULL,
                                     creationflags=subprocess.CREATE_NO_WINDOW, text=True)
@@ -306,11 +309,11 @@ class Forward(socketserver.BaseRequestHandler):
             return
 
 
-def serve(directory, address, upstream, port=443, network=None):
+def serve(directory, address, upstream, port=443, network=None, allow_public=False):
     ip = ipaddress.ip_address(address)
     if ip.version != 4 or not ip.is_private or ip.is_loopback or ip.is_link_local:
         raise ValueError('Select an IPv4 address on the trusted local network')
-    signature = network_signature(address)
+    signature = network_signature(address, allow_public)
     checked = time.monotonic()
     with Relay((address, port), Forward) as relay:
         relay.network = ipaddress.ip_network(network, strict=False) if network else local_subnet(address)
@@ -330,7 +333,7 @@ def serve(directory, address, upstream, port=443, network=None):
             while enabled_hosts(directory):
                 if time.monotonic() - checked >= 10:
                     try:
-                        if network_signature(address) != signature:
+                        if network_signature(address, allow_public) != signature:
                             revoke_all(directory)
                             break
                     except (OSError, ValueError, subprocess.SubprocessError):
@@ -462,32 +465,43 @@ def monitor_change(root, directory, action, project=None, remember=True):
         if action == 'off':
             return 'LAN is already off for this workspace.'
         raise ValueError('No running projects were found in this workspace')
+    public_session = False
     if action == 'on' and native:
-        # Refuse before preparing any routes or displaying elevation prompts.
+        # Startup remains private-only. An explicit toggle grants only this
+        # network's bounded project ingress, without reclassifying Windows.
         trusted = subprocess.check_output([
             'powershell.exe', '-NoProfile', '-Command',
             "Get-NetConnectionProfile | Where-Object {$_.IPv4Connectivity -ne 'Disconnected' -and "
             "$_.NetworkCategory -in @('Private','DomainAuthenticated')} | Select-Object -ExpandProperty InterfaceIndex"
         ], text=True, timeout=15, **options).strip()
         if not trusted:
-            raise ValueError('LAN blocked: this Windows network is Public. If you trust it, set its network profile to Private in Windows Settings, then try again.')
+            if not remember:
+                raise ValueError('Automatic LAN sharing stays off on Public networks. Use the LAN button to enable a session on this network.')
+            public_session = True
 
     def apply(namespace, desired):
         checkout = projects[namespace]
         if native:
             script = str(checkout / 'dev.ps1').replace("'", "''")
-            source = f"& '{script}' lan {desired}; exit $LASTEXITCODE"
+            flag = ' --allow-public' if public_session and desired == 'on' else ''
+            source = f"$ProgressPreference='SilentlyContinue'; & '{script}' lan {desired}{flag}; exit $LASTEXITCODE"
             encoded = base64.b64encode(source.encode('utf-16-le')).decode('ascii')
-            command = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded]
+            command = ['powershell.exe', '-NoProfile', '-OutputFormat', 'Text', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded]
         else:
             command = ['bash', str(checkout / 'dev.sh'), 'lan', desired]
         child_options = dict(options)
         if not native:
             child_options['env'] = {**os.environ, 'DEV_LAN_CONTROLLED': '1'}
-        result = subprocess.run(command, cwd=checkout, capture_output=True, text=True,
-                                encoding='utf-8', errors='replace', **child_options)
-        if result.returncode:
-            raise ValueError((result.stderr or result.stdout or 'LAN update failed')[-2500:])
+        # A detached Windows/WSL worker can inherit pipe handles. Waiting for
+        # capture_output EOF would then hang after the launcher itself exited.
+        with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+            result = subprocess.run(command, cwd=checkout, stdout=output, stderr=errors, **child_options)
+            if result.returncode:
+                errors.seek(0)
+                output.seek(0)
+                detail = (errors.read() or output.read()).decode('utf-8', errors='replace')
+                detail = detail or getattr(result, 'stderr', None) or getattr(result, 'stdout', None) or 'LAN update failed'
+                raise ValueError(detail[-2500:])
 
     if action == 'off':
         # Close every selected project's existing connection before launcher cleanup.
@@ -508,7 +522,8 @@ def monitor_change(root, directory, action, project=None, remember=True):
                 configure(projects[namespace], 'off', directory)
         raise
     names = ', '.join(projects[namespace].name for namespace in selected)
-    return f'LAN {action}: {names}. Your project URLs stay the same.'
+    scope = ' (current network only)' if public_session else ''
+    return f'LAN {action}{scope}: {names}. Your project URLs stay the same.'
 
 
 def monitor_request(root, directory, token, request):
@@ -796,6 +811,7 @@ if __name__ == '__main__':
     parser.add_argument('--address')
     parser.add_argument('--upstream', default='127.0.0.1')
     parser.add_argument('--network')
+    parser.add_argument('--allow-public', action='store_true')
     parser.add_argument('--relay-source', action='append', default=[])
     parser.add_argument('--discover', action='store_true')
     parser.add_argument('--control-state')
@@ -821,7 +837,7 @@ if __name__ == '__main__':
     elif args.action == 'monitor-terminal':
         monitor_terminal(args.frame, args.control_state)
     elif args.action == 'serve':
-        serve(args.directory, args.address, args.upstream, network=args.network)
+        serve(args.directory, args.address, args.upstream, network=args.network, allow_public=args.allow_public)
     else:
         relays = ['127.0.0.1/32', '::1/128'] + args.relay_source
         for source in relays:
