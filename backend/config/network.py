@@ -6,7 +6,6 @@ separate loopback listeners. Only the public CA certificate is exported for phon
 import argparse
 import base64
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import secrets
 import ipaddress
 import json
@@ -14,6 +13,9 @@ import os
 from pathlib import Path
 import re
 import select
+import shutil
+import signal
+import unicodedata
 import socket
 import socketserver
 import struct
@@ -408,8 +410,17 @@ def running_projects():
     return set(subprocess.check_output(command, text=True, timeout=15, **options).split())
 
 
+def background_lan_ready():
+    if os.name == 'nt' or os.geteuid() == 0:
+        return True
+    result = subprocess.run(['sudo', '-n', '-v'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    return result.returncode == 0
+
+
 def monitor_defaults(root, directory, attempted):
     """Try new running projects once per monitor; never undo a deliberate off."""
+    if not background_lan_ready():
+        return
     projects = monitor_projects(root)
     for namespace in sorted(running_projects() & (projects.keys() - attempted)):
         try:
@@ -469,8 +480,11 @@ def monitor_change(root, directory, action, project=None, remember=True):
             command = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded]
         else:
             command = ['bash', str(checkout / 'dev.sh'), 'lan', desired]
+        child_options = dict(options)
+        if not native:
+            child_options['env'] = {**os.environ, 'DEV_LAN_CONTROLLED': '1'}
         result = subprocess.run(command, cwd=checkout, capture_output=True, text=True,
-                                encoding='utf-8', errors='replace', **options)
+                                encoding='utf-8', errors='replace', **child_options)
         if result.returncode:
             raise ValueError((result.stderr or result.stdout or 'LAN update failed')[-2500:])
 
@@ -496,100 +510,287 @@ def monitor_change(root, directory, action, project=None, remember=True):
     return f'LAN {action}: {names}. Your project URLs stay the same.'
 
 
-def monitor_server(root, directory):
-    """A monitor-only loopback control, authenticated independently of app sessions."""
+def monitor_request(root, directory, token, request):
+    """Accept a small authenticated action, never a shell command or checkout path."""
+    if not isinstance(request, dict):
+        raise ValueError('Invalid LAN request')
+    supplied = request.get('token')
+    if not isinstance(supplied, str) or not supplied.isascii() or not secrets.compare_digest(supplied, token):
+        raise ValueError('The monitor session has expired. Reopen the monitor.')
+    action, project = request.get('action'), request.get('project')
+    if action not in ('on', 'off'):
+        raise ValueError('Invalid LAN action')
+    if project is not None and (not isinstance(project, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}', project)):
+        raise ValueError('Invalid project')
+    with monitor_update_lock(directory):
+        return monitor_change(root, directory, action, project)
+
+
+def monitor_controller(root, directory, state):
+    """Private file IPC works through the Windows/WSL bridge and on native Unix."""
+    state = Path(state)
     token = secrets.token_urlsafe(32)
-    nonce = secrets.token_urlsafe(24)
-    lock = threading.Lock()
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass  # Never log control tokens or app output.
-
-        def valid_host(self):
-            return self.headers.get('Host') == f'127.0.0.1:{self.server.server_port}'
-
-        def respond(self, status, body, kind='application/json'):
-            data = body.encode('utf-8')
-            self.send_response(status)
-            self.send_header('Content-Type', kind + '; charset=utf-8')
-            self.send_header('Content-Length', str(len(data)))
-            self.send_header('Cache-Control', 'no-store')
-            self.send_header('Referrer-Policy', 'no-referrer')
-            self.send_header('X-Content-Type-Options', 'nosniff')
-            self.send_header('Content-Security-Policy',
-                             "default-src 'none'; script-src 'nonce-" + nonce + "'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
-            self.end_headers()
-            self.wfile.write(data)
-
-        def do_GET(self):
-            if not self.valid_host():
-                self.respond(403, '{}')
-                return
-            if self.path != '/':
-                self.respond(404, '{}')
-                return
-            # GET/prefetch never changes state. Only a real document executes the
-            # authenticated same-origin POST; the secret stays in the URL fragment.
-            self.respond(200, """<!doctype html><html lang="en"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Local network</title>
-<style>:root{color-scheme:dark}body{font:17px/1.6 system-ui;max-width:640px;margin:12vh auto;padding:24px;background:#15151b;color:#eee}h1{font-size:28px}p{white-space:pre-wrap;color:#bbb}</style>
-<h1>Local network</h1><p id="result">Updating LAN access…</p>
-<script nonce=""" + '"' + nonce + '"' + """>
-const parameters = new URLSearchParams(location.hash.slice(1));
-history.replaceState(null, '', '/');
-(async () => {
-  try {
-    const response = await fetch('/toggle', {method:'POST', headers:{'Content-Type':'application/json',
-      'Authorization':'Bearer ' + parameters.get('token')}, body:JSON.stringify({action:parameters.get('action'), project:parameters.get('project')})});
-    const result = await response.json();
-    document.getElementById('result').textContent = result.message || 'Use the LAN control in your terminal to try again.';
-  } catch (_) {document.getElementById('result').textContent = 'The monitor has closed. Reopen it and try again.';}
-})();
-</script></html>""", 'text/html')
-
-        def do_POST(self):
-            origin = f'http://127.0.0.1:{self.server.server_port}'
-            if (not self.valid_host() or self.headers.get('Origin') != origin
-                    or not secrets.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + token)):
-                self.respond(403, json.dumps({'message': 'Use the LAN control in your terminal.'}))
-                return
-            if self.path != '/toggle' or self.headers.get('Content-Type') != 'application/json':
-                self.respond(400, '{}')
-                return
+    preferences = lan_preferences(directory)
+    atomic_json(state, {'token': token, 'projects': sorted(monitor_projects(root)),
+                        'platform': sys.platform,
+                        'defaults': preferences['default'] or any(preferences['projects'].values())})
+    stop = threading.Event()
+    def heartbeat():
+        while not stop.is_set():
             try:
-                length = int(self.headers.get('Content-Length', '0'))
-                if not 0 < length <= 256:
+                atomic_json(state.parent / 'heartbeat.json', {'time': time.time()})
+            except OSError:
+                pass
+            stop.wait(1)
+    def defaults():
+        attempted = set()
+        while not stop.is_set():
+            try:
+                monitor_defaults(root, directory, attempted)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+            stop.wait(10)
+    threading.Thread(target=heartbeat, daemon=True).start()
+    threading.Thread(target=defaults, daemon=True).start()
+    try:
+        while True:
+            request_path = state.parent / 'request.json'
+            if not request_path.exists():
+                time.sleep(0.1)
+                continue
+            request = {}
+            try:
+                if request_path.stat().st_size > 4096:
                     raise ValueError('Invalid request size')
-                self.connection.settimeout(5)
-                request = json.loads(self.rfile.read(length))
-                action = request.get('action')
-                project = request.get('project')
-                if project is not None and (not isinstance(project, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}', project)):
-                    raise ValueError('Invalid project')
-                if action not in ('on', 'off'):
-                    raise ValueError('Invalid LAN action')
-            except (ValueError, OSError, AttributeError):
-                self.respond(400, '{}')
-                return
-            if not lock.acquire(blocking=False):
-                self.respond(409, json.dumps({'message': 'A LAN update is already running. Wait for it to finish.'}))
-                return
-            try:
-                with monitor_update_lock(directory):
-                    message = monitor_change(root, directory, action, project)
-                self.respond(200, json.dumps({'message': message}))
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
-                self.respond(400, json.dumps({'message': str(error)}))
-            finally:
-                lock.release()
+                request = json.loads(request_path.read_text(encoding='utf-8'))
+                remove_lan_file(request_path)
+                if not isinstance(request, dict) or not re.fullmatch(r'[0-9a-f]{32}', request.get('id', '')):
+                    raise ValueError('Invalid request identity')
+                message = monitor_request(root, directory, token, request)
+                result = {'ok': True, 'message': message}
+            except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+                remove_lan_file(request_path)
+                result = {'ok': False, 'message': str(error)}
+            result['id'] = request.get('id') if isinstance(request, dict) else None
+            atomic_json(state.parent / 'response.json', result)
+    finally:
+        stop.set()
 
-    return ThreadingHTTPServer(('127.0.0.1', 0), Handler), token
+
+def monitor_label(root, directory, state, project=None):
+    metadata = json.loads(Path(state).read_text(encoding='utf-8'))
+    projects = set(metadata['projects'])
+    if project and project not in projects:
+        return None
+    selected = {project} if project else running_projects() & projects
+    enabled = {path.name[:-len('-lan.state')] for path in Path(directory).glob('*-lan.state')}
+    return {'project': project, 'action': 'off' if selected and selected <= enabled else 'on'}
+
+
+ANSI = re.compile(r'\x1b\][^\x1b\x07]*(?:\x1b\\|\x07)|\x1b\[[0-?]*[ -/]*[@-~]')
+LAN_LABEL = re.compile(r'\[LAN (?:ON|OFF)\]')
+
+
+def terminal_columns(text):
+    return sum(0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1 for char in text)
+
+
+def frame_controls(text, controls):
+    """Calculate hit regions from the rendered frame, including invisible ANSI/links."""
+    result, index = [], 0
+    for row, line in enumerate(text.splitlines()):
+        plain = ANSI.sub('', line)
+        for match in LAN_LABEL.finditer(plain):
+            if index >= len(controls):
+                break
+            result.append({**controls[index], 'row': row, 'column': terminal_columns(plain[:match.start()]),
+                           'width': terminal_columns(match.group())})
+            index += 1
+    return result
+
+
+def terminal_event(buffer):
+    """Incremental VT input parser; releases, unknown escapes and pasted text do not toggle."""
+    if not buffer:
+        return None, buffer
+    if buffer.startswith('\x1b[200~'):
+        end = buffer.find('\x1b[201~')
+        return (None, buffer) if end < 0 else (('ignore',), buffer[end + 6:])
+    mouse = re.match(r'\x1b\[<(\d+);(\d+);(\d+)([Mm])', buffer)
+    if mouse:
+        code, x, y = map(int, mouse.group(1, 2, 3))
+        return ('mouse', code, x - 1, y - 1, mouse[4]), buffer[mouse.end():]
+    for sequence, key in [('\x1b[A', 'up'), ('\x1b[B', 'down'), ('\x1bOA', 'up'), ('\x1bOB', 'down'), ('\x1b[Z', 'backtab'),
+                          ('\x1b[5~', 'pageup'), ('\x1b[6~', 'pagedown')]:
+        if buffer.startswith(sequence):
+            return ('key', key), buffer[len(sequence):]
+    if buffer.startswith('\x1b'):
+        complete = re.match(r'\x1b\[[0-?]*[ -/]*[@-~]', buffer)
+        if complete:
+            return ('ignore',), buffer[complete.end():]
+        if len(buffer) < 64 and (buffer.startswith('\x1b[') or buffer == '\x1b'):
+            return None, buffer
+        return ('ignore',), buffer[2:]
+    return ('key', buffer[0]), buffer[1:]
+
+
+def monitor_terminal(frame, state):
+    # Windows enters through WSL, so all three launchers use the same POSIX TTY.
+    import termios
+    import tty
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError('Open the monitor in an interactive terminal')
+    try:
+        metadata = json.loads(Path(state).read_text(encoding='utf-8')) if state else None
+    except (OSError, ValueError):
+        metadata = None
+    saved = termios.tcgetattr(sys.stdin.fileno())
+    old_signals = {kind: signal.getsignal(kind) for kind in (signal.SIGTERM, signal.SIGHUP)}
+    def interrupted(*_):
+        raise KeyboardInterrupt
+    for kind in old_signals:
+        signal.signal(kind, interrupted)
+    enable = '\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[?2004h'
+    disable = '\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[?25h'
+    message = '' if metadata else 'LAN controls are unavailable. Start this monitor through the platform launcher.'
+    pending, buffer, selected, offset = None, '', 0, 0
+    text, controls, signature, last_paint = '', [], None, None
+
+    def authorize():
+        if not metadata or metadata.get('platform') == 'win32' or os.geteuid() == 0:
+            return True
+        if subprocess.run(['sudo', '-n', '-v'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            return True
+        sys.stdout.write(disable + '\nLAN needs administrator access to listen on HTTPS.\n')
+        sys.stdout.flush()
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
+        try:
+            return subprocess.run(['sudo', '-v']).returncode == 0
+        finally:
+            tty.setcbreak(sys.stdin.fileno())
+            sys.stdout.write(enable)
+            sys.stdout.flush()
+
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+        sys.stdout.write(enable)
+        if metadata and metadata.get('defaults'):
+            authorize()
+        while True:
+            try:
+                path = Path(frame)
+                current = path.stat().st_mtime_ns
+                if current != signature:
+                    data = json.loads(path.read_text(encoding='utf-8'))
+                    text = data['text']
+                    controls = frame_controls(text, data['controls'])
+                    selected = min(selected, max(0, len(controls) - 1))
+                    signature = current
+            except (OSError, ValueError, KeyError):
+                pass
+            if pending and metadata:
+                try:
+                    response = json.loads((Path(state).parent / 'response.json').read_text(encoding='utf-8'))
+                    if response.get('id') == pending:
+                        message = response.get('message', '')
+                        pending = None
+                except (OSError, ValueError):
+                    pass
+                try:
+                    alive = json.loads((Path(state).parent / 'heartbeat.json').read_text(encoding='utf-8'))
+                    if time.time() - alive['time'] > 15:
+                        message = 'LAN controller is unavailable. Reopen the monitor to reconnect.'
+                except (OSError, ValueError, KeyError):
+                    pass
+            try:
+                size = os.get_terminal_size(sys.stdout.fileno())
+            except OSError:
+                size = shutil.get_terminal_size((100, 30))
+            height = max(1, size.lines - 3)
+            lines = text.splitlines() or ['Loading services…']
+            offset = max(0, min(offset, len(lines) - height))
+            paint = signature, selected, offset, message, pending, size
+            if paint != last_paint:
+                output = []
+                for row in range(offset, min(len(lines), offset + height)):
+                    line = lines[row]
+                    # Truncate overlong rows rather than wrap and invalidate mouse coordinates.
+                    visible = ANSI.sub('', line)
+                    if terminal_columns(visible) > size.columns:
+                        column, shortened = 0, ''
+                        for char in visible:
+                            column += terminal_columns(char)
+                            if column > size.columns - 1:
+                                break
+                            shortened += char
+                        line = shortened + '…'
+                    elif controls and row == controls[selected]['row']:
+                        line = LAN_LABEL.sub(lambda match: '\x1b[7m' + match.group() + '\x1b[27m', line, count=1)
+                    output.append(line + '\x1b[0m')
+                output.extend([''] * (height - len(output)))
+                clean_message = ' '.join(re.sub(r'[\x00-\x1f\x7f]', '', ANSI.sub('', message)).split())[:max(1, size.columns - 1)]
+                help_text = 'Tab/arrows select | Space/Enter toggle | L all | Q quit | Shift to select text'
+                output.extend(['\x1b[2m' + help_text[:max(1, size.columns - 1)] + '\x1b[0m', clean_message])
+                sys.stdout.write('\x1b[H\x1b[2J' + '\n'.join(output))
+                sys.stdout.flush()
+                last_paint = paint
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                chunk = os.read(sys.stdin.fileno(), 4096)
+                if not chunk:
+                    break
+                buffer += chunk.decode('utf-8', errors='ignore')
+            while buffer:
+                event, rest = terminal_event(buffer)
+                if event is None:
+                    break
+                buffer = rest
+                target = None
+                if event[0] == 'mouse':
+                    _, code, x, y, phase = event
+                    if code in (64, 65):
+                        offset += -3 if code == 64 else 3
+                    elif code == 0 and phase == 'M' and y < height:
+                        target = next((i for i, button in enumerate(controls)
+                                       if button['row'] == y + offset and button['column'] <= x < min(size.columns, button['column'] + button['width'])), None)
+                elif event[0] == 'key':
+                    key = event[1]
+                    if key.lower() == 'q':
+                        return
+                    if key in ('\t', 'down', 'up', 'backtab') and controls:
+                        selected = (selected + (-1 if key in ('up', 'backtab') else 1)) % len(controls)
+                        offset = min(offset, controls[selected]['row'])
+                        offset = max(offset, controls[selected]['row'] - height + 1)
+                    elif key in (' ', '\r', '\n') and controls:
+                        target = selected
+                    elif key.lower() == 'l':
+                        target = next((i for i, button in enumerate(controls) if button['project'] is None), None)
+                    elif key in ('pageup', 'pagedown'):
+                        offset += -height if key == 'pageup' else height
+                if target is not None and not pending and metadata:
+                    selected = target
+                    offset = min(offset, controls[target]['row'])
+                    offset = max(offset, controls[target]['row'] - height + 1)
+                    button = controls[target]
+                    if button['action'] == 'on' and not authorize():
+                        message = 'LAN was not enabled: administrator access was declined.'
+                        continue
+                    pending = secrets.token_hex(16)
+                    atomic_json(Path(state).parent / 'request.json', {'id': pending, 'token': metadata['token'],
+                                'action': button['action'], 'project': button['project']})
+                    message = 'Updating LAN access…'
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
+        for kind, previous in old_signals.items():
+            signal.signal(kind, previous)
+        sys.stdout.write('\x1b[0m' + disable + '\n')
+        sys.stdout.flush()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['on', 'off', 'status', 'serve', 'monitor', 'monitor-link'])
+    parser.add_argument('action', choices=['on', 'off', 'status', 'serve', 'monitor', 'monitor-label', 'monitor-frame', 'monitor-terminal'])
     parser.add_argument('--root', default='.')
     parser.add_argument('--directory', default='/tmp/traefik-dynamic')
     parser.add_argument('--address')
@@ -599,37 +800,26 @@ if __name__ == '__main__':
     parser.add_argument('--discover', action='store_true')
     parser.add_argument('--control-state')
     parser.add_argument('--project')
+    parser.add_argument('--frame')
+    parser.add_argument('--controls')
+    parser.add_argument('--output')
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     if args.action == 'monitor':
-        server, token = monitor_server(args.root, args.directory)
-        with server:
-            atomic_json(args.control_state, {'url': f'http://127.0.0.1:{server.server_port}', 'token': token,
-                                             'projects': sorted(monitor_projects(args.root))})
-            stop = threading.Event()
-            def defaults():
-                attempted = set()
-                while not stop.is_set():
-                    try:
-                        monitor_defaults(args.root, args.directory, attempted)
-                    except (OSError, ValueError, subprocess.SubprocessError):
-                        pass
-                    stop.wait(10)
-            threading.Thread(target=defaults, daemon=True).start()
-            try:
-                server.serve_forever()
-            finally:
-                stop.set()
-    elif args.action == 'monitor-link':
-        state = json.loads(Path(args.control_state).read_text(encoding='utf-8'))
-        enabled = {path.name[:-len('-lan.state')] for path in Path(args.directory).glob('*-lan.state')}
-        projects = set(state['projects']) if 'projects' in state else monitor_projects(args.root).keys()
-        if args.project and args.project not in projects:
-            sys.exit(0)
-        selected = {args.project} if args.project else running_projects() & projects
-        action = 'off' if selected and selected <= enabled else 'on'
-        scope = f'&project={args.project}' if args.project else ''
-        print(f'{state["url"]}/#token={state["token"]}{scope}&action={action}')
+        monitor_controller(args.root, args.directory, args.control_state)
+    elif args.action == 'monitor-label':
+        control = monitor_label(args.root, args.directory, args.control_state, args.project)
+        if control:
+            print(f'{control["project"] or "*"}|{control["action"]}')
+    elif args.action == 'monitor-frame':
+        controls = []
+        for line in Path(args.controls).read_text(encoding='utf-8').splitlines():
+            if line.startswith('@lan|'):
+                _, project, action = line.split('|')
+                controls.append({'project': None if project == '*' else project, 'action': action})
+        atomic_json(args.output, {'text': Path(args.frame).read_text(encoding='utf-8'), 'controls': controls})
+    elif args.action == 'monitor-terminal':
+        monitor_terminal(args.frame, args.control_state)
     elif args.action == 'serve':
         serve(args.directory, args.address, args.upstream, network=args.network)
     else:

@@ -938,7 +938,7 @@ Start-Process -FilePath (Get-Command wsl.exe).Source -WindowStyle Hidden -Argume
     '-d', 'Ubuntu', '--cd', '/', '--', 'bash', "`"$wslWorkspace/dev.sh`"", '_workspace-sync',
     "`"$wslRoot`"", "`"$wslWorkspace`""
 ) | Out-Null
-# A local terminal link can enable LAN through this native host without asking
+# Native terminal controls enable LAN through this host without asking
 # WSL to access an unavailable Windows-drive mount. Defaults retain trust checks.
 $lanControlProcess = $null
 $lanControlDirectory = ''
@@ -972,7 +972,7 @@ try {
         Stop-Process -Id $lanControlProcess.Id -ErrorAction SilentlyContinue
     }
     if ($lanControlWindowsDirectory) {
-        foreach ($file in @('control.json', 'control.log', 'control-error.log')) {
+        foreach ($file in @('control.json', 'control.log', 'control-error.log', 'request.json', 'response.json', 'heartbeat.json', 'request.pending', 'response.pending', 'heartbeat.pending', 'control.pending')) {
             Remove-Item -LiteralPath (Join-Path $lanControlWindowsDirectory $file) -ErrorAction SilentlyContinue
         }
         Remove-Item -LiteralPath $lanControlWindowsDirectory -ErrorAction SilentlyContinue

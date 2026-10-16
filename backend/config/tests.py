@@ -121,48 +121,38 @@ class LocalNetworkTests(SimpleTestCase):
 
 
 class MonitorLanTests(SimpleTestCase):
-    def test_control_get_is_read_only_and_post_requires_local_origin_host_and_token(self):
-        import http.client
-        import threading
-        from .network import monitor_server
-        with TemporaryDirectory() as directory, patch('config.network.monitor_change', return_value='LAN on') as change:
-            server, token = monitor_server(directory, directory)
-            worker = threading.Thread(target=server.serve_forever, daemon=True)
-            worker.start()
-            origin = f'http://127.0.0.1:{server.server_port}'
-            def request(method, headers=None, body=None):
-                connection = http.client.HTTPConnection(*server.server_address, timeout=3)
-                try:
-                    connection.request(method, '/' if method == 'GET' else '/toggle', body, headers or {})
-                    response = connection.getresponse()
-                    data = response.read()
-                    return response.status, data
-                finally:
-                    connection.close()
-            try:
-                status, page = request('GET')
-                self.assertEqual(status, 200)
-                self.assertIn(b'history.replaceState', page)
-                self.assertNotIn(token.encode(), page)
-                change.assert_not_called()
-                headers = {'Origin': origin, 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'}
-                for field, bad in [('Origin', 'https://untrusted.example'), ('Authorization', 'Bearer invalid'), ('Host', 'untrusted.example')]:
-                    self.assertEqual(request('POST', {**headers, field: bad}, '{"action":"on"}')[0], 403)
-                self.assertEqual(request('POST', {'Content-Type': 'application/json'}, '{"action":"on"}')[0], 403)
-                self.assertEqual(request('POST', headers, '{"action":"execute"}')[0], 400)
-                self.assertEqual(request('POST', headers, '[]')[0], 400)
-                self.assertEqual(request('POST', headers, '{"action":"on","project":"../outside"}')[0], 400)
-                self.assertEqual(request('POST', headers, 'x' * 257)[0], 400)
-                change.assert_not_called()
-                self.assertEqual(request('POST', headers, '{"action":"on"}')[0], 200)
-                change.assert_called_once_with(directory, directory, 'on', None)
-                change.reset_mock()
-                self.assertEqual(request('POST', headers, '{"action":"off","project":"one"}')[0], 200)
-                change.assert_called_once_with(directory, directory, 'off', 'one')
-            finally:
-                server.shutdown()
-                server.server_close()
-                worker.join(3)
+    def test_terminal_requests_require_session_token_and_fixed_actions(self):
+        from .network import monitor_request
+        with TemporaryDirectory() as directory, patch('config.network.monitor_change', return_value='LAN off') as change:
+            for request in [[], {}, {'token': 'wrong', 'action': 'on'},
+                            {'token': 'session', 'action': 'execute'},
+                            {'token': 'session', 'action': 'on', 'project': '../outside'}]:
+                with self.assertRaises(ValueError):
+                    monitor_request(directory, directory, 'session', request)
+            change.assert_not_called()
+            result = monitor_request(directory, directory, 'session', {'token': 'session', 'action': 'off', 'project': 'one'})
+            self.assertEqual(result, 'LAN off')
+            change.assert_called_once_with(directory, directory, 'off', 'one')
+
+    def test_terminal_hit_regions_ignore_colors_and_real_url_links(self):
+        from .network import frame_controls
+        text = ('  infrastructure \x1b[31m[LAN OFF]\x1b[0m\n'
+                '  project \x1b[32m[LAN ON]\x1b[0m \x1b]8;;https://example.local\x1b\\example.local\x1b]8;;\x1b\\\n')
+        controls = [{'project': None, 'action': 'on'}, {'project': 'one', 'action': 'off'}]
+        regions = frame_controls(text, controls)
+        self.assertEqual([(item['row'], item['column'], item['width']) for item in regions], [(0, 17, 9), (1, 10, 8)])
+        self.assertEqual(regions[1]['project'], 'one')
+
+    def test_terminal_parser_handles_fragmented_clicks_keyboard_and_ignored_pastes(self):
+        from .network import terminal_event
+        event, remaining = terminal_event('\x1b[<0;18;2M\t')
+        self.assertEqual(event, ('mouse', 0, 17, 1, 'M'))
+        self.assertEqual(terminal_event(remaining)[0], ('key', '\t'))
+        self.assertEqual(terminal_event('\x1b[<0;18;2m')[0][-1], 'm')
+        self.assertEqual(terminal_event('\x1b[<0;18;')[0], None)
+        self.assertEqual(terminal_event('\x1b[A')[0], ('key', 'up'))
+        self.assertEqual(terminal_event('\x1b[200~l q '), (None, '\x1b[200~l q '))
+        self.assertEqual(terminal_event('\x1b[200~l q \x1b[201~q'), (('ignore',), 'q'))
 
     def test_individual_off_preserves_other_projects_and_remembers_its_choice(self):
         from .network import configure, monitor_change, lan_preferences
@@ -180,7 +170,8 @@ class MonitorLanTests(SimpleTestCase):
             self.assertEqual(command.call_count, 1)
             self.assertEqual(command.call_args.kwargs['cwd'], roots['one'])
 
-    def test_default_on_applies_to_new_running_projects_only_and_honors_saved_off(self):
+    @patch('config.network.background_lan_ready', return_value=True)
+    def test_default_on_applies_to_new_running_projects_only_and_honors_saved_off(self, _ready):
         from .network import monitor_defaults, atomic_json
         with TemporaryDirectory() as directory:
             roots = {name: Path(directory) / name for name in ('one', 'two')}
@@ -201,7 +192,8 @@ class MonitorLanTests(SimpleTestCase):
                 monitor_defaults(directory, directory, attempted)
                 change.assert_not_called()
 
-    def test_failed_default_on_is_not_retried_in_the_background(self):
+    @patch('config.network.background_lan_ready', return_value=True)
+    def test_failed_default_on_is_not_retried_in_the_background(self, _ready):
         from .network import monitor_defaults
         with TemporaryDirectory() as directory, patch('config.network.monitor_projects', return_value={'one': Path(directory)}), patch('config.network.running_projects', return_value={'one'}), patch('config.network.monitor_change', side_effect=ValueError('Public network')) as change:
             attempted = set()

@@ -4531,21 +4531,21 @@ _draw_status_live() {
     printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$_url" "$_label"
   }
 
-  # Explicit LAN state with terminal-theme colors and no forced background.
+  # The monitor handles these controls directly; LAN labels are never browser links.
   _lan_button() {
     [[ -n "${DEV_LAN_CONTROL_STATE:-}" && -s "$DEV_LAN_CONTROL_STATE" ]] || return 0
-    local _url _label='[LAN OFF]' _scope=()
+    local _target _action _label='[LAN OFF]' _scope=()
     [[ -n "${1:-}" ]] && _scope=(--project "$1")
-    _url=$(python3 "$ROOT_DIR/backend/config/network.py" monitor-link --root "$ROOT_DIR" --control-state "$DEV_LAN_CONTROL_STATE" "${_scope[@]}" 2>/dev/null || true)
-    [[ -n "$_url" ]] || return 0
-    if [[ "$_url" == *'&action=off' ]]; then
+    IFS='|' read -r _target _action < <(python3 "$ROOT_DIR/backend/config/network.py" monitor-label --root "$ROOT_DIR" --control-state "$DEV_LAN_CONTROL_STATE" "${_scope[@]}" 2>/dev/null || true)
+    [[ -n "$_target" && -n "$_action" ]] || return 0
+    printf '@lan|%s|%s\n' "$_target" "$_action" >> "$_rows_file"
+    if [[ "$_action" == off ]]; then
       _label='[LAN ON]'
       printf '\033[32m'
     else
       printf '\033[31m'
     fi
-    _hyperlink "$_url" "$_label"
-    printf '\033[0m'
+    printf '%s\033[0m' "$_label"
   }
 
   # Render rows first so the header reflects exactly the statuses in this frame.
@@ -4698,7 +4698,7 @@ _draw_status_live() {
       fi
       echo ""
     done
-    printf "  \033[2mCtrl+C to quit\033[0m\n\n"
+
   } > "$_tmp" 2>/dev/null
   cat "$_tmp"
   rm -f "$_tmp" "$_sf" "$_core_rows" "$_project_service_rows" "$_mobile_rows"
@@ -5005,43 +5005,41 @@ live_monitor() {
     done
   fi
 
-  local _rows_file
+  local _rows_file _frame_file _render_pid=""
   _rows_file="$(mktemp /tmp/${PROJECT_NAME}-status-rows-XXXXXX)"
-  local _SAVED_STTY
-  _SAVED_STTY="$(stty -g 2>/dev/null || true)"
-
+  _frame_file="$(mktemp /tmp/${PROJECT_NAME}-status-frame-XXXXXX)"
   _cleanup_monitor() {
-    printf '\033[?25h'
-    stty "$_SAVED_STTY" 2>/dev/null || true
-    rm -f "$_rows_file"
+    if [[ -n "$_render_pid" ]]; then
+      kill "$_render_pid" 2>/dev/null || true
+      wait "$_render_pid" 2>/dev/null || true
+    fi
+    printf '\033[?1000l\033[?1006l\033[?2004l\033[?25h'
+    rm -f "$_rows_file" "$_frame_file" "${_frame_file}.pending" "${_frame_file}.raw"
     if [[ -n "$_lan_control_pid" ]]; then
       kill "$_lan_control_pid" 2>/dev/null || true
-      rm -f "$_lan_control_dir/control.json" "$_lan_control_dir/control.log"
+      rm -f "$_lan_control_dir/"*.json "$_lan_control_dir/"*.pending "$_lan_control_dir/control.log"
       rmdir "$_lan_control_dir" 2>/dev/null || true
     fi
     printf "\n\033[2m  Services keep running in the background.\033[0m\n\n"
-    exit 0
   }
-  trap '_cleanup_monitor' HUP INT TERM
+  trap '_cleanup_monitor; exit 0' HUP INT TERM
 
-  printf '\033[?25l'   # hide cursor
-
-  # Infinite loop - keep monitoring until user presses Ctrl+C
-  while true; do
-    : > "$_rows_file"
-    set +e
-    # Capture the new frame, then clear + paint atomically to avoid flicker
-    local _out_tmp
-    _out_tmp="$(mktemp /tmp/${PROJECT_NAME}-monitor-out-XXXXXX)"
-    _draw_status_live "$_rows_file" 2>/dev/null > "$_out_tmp"
-    set -e
-    clear
-    cat "$_out_tmp"
-    rm -f "$_out_tmp"
-    sleep 3 2>/dev/null || true
-  done
-
+  # Keep slow container/stat collection off the input loop. Publish the frame and
+  # its hit regions atomically, so clicks always refer to what is on screen.
+  (
+    trap 'exit 0' HUP INT TERM
+    while true; do
+      _draw_status_live "$_rows_file" > "${_frame_file}.raw" 2>/dev/null || true
+      python3 "$ROOT_DIR/backend/config/network.py" monitor-frame --frame "${_frame_file}.raw" --controls "$_rows_file" --output "$_frame_file" 2>/dev/null || true
+      sleep 3
+    done
+  ) </dev/null &
+  _render_pid=$!
+  local _terminal_args=()
+  [[ -n "${DEV_LAN_CONTROL_STATE:-}" ]] && _terminal_args=(--control-state "$DEV_LAN_CONTROL_STATE")
+  python3 "$ROOT_DIR/backend/config/network.py" monitor-terminal --frame "$_frame_file" "${_terminal_args[@]}" || true
   _cleanup_monitor
+  trap - HUP INT TERM
 }
 
 
@@ -8354,8 +8352,12 @@ case "$CMD" in
     fi
     if [[ "$_lan_action" == on && "$OS" != wsl ]]; then
       _lan_ip=$(_get_lan_ip)
-      sudo -v || exit 1
-      sudo -b python3 "$ROOT_DIR/backend/config/network.py" serve --address "$_lan_ip" \
+      if [[ "${DEV_LAN_CONTROLLED:-}" == 1 ]]; then
+        sudo -n -v || exit 1
+      else
+        sudo -v || exit 1
+      fi
+      sudo -n -b python3 "$ROOT_DIR/backend/config/network.py" serve --address "$_lan_ip" \
         --root "$ROOT_DIR" >/tmp/devtools-lan.log 2>&1
       echo 'LAN discovery requires multicast on the Wi-Fi network. Trust the public mkcert rootCA.pem on your phone.'
     elif [[ "$_lan_action" == on ]]; then

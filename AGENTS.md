@@ -109,11 +109,15 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   each project's LAN button controls only that project. Red/green reflects actual
   sharing, not the saved preference. Startup defaults never bypass network trust
   checks or repeatedly request elevation after a failure.
-  Keep its controller on loopback only, with exact Host/Origin checks and a random
-  session token. GET and link previews never mutate sharing; changes use POST.
-  Serialize changes across monitors, fail closed on enable errors, and retain the
-  native Windows trusted-network/firewall checks. Never expose the controller
-  through Traefik, a tunnel or the LAN listener.
+  Controls are handled inside the terminal: Tab/arrows select, Space/Enter toggle,
+  L toggles all, and VT mouse clicks activate the displayed hit regions. Keep
+  keyboard control available when a terminal has no mouse support. Restore terminal
+  modes on exit and keep slow rendering separate from responsive input handling.
+  The native host controller uses authenticated file IPC in the private monitor
+  directory; never emit LAN browser links or accept arbitrary commands/paths.
+  Serialize changes across monitors, fail closed on enable errors, and retain
+  Windows trust/firewall checks. On Unix, foreground password prompts must occur
+  outside raw input mode; background workers must never read terminal passwords.
 - Phones need multicast DNS support on their Wi-Fi and must trust the public
   local CA. `dev.ps1 lan certificate` exports only rootCA.pem to Downloads as
   ProjectLocalCA.crt. Never export rootCA-key.pem. Wi-Fi client isolation can
