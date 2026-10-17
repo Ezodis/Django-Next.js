@@ -331,7 +331,12 @@ def set_public_mode(root):
     temporary = Path(temporary_name)
     try:
         if os.name == 'nt':
-            _restrict_windows_path(temporary)
+            try:
+                _restrict_windows_path(temporary)
+            except DevelopmentDNSError:
+                # .env normally inherits the checkout folder's permissions; a
+                # failed extra lockdown must not block saving one TLS setting.
+                pass
         else:
             os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, 'wb') as stream:
