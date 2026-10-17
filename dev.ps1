@@ -1224,7 +1224,8 @@ try {
         foreach ($file in @('control.json', 'control.log', 'control-error.log', 'request.json', 'response.json', 'heartbeat.json', 'request.pending', 'response.pending', 'heartbeat.pending', 'control.pending')) {
             Remove-Item -LiteralPath (Join-Path $lanControlWindowsDirectory $file) -ErrorAction SilentlyContinue
         }
-        Remove-Item -LiteralPath $lanControlWindowsDirectory -ErrorAction SilentlyContinue
+        # This mktemp directory is owned by this launch; remove any leftovers without prompting.
+        Remove-Item -LiteralPath $lanControlWindowsDirectory -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 wsl.exe -d Ubuntu --cd / -- rm -f $tmpScript 2>$null | Out-Null

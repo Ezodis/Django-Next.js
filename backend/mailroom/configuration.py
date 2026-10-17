@@ -1,7 +1,12 @@
 """Per-project mailbox settings; never inherit another project's credentials."""
 import os
 from email.utils import parseaddr
-from django.conf import settings
+try:
+    from django.conf import settings
+except ImportError:
+    # project.py loads this in the launcher's Python, which has no Django.
+    # Only project_email_settings() runs there, and it never reads settings.
+    settings = None
 
 
 def project_email_settings(environ=None):
