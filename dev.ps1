@@ -37,6 +37,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Windows PowerShell 5.1 launched from PowerShell 7 (directly or via Python)
+# inherits PS7's module folders and then fails to load built-in commands such
+# as Get-FileHash. Keep only module folders that 5.1 can use.
+if ($PSVersionTable.PSEdition -eq 'Desktop' -and $env:PSModulePath) {
+    $env:PSModulePath = (@($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '\\PowerShell(\\|$)' }) -join ';'
+}
+
 function Get-ProjectDevelopmentHostname {
     $nativePython = Get-Command python.exe -ErrorAction SilentlyContinue
     if (-not $nativePython) { throw 'Install native Python 3 to resolve the development domain and run LAN setup.' }
@@ -226,7 +233,7 @@ New-NetFirewallRule -Name '$rule-HTTPS' -DisplayName 'Project LAN HTTPS' -Direct
     # Reuse only the implementation that was actually launched. Hash shared
     # bytes, not checkout paths, so switching projects keeps one healthy relay.
     $helperRevision = (@('backend\config\network.py', 'backend\config\project_config.py', 'dev.ps1') | ForEach-Object {
-        (Get-FileHash -LiteralPath (Join-Path $ROOT_DIR $_) -Algorithm SHA256).Hash
+        [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes((Join-Path $ROOT_DIR $_)))).Replace('-', '')
     }) -join ':'
     $running = $null
     $preserveSharingSession = $false
