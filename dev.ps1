@@ -63,6 +63,26 @@ print(mode)
     return (($resolved | Out-String).Trim())
 }
 
+function Set-ProjectDevelopmentTlsMode {
+    param([ValidateSet('local', 'public')][string]$Mode)
+    # Rewrite only DEV_TLS_MODE in the private .env, keeping encoding and newlines.
+    $nativePython = Get-Command python.exe -ErrorAction Stop
+    $writer = @"
+import re, sys
+from pathlib import Path
+path = Path(sys.argv[1]) / '.env'
+if path.is_symlink() or not path.is_file():
+    raise SystemExit(0)
+original = path.read_bytes()
+text = original.decode('utf-8-sig')
+updated = re.sub(r'(?m)^[ \t]*(?:export[ \t]+)?DEV_TLS_MODE[ \t]*=[^\r\n]*', 'DEV_TLS_MODE=' + sys.argv[2], text)
+if updated != text:
+    path.write_bytes(updated.encode('utf-8-sig' if original.startswith(b'\xef\xbb\xbf') else 'utf-8'))
+"@
+    $writer | & $nativePython.Source - $ROOT_DIR $Mode
+    if ($LASTEXITCODE -ne 0) { throw 'Could not update the development HTTPS mode in .env.' }
+}
+
 function Sync-ProjectDevelopmentCredentials {
     param([switch]$Optional)
     # Validate one private host credential, then transfer it over stdin into WSL.
@@ -1036,7 +1056,22 @@ if ($DevArgs.Count -gt 1 -and $DevArgs[0] -eq 'build' -and $DevArgs -notcontains
 
 Ensure-WslSourceAccess
 $developmentTlsMode = Get-ProjectDevelopmentTlsMode
-Sync-ProjectDevelopmentCredentials -Optional:($developmentTlsMode -eq 'local')
+if ($developmentTlsMode -eq 'public') {
+    try {
+        Sync-ProjectDevelopmentCredentials
+    } catch {
+        # `lan on` switches a project to trusted HTTPS. Without a usable host
+        # Cloudflare credential, start with computer-only HTTPS instead of
+        # blocking; `lan setup` or `lan on` switch back once a token exists.
+        Write-Host 'Trusted LAN HTTPS needs a Cloudflare token that this computer does not have; starting with local HTTPS instead.' -ForegroundColor Yellow
+        Write-Host 'Run .\dev.ps1 lan setup when you want trusted LAN HTTPS again.' -ForegroundColor Yellow
+        Set-ProjectDevelopmentTlsMode -Mode local
+        $developmentTlsMode = 'local'
+        Sync-ProjectDevelopmentCredentials -Optional
+    }
+} else {
+    Sync-ProjectDevelopmentCredentials -Optional
+}
 
 # ── Fix WSL2 port forwarding if needed ────────────────────────────────────────
 Ensure-WSLPortForwarding
