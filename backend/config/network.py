@@ -729,7 +729,7 @@ def monitor_terminal(frame, state):
             message_lines = textwrap.wrap(clean_message, width=max(1, size.columns - 1)) or ['']
             message_lines = message_lines[:max(1, min(3, size.lines - 4))]
             height = max(1, size.lines - len(message_lines) - 2)
-            lines = text.splitlines() or ['Loading servicesÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦']
+            lines = text.splitlines() or ['Loading services...']
             offset = max(0, min(offset, len(lines) - height))
             paint = signature, selected, offset, message, pending, size
             if paint != last_paint:
@@ -745,7 +745,7 @@ def monitor_terminal(frame, state):
                             if column > size.columns - 1:
                                 break
                             shortened += char
-                        line = shortened + 'ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦'
+                        line = shortened + '...'
                     elif controls and row == controls[selected]['row']:
                         line = LAN_LABEL.sub(lambda match: '\x1b[7m' + match.group() + '\x1b[27m', line, count=1)
                     output.append(line + '\x1b[0m')
@@ -795,7 +795,7 @@ def monitor_terminal(frame, state):
                     pending = secrets.token_hex(16)
                     atomic_json(Path(state).parent / 'request.json', {'id': pending, 'token': metadata['token'],
                                 'action': button['action'], 'project': button['project']})
-                    message = 'Updating LAN accessÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦'
+                    message = 'Updating LAN access...'
     except KeyboardInterrupt:
         pass
     finally:
