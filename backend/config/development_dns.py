@@ -136,9 +136,35 @@ def _host_token_path(root):
     return shared
 
 
+def recover_host_token():
+    """Restore a missing Windows host token from the WSL copy made by an earlier sync.
+
+    Every successful sync mirrors the host token into WSL. If the Windows copy
+    is later lost, reuse that private copy instead of asking for a new token.
+    The token travels only over a pipe, never through arguments or logs.
+    """
+    path = host_token_file()
+    if os.name != 'nt' or path.exists():
+        return False
+    try:
+        result = subprocess.run(['wsl.exe', '-d', 'Ubuntu', '--cd', '/', '--', 'sh', '-c',
+                                 'cat "$HOME/.config/project-development/cloudflare-token" 2>/dev/null'],
+                                capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    value = result.stdout.decode('utf-8', 'replace').strip() if result.returncode == 0 else ''
+    if not value or len(value) > 4096 or not re.fullmatch(r'[A-Za-z0-9._~-]+', value):
+        return False
+    restored = _write_private_file(path, value)
+    if restored:
+        print('Restored the host Cloudflare token from WSL.', file=sys.stderr)
+    return restored
+
+
 def prepare_host(root):
     """Validate the one shared resolver credential locally; return only its path."""
     shared = _host_token_path(root)
+    recover_host_token()
     _read_token(shared)
     return shared
 
@@ -337,6 +363,7 @@ def setup(root):
     hostname = _public_hostname(root)
     path = _host_token_path(root)
     enrolled = False
+    recover_host_token()
     if not path.exists():
         print('Create a Cloudflare API token with Zone:Read and DNS:Edit for your project domains. '
               'The same private host token is reused by every checkout.', file=sys.stderr)
