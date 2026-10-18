@@ -1457,7 +1457,20 @@ _start_healthcheck_runner() {
         [[ "$(podman inspect --format "{{if .Config.Healthcheck}}yes{{end}}" "$_cname" 2>/dev/null)" == yes ]] || continue
         # podman may read from stdin. Without /dev/null it consumes the process
         # substitution feeding this loop, so only the first container is checked.
-        podman healthcheck run "$_cname" </dev/null >> "$_log_file" 2>&1 || true
+        local _check_code=0 _merged
+        podman healthcheck run "$_cname" </dev/null >> "$_log_file" 2>&1 || _check_code=$?
+        # A long-lived WSL mount namespace may not see an overlay mounted by
+        # another launcher. Podman then cannot resolve the container user and
+        # returns 125 before running the check. Refresh only that missing mount;
+        # genuine application failures must remain unhealthy.
+        if [[ "$_check_code" -eq 125 && "$EUID" -eq 0 ]]; then
+          _merged=$(podman inspect --format "{{.GraphDriver.Data.MergedDir}}" "$_cname" 2>/dev/null)
+          if [[ -n "$_merged" && -d "$_merged" ]] && ! mountpoint -q -- "$_merged"; then
+            if podman mount "$_cname" </dev/null >> "$_log_file" 2>&1; then
+              podman healthcheck run "$_cname" </dev/null >> "$_log_file" 2>&1 || true
+            fi
+          fi
+        fi
       done < <(podman ps \
         --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
         --format "{{.Names}}" 2>/dev/null)
