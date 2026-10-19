@@ -1220,6 +1220,37 @@ if ($DevArgs.Count -eq 0 -or $DevArgs[0] -in @('status', 'monitor', 'up', 'start
     }
 }
 
+# Optional native startup commands are literal DEV_COMMANDS names in project.py.
+# Discovery never imports integrations; handlers own their background lifecycle.
+function Start-ProjectDevelopmentServices {
+    $nativePython = Get-Command python.exe -ErrorAction Stop
+    $reader = @"
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / 'backend'))
+from config.project_config import project_option
+commands = project_option(root, 'DEV_WINDOWS_AUTOSTART_COMMANDS', [])
+registered = project_option(root, 'DEV_COMMANDS', {})
+if not isinstance(commands, list) or any(
+    not isinstance(command, str) or not command or '\n' in command or '\r' in command
+    or command not in registered for command in commands
+):
+    raise SystemExit('DEV_WINDOWS_AUTOSTART_COMMANDS must be a literal list of DEV_COMMANDS names.')
+for command in commands:
+    print(command)
+"@
+    $commands = @($reader | & $nativePython.Source - $ROOT_DIR)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not read project startup commands.' }
+    foreach ($command in $commands) {
+        & $nativePython.Source (Join-Path $ROOT_DIR 'backend\config\project_config.py') $ROOT_DIR run-dev-command $command
+        if ($LASTEXITCODE -ne 0) { _warn "Project startup command '$command' exited with code $LASTEXITCODE." }
+    }
+}
+if ($DevArgs.Count -eq 0 -or $DevArgs[0] -in @('up', 'start', 'restart')) {
+    try { Start-ProjectDevelopmentServices } catch { _warn "Project startup command unavailable: $($_.Exception.Message)" }
+}
+
 try {
     wsl.exe -d Ubuntu --cd / -- env "DEV_LAN_CONTROL_STATE=$lanControlLinuxState" bash $tmpScript
     $devShExitCode = $LASTEXITCODE
