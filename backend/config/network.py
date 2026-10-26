@@ -135,18 +135,32 @@ def configure(root, action, directory, relays=('127.0.0.1/32', '::1/128'), disco
 
 
 def enabled_hosts(directory):
+    """Hosts opted in to LAN sharing.
+
+    Raises OSError when the state directory cannot be read right now (for
+    example the \\\\wsl.localhost share stalling after sleep), so callers can
+    tell "nothing is shared" apart from "could not check". Path.glob would
+    silently return nothing in that case on newer Python versions.
+    """
     result = set()
-    for path in Path(directory).glob('*-lan.state'):
+    with os.scandir(directory) as entries:
+        names = [entry.name for entry in entries if entry.name.endswith('-lan.state')]
+    for name in names:
         try:
-            value = json.loads(path.read_text(encoding='utf-8'))
-            if not isinstance(value, dict):
-                continue
-            host = value.get('host')
-            # A stale .local state must never re-enable an old alias.
-            from config.project_config import development_hostname_for_domain
+            value = json.loads((Path(directory) / name).read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            continue  # revoked while listing
+        except ValueError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        host = value.get('host')
+        # A stale .local state must never re-enable an old alias.
+        from config.project_config import development_hostname_for_domain
+        try:
             if isinstance(host, str) and host.startswith('dev.') and development_hostname_for_domain(host[4:]) == host:
                 result.add(host)
-        except (OSError, ValueError, KeyError):
+        except (ValueError, KeyError):
             continue
     return result
 
@@ -158,7 +172,9 @@ def network_signature(address, allow_public=False):
         # it cannot detect a Wi-Fi change that preserves the same private IP.
         return None
     # A manual Public session remains pinned to this exact interface/network.
-    guard = '' if allow_public else "if($p.NetworkCategory -eq 'Public'){throw 'Untrusted network'}; "
+    # Report (not throw) an untrusted network so it is told apart from a
+    # transient check failure and revoked immediately.
+    guard = '' if allow_public else "if($p.NetworkCategory -eq 'Public'){'untrusted'; exit 0}; "
     # address has already been validated as an IPv4 literal, never shell input.
     command = (f"$a=Get-NetIPAddress -IPAddress '{address}' -AddressFamily IPv4 -ErrorAction Stop; "
                "$p=Get-NetConnectionProfile -InterfaceIndex $a.InterfaceIndex -ErrorAction Stop; "
@@ -167,9 +183,15 @@ def network_signature(address, allow_public=False):
                "-ErrorAction Stop | Select-Object -First 1 -ExpandProperty NextHop; "
                "@{name=$p.Name;index=$a.InterfaceIndex;category=[string]$p.NetworkCategory;prefix=$a.PrefixLength;gateway=$g} | ConvertTo-Json -Compress")
     value = subprocess.check_output(['powershell.exe', '-NoProfile', '-Command', command],
-                                    timeout=8, stderr=subprocess.DEVNULL,
+                                    timeout=20, stderr=subprocess.DEVNULL,
                                     creationflags=subprocess.CREATE_NO_WINDOW, text=True)
+    if value.strip() == 'untrusted':
+        raise UntrustedNetwork('Untrusted network')
     return json.dumps(json.loads(value), sort_keys=True)
+
+
+class UntrustedNetwork(ValueError):
+    """The interface is now on a Public network; never tolerate this as transient."""
 
 
 def revoke_all(directory):
@@ -242,6 +264,12 @@ class Relay(socketserver.ThreadingTCPServer):
         self._hosts_lock = threading.Lock()
         self._hosts = frozenset()
         self._hosts_until = 0
+        # True only when the last read succeeded. A failed read fails closed
+        # (no traffic) but is not proof that sharing was turned off.
+        self.hosts_confirmed = False
+        self._upstream_lock = threading.Lock()
+        self._upstream_checked = 0.0
+        self.upstream_resolver = None
         super().__init__(*args, **kwargs)
 
     def allowed_hosts(self):
@@ -251,10 +279,64 @@ class Relay(socketserver.ThreadingTCPServer):
                 if time.monotonic() >= self._hosts_until:
                     try:
                         self._hosts = frozenset(enabled_hosts(self.directory))
+                        self.hosts_confirmed = True
                     except OSError:
                         self._hosts = frozenset()
+                        self.hosts_confirmed = False
                     self._hosts_until = time.monotonic() + 0.25
         return self._hosts
+
+    def connect_upstream(self):
+        attempted = self.upstream
+        try:
+            return socket.create_connection(attempted, timeout=5)
+        except OSError:
+            if not self.refresh_upstream(attempted):
+                raise
+            return socket.create_connection(self.upstream, timeout=5)
+
+    def refresh_upstream(self, attempted):
+        """Follow the WSL address after WSL restarts instead of relaying to a dead one.
+
+        Returns True when a different upstream is now available to retry.
+        """
+        if self.upstream_resolver is None:
+            return False
+        with self._upstream_lock:
+            if self.upstream != attempted:
+                return True  # another connection already refreshed it
+            if time.monotonic() - self._upstream_checked < UPSTREAM_REFRESH_SECONDS:
+                return False
+            self._upstream_checked = time.monotonic()
+            try:
+                address = self.upstream_resolver()
+            except (OSError, ValueError, subprocess.SubprocessError):
+                return False
+            if not address or (address, attempted[1]) == attempted:
+                return False
+            print(f'LAN upstream moved to {address}', file=sys.stderr, flush=True)
+            self.upstream = (address, attempted[1])
+            return True
+
+
+UPSTREAM_REFRESH_SECONDS = 15
+# Consecutive failed network checks (10 s apart) tolerated before revoking.
+# Waking from sleep or a slow PowerShell start must not switch LAN off.
+NETWORK_CHECK_FAILURES = 6
+
+
+def wsl_upstream_address():
+    """Current WSL VM address, the same one global Traefik publishes :8443 on."""
+    output = subprocess.check_output(['wsl.exe', '-d', 'Ubuntu', '--cd', '/', '--', 'hostname', '-I'],
+                                     timeout=15, stderr=subprocess.DEVNULL, text=True, errors='replace',
+                                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    for token in output.replace('\x00', '').split():
+        try:
+            if ipaddress.ip_address(token).version == 4:
+                return token
+        except ValueError:
+            continue
+    return None
 
 
 class Forward(socketserver.BaseRequestHandler):
@@ -275,7 +357,7 @@ class Forward(socketserver.BaseRequestHandler):
             host = hello_hostname(data)
             if host not in server.allowed_hosts():
                 return
-            with socket.create_connection(server.upstream, timeout=5) as target:
+            with server.connect_upstream() as target:
                 target.sendall(data)
                 self.request.settimeout(2)
                 target.settimeout(2)
@@ -319,21 +401,38 @@ def serve(directory, address, upstream, port=443, network=None, allow_public=Fal
             raise ValueError('The listener must belong to the selected private subnet')
         relay.directory = directory
         relay.upstream = (upstream, 8443)
+        if os.name == 'nt' and not ipaddress.ip_address(upstream).is_loopback:
+            relay.upstream_resolver = wsl_upstream_address
         threading.Thread(target=relay.serve_forever, daemon=True).start()
+        failures = 0
         try:
             with listener_readiness(ready_file, address):
-                while relay.allowed_hosts():
+                while True:
+                    # Stop only when sharing was really turned off. A state
+                    # read that fails (WSL share briefly unavailable) already
+                    # blocks traffic; exiting would leave LAN dead afterwards.
+                    if not relay.allowed_hosts() and relay.hosts_confirmed:
+                        break
                     if time.monotonic() - checked >= 10:
                         try:
                             current_signature = network_signature(address, allow_public)
+                            failures = 0
                             if current_signature != signature:
                                 print('LAN stopped: network identity changed', file=sys.stderr, flush=True)
                                 revoke_all(directory)
                                 break
-                        except (OSError, ValueError, subprocess.SubprocessError) as error:
-                            print('LAN stopped: network verification failed: ' + type(error).__name__, file=sys.stderr, flush=True)
+                        except UntrustedNetwork:
+                            print('LAN stopped: network is no longer trusted', file=sys.stderr, flush=True)
                             revoke_all(directory)
                             break
+                        except (OSError, ValueError, subprocess.SubprocessError) as error:
+                            failures += 1
+                            print(f'LAN network check failed ({failures}/{NETWORK_CHECK_FAILURES}): '
+                                  + type(error).__name__, file=sys.stderr, flush=True)
+                            if failures >= NETWORK_CHECK_FAILURES:
+                                print('LAN stopped: network verification failed', file=sys.stderr, flush=True)
+                                revoke_all(directory)
+                                break
                         checked = time.monotonic()
                     time.sleep(0.5)
         finally:
@@ -429,6 +528,154 @@ def monitor_defaults(root, directory, attempted):
             attempted.add(namespace)
 
 
+NATIVE_WINDOWS = os.name == 'nt'
+
+
+def trusted_network_key():
+    """Identity of the connected Windows networks, used to re-apply LAN
+    preferences once after the computer joins (or rejoins) a network."""
+    if not NATIVE_WINDOWS:
+        return None
+    command = ("Get-NetConnectionProfile | Where-Object {$_.IPv4Connectivity -ne 'Disconnected'} | "
+               "ForEach-Object { $_.Name + '|' + [string]$_.NetworkCategory + '|' + "
+               "((Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+               "Select-Object -ExpandProperty IPAddress) -join ',') } | Sort-Object")
+    return subprocess.check_output(['powershell.exe', '-NoProfile', '-Command', command], text=True, timeout=20,
+                                   stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW).strip()
+
+
+def lan_https_check(address, host, timeout=6):
+    """The phone's path, tested from this computer: LAN address -> relay ->
+    Traefik -> publicly trusted certificate -> app. Returns the HTTP status line."""
+    import ssl
+    context = ssl.create_default_context()
+    with socket.create_connection((address, 443), timeout=timeout) as raw:
+        with context.wrap_socket(raw, server_hostname=host) as tls:
+            tls.settimeout(timeout)
+            tls.sendall(f'HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n'.encode('ascii'))
+            line = tls.recv(256).split(b'\r\n', 1)[0].decode('ascii', 'replace')
+    if not line.startswith('HTTP/'):
+        raise ValueError('No HTTP response through the LAN relay')
+    return line
+
+
+def public_dns_address(host):
+    """The A record phones see (computer hosts files point the same name at loopback)."""
+    import urllib.request
+    request = urllib.request.Request(f'https://cloudflare-dns.com/dns-query?name={host}&type=A',
+                                     headers={'accept': 'application/dns-json'})
+    with urllib.request.urlopen(request, timeout=8) as response:
+        answers = json.loads(response.read().decode('utf-8')).get('Answer') or []
+    return sorted({item['data'] for item in answers if item.get('type') == 1})
+
+
+def doctor(root, directory):
+    """Explain exactly where phone access breaks. Exit 0 only when every check passes."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from config.project_config import development_hostname
+    problems = 0
+
+    def report(ok, label, detail=''):
+        nonlocal problems
+        problems += 0 if ok else 1
+        print(f'  [{"OK" if ok else "!!"}] {label}' + (f' - {detail}' if detail else ''))
+
+    host = development_hostname(root)
+    print(f'LAN check for https://{host}')
+    try:
+        hosts = enabled_hosts(directory)
+        report(host in hosts, 'LAN sharing is on for this project',
+               '' if host in hosts else 'run .\\dev.ps1 lan on (or press its LAN button)')
+    except OSError as error:
+        report(False, 'Sharing state is readable', f'{directory}: {error}')
+    state_root = Path(os.environ.get('LOCALAPPDATA', '')) / 'ProjectDevelopment'
+    address = upstream = None
+    try:
+        address = json.loads((state_root / 'lan-ready.json').read_text(encoding='utf-8'))['address']
+        listener = json.loads((state_root / 'lan-listener.json').read_text(encoding='utf-8'))
+        upstream = listener.get('upstream')
+    except (OSError, ValueError, KeyError):
+        pass
+    report(bool(address), 'LAN relay is running', address or 'not running: run .\\dev.ps1 lan on')
+    if address:
+        try:
+            dns = public_dns_address(host)
+            report(dns == [address], 'Public DNS points phones at this computer',
+                   f'{host} -> {", ".join(dns) or "no record"} (this computer: {address})')
+        except (OSError, ValueError) as error:
+            report(False, 'Public DNS lookup', type(error).__name__)
+    if NATIVE_WINDOWS and upstream:
+        try:
+            current = wsl_upstream_address()
+            report(current == upstream, 'Relay forwards to the current WSL address',
+                   f'relay {upstream}, WSL now {current} (the relay follows it automatically)')
+        except (OSError, subprocess.SubprocessError) as error:
+            report(False, 'WSL is reachable', type(error).__name__)
+    if address:
+        try:
+            report(True, 'HTTPS works through the LAN address', lan_https_check(address, host))
+        except Exception as error:  # report every failure mode, never crash the doctor
+            report(False, 'HTTPS works through the LAN address', f'{type(error).__name__}: {error}')
+    print()
+    if problems:
+        print(f'{problems} problem(s) found above.')
+    else:
+        print('Everything on this computer works. If the phone still cannot open it:')
+    print('  - The phone must be on the same Wi-Fi as this computer, not a guest network')
+    print('    (guest/isolated networks block devices from reaching each other).')
+    print('  - Some routers block public names that point to home addresses ("DNS rebinding')
+    print('    protection"). If the phone shows a DNS/"site can\'t be reached" error, add')
+    print(f'    {host.split(".", 1)[1]} to the router\'s rebinding exceptions, or set the phone\'s')
+    print('    Private DNS to 1dot1dot1dot1.cloudflare-dns.com so it skips the router filter.')
+    print('  - Give this computer a fixed address (DHCP reservation) in the router so the')
+    print('    phone address never goes stale.')
+    return 1 if problems else 0
+
+
+def windows_relay_healthy():
+    """True only while the native Windows relay accepts HTTPS on its LAN address.
+
+    A project's state file alone only says sharing was requested. The relay can
+    exit (sleep, crash, IP change), so the monitor must probe the real socket.
+    """
+    path = Path(os.environ.get('LOCALAPPDATA', '')) / 'ProjectDevelopment' / 'lan-ready.json'
+    try:
+        address = str(ipaddress.IPv4Address(json.loads(path.read_text(encoding='utf-8'))['address']))
+        with socket.create_connection((address, 443), timeout=2):
+            return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def monitor_relay(root, directory):
+    """Restart a dead Windows relay once; if that fails, show LAN as off.
+
+    Revoking a failed project keeps the label truthful and stops repeated
+    elevation prompts. Turning it on again is an explicit button press.
+    """
+    if not NATIVE_WINDOWS:
+        return
+    states = lambda: {path.name[:-len('-lan.state')] for path in Path(directory).glob('*-lan.state')}
+    if not states() or windows_relay_healthy():
+        return
+    projects = monitor_projects(root)
+    with monitor_update_lock(directory):
+        enabled = states() & projects.keys()
+        if not enabled or windows_relay_healthy():
+            return
+        for namespace in sorted(enabled):
+            try:
+                monitor_change(root, directory, 'on', namespace, remember=False)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+        if not windows_relay_healthy():
+            for namespace in sorted(enabled):
+                try:
+                    configure(projects[namespace], 'off', directory)
+                except (OSError, ValueError):
+                    pass
+
+
 def monitor_change(root, directory, action, project=None, remember=True):
     if action not in ('on', 'off'):
         raise ValueError('Choose LAN on or off')
@@ -497,6 +744,7 @@ def monitor_change(root, directory, action, project=None, remember=True):
                 output.seek(0)
                 detail = (errors.read() or output.read()).decode('utf-8', errors='replace')
                 detail = detail or getattr(result, 'stderr', None) or getattr(result, 'stdout', None) or 'LAN update failed'
+                detail = readable_powershell_error(detail)
                 raise ValueError(detail[-2500:])
 
     if action == 'off':
@@ -527,6 +775,19 @@ def monitor_change(root, directory, action, project=None, remember=True):
     names = ', '.join(projects[namespace].name for namespace in selected)
     scope = ' (current network only)' if public_session else ''
     return f'LAN {action}{scope}: {names}. Your project URLs stay the same.'
+
+
+def readable_powershell_error(text):
+    """PowerShell sends errors to a pipe as CLIXML; show the message, not the XML."""
+    if '#< CLIXML' not in text:
+        return text
+    import html
+    parts = re.findall(r'<S S="Error">(.*?)</S>', text, flags=re.S)
+    message = ''.join(html.unescape(part) for part in parts)
+    message = re.sub(r'_x([0-9A-Fa-f]{4})_', lambda match: chr(int(match[1], 16)), message)
+    lines = [line.rstrip() for line in message.splitlines() if line.strip()]
+    # The first lines carry the thrown message; the rest is the script position.
+    return '\n'.join(lines[:3]) or text
 
 
 def monitor_request(root, directory, token, request):
@@ -563,9 +824,24 @@ def monitor_controller(root, directory, state):
             stop.wait(1)
     def defaults():
         attempted = set()
+        network = None
         while not stop.is_set():
             try:
+                # Wi-Fi reconnects and sleep/resume revoke sharing for safety.
+                # Re-apply the remembered preference once on the new network,
+                # instead of leaving LAN off until someone notices.
+                current = trusted_network_key()
+                if network is not None and current != network:
+                    attempted.clear()
+                network = current
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+            try:
                 monitor_defaults(root, directory, attempted)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+            try:
+                monitor_relay(root, directory)
             except (OSError, ValueError, subprocess.SubprocessError):
                 pass
             stop.wait(10)
@@ -808,7 +1084,7 @@ def monitor_terminal(frame, state):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['on', 'off', 'status', 'serve', 'monitor', 'monitor-label', 'monitor-frame', 'monitor-terminal'])
+    parser.add_argument('action', choices=['on', 'off', 'status', 'doctor', 'serve', 'monitor', 'monitor-label', 'monitor-frame', 'monitor-terminal'])
     parser.add_argument('--root', default='.')
     parser.add_argument('--directory', default='/tmp/traefik-dynamic')
     parser.add_argument('--address')
@@ -840,6 +1116,8 @@ if __name__ == '__main__':
         atomic_json(args.output, {'text': Path(args.frame).read_text(encoding='utf-8'), 'controls': controls})
     elif args.action == 'monitor-terminal':
         monitor_terminal(args.frame, args.control_state)
+    elif args.action == 'doctor':
+        sys.exit(doctor(args.root, args.directory))
     elif args.action == 'serve':
         serve(args.directory, args.address, args.upstream, network=args.network, allow_public=args.allow_public, ready_file=args.ready_file)
     else:

@@ -158,6 +158,15 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   On a new computer, repeat host credential enrollment; keep tokens out of Git,
   preserve the same development URLs, and revoke retired computer tokens.
   Local-only projects must stay runnable without internet or a Cloudflare token.
+- The Windows relay must survive transient failures: an unreadable sharing state
+  blocks traffic but does not stop the relay; only a readable, empty state does.
+  Tolerate several failed network checks before revoking, but revoke a Public
+  network at once. Follow the WSL address when it changes. Write the firewall
+  rule for the real interpreter image (Store Python runs from WindowsApps), clear
+  only Windows "Query User" block rules for that image, and elevate only when the
+  rule fingerprint changes. After a network change the monitor re-applies saved
+  preferences once. `dev.ps1 lan doctor` checks state, relay, public DNS, WSL
+  upstream, firewall and end-to-end HTTPS through the LAN address.
 
 ## Backup and recovery
 

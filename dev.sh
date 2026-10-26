@@ -3030,13 +3030,6 @@ HAS_HOST_DNS_CREDENTIAL
       --label "dev.kiro.config-sig=${_config_sig}" \
       --label "traefik.enable=true" \
       --label "traefik.docker.network=${_net}" \
-      --label "traefik.http.routers.traefik-dashboard.rule=Host(\`traefik.local\`)" \
-      --label "traefik.http.routers.traefik-dashboard.entrypoints=web" \
-      --label "traefik.http.routers.traefik-dashboard.service=api@internal" \
-      --label "traefik.http.routers.traefik-dashboard.middlewares=traefik-dashboard-redirect" \
-      --label 'traefik.http.middlewares.traefik-dashboard-redirect.redirectregex.regex=^http://traefik\.local/?$' \
-      --label "traefik.http.middlewares.traefik-dashboard-redirect.redirectregex.replacement=http://traefik.local/dashboard/" \
-      --label "traefik.http.middlewares.traefik-dashboard-redirect.redirectregex.permanent=false" \
       "${_selinux_args[@]}" \
       "${_sock_args[@]}" \
       traefik:v3.6.5 \
@@ -3063,7 +3056,7 @@ HAS_HOST_DNS_CREDENTIAL
         --global.checknewversion=false \
         --global.sendanonymoususage=false \
       >/dev/null 2>&1 || { echo 'Global Traefik could not start; inspect its container logs.' >&2; return 1; }
-    echo "✅ Global Traefik started → http://traefik.local"
+    echo "✅ Global Traefik started → http://localhost:8080/dashboard/"
   fi
 
   if [[ "$DEV_TLS_MODE" == public ]]; then
@@ -4880,7 +4873,7 @@ _draw_status_live() {
       : > "$_core_rows"
       for _gcn in "${_global_containers[@]}"; do
         printf '%s|%s\n' "$_gcn" "$_gcn" >> "$_rows_file"
-        [[ "$_gcn" == "traefik" ]] && _infra_links="  $(_hyperlink "http://traefik.local" "traefik.local")"
+        [[ "$_gcn" == "traefik" ]] && _infra_links="  $(_hyperlink "http://localhost:8080/dashboard/" "localhost:8080")"
         _draw_status_live_row "$_gcn" "$_gcn" "$_lw" "" "$_sf" >> "$_core_rows" || true
       done
       # Stopped sections stay hollow; failures take priority over startup.
@@ -5225,7 +5218,7 @@ print_status() {
   printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Web:"     "https://${_local_host}"
   printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "API:"     "https://${_local_host}/api"
   printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Admin:"   "https://${_local_host}/admin"
-  printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Traefik:" "http://traefik.local"
+  printf "  \033[2m%-14s\033[0m \033[36m%s\033[0m\n"  "Traefik:" "http://localhost:8080/dashboard/"
 
   if [[ -n "$_tunnel_url" ]]; then
     echo ""

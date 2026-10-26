@@ -171,6 +171,61 @@ function Test-ProjectLanListenerReady {
     return [bool]($listeners.Count -eq 1)
 }
 
+function Resolve-PythonImagePath {
+    param([string]$PythonPath)
+    # Firewall program rules match the real process image. Store Python's
+    # python.exe is an App Execution Alias whose process runs from WindowsApps,
+    # so a rule written for the alias path silently never matches.
+    try {
+        $probe = Start-Process -FilePath $PythonPath -ArgumentList '-c', '"import time; time.sleep(4)"' -WindowStyle Hidden -PassThru
+        Start-Sleep -Milliseconds 400
+        $image = (Get-Process -Id $probe.Id -ErrorAction Stop).Path
+        Stop-Process -Id $probe.Id -ErrorAction SilentlyContinue
+        if ($image) { return $image }
+    } catch {}
+    return $PythonPath
+}
+
+function Get-ProjectLanBlockingRules {
+    param([string]$Program)
+    # Dismissing a Windows "allow access" prompt creates inbound Block rules for
+    # the program. Block always wins over Allow, so phones are silently refused.
+    @(Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue | Where-Object {
+        $_.Program -and ([Environment]::ExpandEnvironmentVariables($_.Program) -eq $Program)
+    } | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {
+        $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block' -and $_.Enabled -eq 'True'
+    })
+}
+
+function Show-ProjectLanFirewall {
+    $listenerState = Join-Path $env:LOCALAPPDATA 'ProjectDevelopment\lan-listener.json'
+    $program = $null
+    if (Test-Path -LiteralPath $listenerState) {
+        $last = Get-Content -LiteralPath $listenerState -Raw | ConvertFrom-Json
+        $process = Get-Process -Id $last.pid -ErrorAction SilentlyContinue
+        if ($process) { $program = $process.Path }
+    }
+    $connected = @(Get-NetConnectionProfile | Where-Object { $_.IPv4Connectivity -ne 'Disconnected' })
+    foreach ($item in $connected) {
+        if ($item.NetworkCategory -eq 'Public') { Write-Host "  [!!] Network '$($item.Name)' is Public - set it to Private in Settings > Network & internet > Wi-Fi, then .\dev.ps1 lan on" }
+        else { Write-Host "  [OK] Network '$($item.Name)' is $($item.NetworkCategory)" }
+    }
+    if (-not $program) {
+        Write-Host '  [!!] LAN relay process is not running - run .\dev.ps1 lan on'
+        return
+    }
+    $allow = @(Get-NetFirewallRule -DisplayName 'Project LAN HTTPS' -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq 'True' } | Where-Object {
+        ([Environment]::ExpandEnvironmentVariables(($_ | Get-NetFirewallApplicationFilter).Program)) -eq $program
+    })
+    if ($allow.Count) { Write-Host "  [OK] Firewall allows the relay ($program)" }
+    else { Write-Host "  [!!] No firewall rule allows the relay program $program - run .\dev.ps1 lan on" }
+    $blocking = Get-ProjectLanBlockingRules -Program $program
+    if ($blocking.Count) { Write-Host "  [!!] Firewall BLOCK rules override it: $(($blocking | ForEach-Object DisplayName) -join ', ') - run .\dev.ps1 lan on to clear them" }
+    else { Write-Host '  [OK] No firewall block rules for the relay' }
+    $profile = Get-NetConnectionProfile | Where-Object { $_.IPv4Connectivity -ne 'Disconnected' } | Select-Object -First 1
+    if ($profile) { Write-Host "  [--] Network '$($profile.Name)' is $($profile.NetworkCategory)" }
+}
+
 function Start-ProjectLanListener {
     param([switch]$AllowPublic)
     # Explicit Public sessions expose only project HTTPS on the selected subnet.
@@ -182,7 +237,7 @@ function Start-ProjectLanListener {
             $_.IPv4Connectivity -ne 'Disconnected' -and $_.NetworkCategory -eq 'Public'
         } | Select-Object -First 1
     }
-    if (-not $profile) { throw 'No eligible LAN interface is available. Public networks require an explicit LAN toggle.' }
+    if (-not $profile) { throw 'Windows marks this Wi-Fi as a Public network, so LAN sharing is blocked. Fix permanently: Settings > Network & internet > Wi-Fi > (your network) > Network profile type > Private, then run .\dev.ps1 lan on again. For this session only: .\dev.ps1 lan on --allow-public' }
     $address = Get-NetIPAddress -InterfaceIndex $profile.InterfaceIndex -AddressFamily IPv4 | Where-Object {
         $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -notlike '127.*'
     } | Select-Object -First 1
@@ -210,16 +265,35 @@ set_public_mode(Path(sys.argv[2]))
     wsl.exe -d Ubuntu --cd / -- env 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin' bash "$runtimeRoot/dev.sh" lan on
     if ($LASTEXITCODE -ne 0) { throw 'Trusted HTTPS is not ready; LAN access was not enabled.' }
     $alias = $profile.InterfaceAlias.Replace("'", "''")
-    $program = $pythonPath.Replace("'", "''")
+    $programPath = Resolve-PythonImagePath -PythonPath $pythonPath
+    $program = $programPath.Replace("'", "''")
     $rule = "Devtools-LAN-$($profile.InterfaceIndex)"
     $lanSubnet = (& $pythonPath -c "import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False))" "$lanAddress/$($address.PrefixLength)").Trim()
     if ($LASTEXITCODE -ne 0 -or -not $lanSubnet) { throw 'Could not determine the LAN subnet.' }
     $firewallProfiles = if ($profile.NetworkCategory -eq 'Public') { 'Public' } else { 'Private,Domain' }
+    # Firewall descriptions reject characters such as | so store a hash of the settings.
+    $ruleSettings = "$lanAddress;$lanSubnet;$firewallProfiles;$($profile.InterfaceAlias);$programPath"
+    $ruleHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($ruleSettings))).Replace('-', '').Substring(0, 32)
+    $ruleFingerprint = "Project LAN HTTPS $ruleHash"
+    $ruleDescription = $ruleFingerprint.Replace("'", "''")
+    $blocking = @(Get-ProjectLanBlockingRules -Program $programPath | Where-Object { $_.Name -like 'TCP Query User*' -or $_.Name -like 'UDP Query User*' })
+    $blockingNames = ($blocking | ForEach-Object { "'" + $_.Name.Replace("'", "''") + "'" }) -join ', '
+    if ($blocking.Count) { Write-Host "Clearing $($blocking.Count) Windows firewall block rule(s) for Python left by a dismissed prompt." -ForegroundColor Yellow }
+    $currentRule = Get-NetFirewallRule -Name "$rule-HTTPS" -ErrorAction SilentlyContinue
+    $ruleCurrent = $currentRule -and $currentRule.Enabled -eq 'True' -and $currentRule.Description -eq $ruleFingerprint -and -not $blocking.Count
+    $firewallLog = Join-Path $env:LOCALAPPDATA 'ProjectDevelopment\lan-firewall-error.log'
+    New-Item -ItemType Directory -Path (Split-Path $firewallLog) -Force | Out-Null
+    Remove-Item -LiteralPath $firewallLog -ErrorAction SilentlyContinue
+    $firewallLogLiteral = $firewallLog.Replace("'", "''")
     $rules = @"
 `$ErrorActionPreference = 'Stop'
+if (`$env:PSModulePath) { `$env:PSModulePath = (@(`$env:PSModulePath -split ';') | Where-Object { `$_ -and `$_ -notmatch '\\PowerShell(\\|`$)' }) -join ';' }
+trap { (`$_ | Out-String) | Set-Content -LiteralPath '$firewallLogLiteral' -Encoding UTF8; exit 1 }
 # Remove obsolete owned mDNS/certificate-bootstrap rules; only HTTPS is exposed.
 Get-NetFirewallRule -Name '$rule-HTTPS', '$rule-mDNS', '$rule-Certificate' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-New-NetFirewallRule -Name '$rule-HTTPS' -DisplayName 'Project LAN HTTPS' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 443 -LocalAddress '$lanAddress' -RemoteAddress '$lanSubnet' -Profile $firewallProfiles -InterfaceAlias '$alias' -Program '$program' | Out-Null
+New-NetFirewallRule -Name '$rule-HTTPS' -DisplayName 'Project LAN HTTPS' -Description '$ruleDescription' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 443 -LocalAddress '$lanAddress' -RemoteAddress '$lanSubnet' -Profile $firewallProfiles -InterfaceAlias '$alias' -Program '$program' | Out-Null
+# Rules Windows created when its allow-access prompt was dismissed block this exact interpreter.
+foreach (`$name in @($blockingNames)) { Disable-NetFirewallRule -Name `$name }
 "@
     $upstream = ((wsl.exe -d Ubuntu --cd / -- hostname -I) -split '\s+')[0]
     if (-not $upstream) { throw 'WSL is unavailable; LAN access was not enabled.' }
@@ -250,9 +324,16 @@ New-NetFirewallRule -Name '$rule-HTTPS' -DisplayName 'Project LAN HTTPS' -Direct
             Stop-Process -Id $old.pid -ErrorAction SilentlyContinue
         }
     }
-    $encodedRules = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($rules))
-    $setup = Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList "-NoProfile -EncodedCommand $encodedRules"
-    if ($setup.ExitCode -ne 0) { throw 'LAN firewall setup was not completed.' }
+    # Ask for administrator approval only when the rule actually has to change
+    # (first use, new address/network, or a block rule to clear).
+    if (-not $ruleCurrent) {
+        $encodedRules = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($rules))
+        $setup = Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList "-NoProfile -EncodedCommand $encodedRules"
+        if ($setup.ExitCode -ne 0) {
+            $reason = if (Test-Path -LiteralPath $firewallLog) { (Get-Content -LiteralPath $firewallLog -Raw).Trim() } else { "exit code $($setup.ExitCode)" }
+            throw "LAN firewall setup failed: $reason"
+        }
+    }
     # A new sharing session opts in only the requested project. Stale opt-ins
     # from a previous network/reboot must not silently follow this computer.
     # Replacing only the code of a ready same-network helper keeps its opt-ins.
@@ -290,6 +371,10 @@ New-NetFirewallRule -Name '$rule-HTTPS' -DisplayName 'Project LAN HTTPS' -Direct
     }
     $listener.Refresh()
     if ($listener.HasExited) { throw "LAN listener could not start. See $stderr" }
+    $listenerImage = (Get-Process -Id $listener.Id -ErrorAction SilentlyContinue).Path
+    if ($listenerImage -and $listenerImage -ne $programPath) {
+        Write-Warning "The LAN relay runs as $listenerImage but the firewall rule allows $programPath. Phones may be blocked; run .\dev.ps1 lan doctor."
+    }
     @{pid=$listener.Id; address=$lanAddress; upstream=$upstream; network=$networkId; allowPublic=[bool]$AllowPublic; revision=$helperRevision} | ConvertTo-Json | Set-Content -LiteralPath $pidFile
     Write-Host "LAN enabled on $($profile.InterfaceAlias): $lanAddress." -ForegroundColor Green
 }
@@ -312,8 +397,23 @@ if ($DevArgs.Count -gt 1 -and $DevArgs[0] -eq 'lan' -and $DevArgs[1] -eq 'on') {
     if (-not (Test-Path -LiteralPath (Join-Path $runtimeWindows 'dev.sh'))) {
         throw 'Start this project first, then enable LAN access.'
     }
+    $allowPublic = $DevArgs -contains '--allow-public'
+    if (-not $allowPublic) {
+        $connectedProfiles = @(Get-NetConnectionProfile | Where-Object { $_.IPv4Connectivity -ne 'Disconnected' })
+        $trustedProfiles = @($connectedProfiles | Where-Object { [string]$_.NetworkCategory -in @('Private', 'DomainAuthenticated') })
+        $publicProfile = $connectedProfiles | Where-Object { [string]$_.NetworkCategory -eq 'Public' } | Select-Object -First 1
+        if (-not $trustedProfiles.Count -and $publicProfile) {
+            Write-Host "Warning: Windows marks '$($publicProfile.Name)' as a Public network." -ForegroundColor Yellow
+            Write-Host '  Only share on networks you trust. To stop this question, set it to Private:' -ForegroundColor Yellow
+            Write-Host '  Settings > Network & internet > Wi-Fi > (your network) > Network profile type > Private.' -ForegroundColor Yellow
+            if ([Console]::IsInputRedirected) { throw 'LAN not enabled on a Public network. Re-run with --allow-public to share for this session.' }
+            $answer = Read-Host 'Share this project on this network anyway, for this session only? (y/N)'
+            if ($answer -notmatch '^(y|yes)$') { Write-Host 'LAN was not enabled.'; exit 1 }
+            $allowPublic = $true
+        }
+    }
     try {
-        Start-ProjectLanListener -AllowPublic:($DevArgs -contains '--allow-public')
+        Start-ProjectLanListener -AllowPublic:$allowPublic
     } catch {
         $nativePython = Get-Command python.exe -ErrorAction Stop
         & $nativePython.Source (Join-Path $ROOT_DIR 'backend\config\network.py') off --root $ROOT_DIR --directory '\\wsl.localhost\Ubuntu\tmp\traefik-dynamic'
@@ -348,6 +448,11 @@ if ($DevArgs.Count -gt 0 -and $DevArgs[0] -eq 'lan' -and ($DevArgs.Count -eq 1 -
             exit 0
         }
         & $nativePython.Source (Join-Path $ROOT_DIR 'backend\config\development_dns.py') $ROOT_DIR setup
+        exit $LASTEXITCODE
+    }
+    if ($action -eq 'doctor') {
+        Show-ProjectLanFirewall
+        & $nativePython.Source (Join-Path $ROOT_DIR 'backend\config\network.py') doctor --root $ROOT_DIR --directory '\\wsl.localhost\Ubuntu\tmp\traefik-dynamic'
         exit $LASTEXITCODE
     }
     if ($action -eq 'certificate') {

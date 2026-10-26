@@ -556,6 +556,79 @@ class MonitorLanTests(SimpleTestCase):
             self.assertEqual(result, 'LAN off')
             change.assert_called_once_with(directory, directory, 'off', 'one')
 
+    def test_dead_windows_relay_is_restarted_or_shown_as_off(self):
+        from contextlib import nullcontext
+        from .network import monitor_relay, atomic_json
+        with TemporaryDirectory() as directory:
+            roots = {'one': Path(directory) / 'one'}
+            atomic_json(Path(directory) / 'one-lan.state', {'host': 'dev.one.app'})
+            common = [patch('config.network.NATIVE_WINDOWS', True),
+                      patch('config.network.monitor_projects', return_value=roots),
+                      patch('config.network.monitor_update_lock', return_value=nullcontext())]
+            for item in common:
+                item.start()
+                self.addCleanup(item.stop)
+            # Healthy relay: nothing changes.
+            with patch('config.network.windows_relay_healthy', return_value=True), patch('config.network.monitor_change') as change:
+                monitor_relay(directory, directory)
+                change.assert_not_called()
+            # Dead relay that restarts: the project stays on.
+            with patch('config.network.windows_relay_healthy', side_effect=[False, False, True]), \
+                    patch('config.network.monitor_change') as change, patch('config.network.configure') as configure:
+                monitor_relay(directory, directory)
+                change.assert_called_once_with(directory, directory, 'on', 'one', remember=False)
+                configure.assert_not_called()
+            # Dead relay that cannot restart: the label must turn off.
+            with patch('config.network.windows_relay_healthy', return_value=False), \
+                    patch('config.network.monitor_change', side_effect=ValueError('no')), patch('config.network.configure') as configure:
+                monitor_relay(directory, directory)
+                configure.assert_called_once_with(roots['one'], 'off', directory)
+
+    def test_unreadable_lan_state_fails_closed_without_counting_as_switched_off(self):
+        from .network import Relay, enabled_hosts, atomic_json
+        with self.assertRaises(OSError):
+            enabled_hosts('/nonexistent/lan-state-directory')
+        with TemporaryDirectory() as directory, Relay(('127.0.0.1', 0), None) as relay:
+            relay.directory = '/nonexistent/lan-state-directory'
+            self.assertEqual(relay.allowed_hosts(), set())
+            self.assertFalse(relay.hosts_confirmed)
+            relay.directory, relay._hosts_until = directory, 0
+            self.assertEqual(relay.allowed_hosts(), set())
+            self.assertTrue(relay.hosts_confirmed)
+            atomic_json(Path(directory) / 'one-lan.state', {'host': 'dev.one.app'})
+            relay._hosts_until = 0
+            self.assertEqual(relay.allowed_hosts(), {'dev.one.app'})
+
+    def test_relay_follows_a_moved_wsl_address(self):
+        import socket
+        from .network import Relay
+        upstream = socket.socket()
+        upstream.bind(('127.0.0.1', 0))
+        upstream.listen()
+        self.addCleanup(upstream.close)
+        port = upstream.getsockname()[1]
+        with Relay(('127.0.0.1', 0), None) as relay:
+            relay.upstream = ('127.0.0.2', port)
+            relay.upstream_resolver = lambda: '127.0.0.1'
+            with relay.connect_upstream():
+                pass
+            self.assertEqual(relay.upstream, ('127.0.0.1', port))
+            # Without a new address there is nothing to retry; the error surfaces.
+            relay.upstream = ('127.0.0.2', port)
+            relay._upstream_checked = 0
+            relay.upstream_resolver = lambda: '127.0.0.2'
+            with self.assertRaises(OSError):
+                relay.connect_upstream()
+
+    def test_public_network_is_revoked_but_check_failures_are_tolerated(self):
+        from .network import network_signature, UntrustedNetwork, NETWORK_CHECK_FAILURES
+        self.assertGreater(NETWORK_CHECK_FAILURES, 1)
+        with patch('config.network.os.name', 'nt'), \
+                patch('config.network.subprocess.CREATE_NO_WINDOW', 0, create=True), \
+                patch('config.network.subprocess.check_output', return_value='untrusted\n'):
+            with self.assertRaises(UntrustedNetwork):
+                network_signature('192.168.1.10')
+
     def test_terminal_hit_regions_ignore_colors_and_real_url_links(self):
         from .network import frame_controls
         text = ('  infrastructure \x1b[31m[LAN OFF]\x1b[0m\n'
