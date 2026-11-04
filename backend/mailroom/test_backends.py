@@ -6,11 +6,28 @@ from unittest.mock import MagicMock, patch
 from django.core.mail import EmailMultiAlternatives
 from django.test import SimpleTestCase, override_settings
 
-from .backends import CloudflareEmailBackend, BrevoEmailBackend, email_delivery_ready
+from .backends import CloudflareEmailBackend, BrevoEmailBackend, ResendEmailBackend, email_delivery_ready
 from .configuration import project_email_settings
 
 
 class ProjectEmailSettingsTest(SimpleTestCase):
+    def test_resend_selection_and_credentials_stay_in_the_project_environment(self):
+        first = project_email_settings({'DOMAIN': 'one.example', 'RESEND_API_KEY': 'first-key'})
+        second = project_email_settings({'DOMAIN': 'two.example'})
+        self.assertEqual(first['EMAIL_BACKEND'], 'mailroom.backends.ResendEmailBackend')
+        self.assertEqual(second['RESEND_API_KEY'], '')
+        self.assertNotEqual(second['EMAIL_BACKEND'], first['EMAIL_BACKEND'])
+
+    @override_settings(EMAIL_BACKEND='django.core.mail.backends.smtp.EmailBackend',
+                       EMAIL_HOST_USER='sender', EMAIL_HOST_PASSWORD='test-password',
+                       EMAIL_DELIVERY_ALLOW_SMTP=True)
+    def test_smtp_readiness_respects_project_deployment_policy(self):
+        self.assertTrue(email_delivery_ready())
+        with override_settings(EMAIL_DELIVERY_ALLOW_SMTP=False):
+            self.assertFalse(email_delivery_ready())
+        with override_settings(EMAIL_HOST_PASSWORD=''):
+            self.assertFalse(email_delivery_ready())
+
     def test_each_project_derives_its_own_identity_and_has_no_inherited_secrets(self):
         first = project_email_settings({'DOMAIN': 'one.example', 'BREVO_API_KEY': 'first-key'})
         second = project_email_settings({'DOMAIN': 'two.example'})
@@ -84,6 +101,35 @@ class HTTPSDeliveryTest(SimpleTestCase):
         self.assertEqual(payload['bcc'], [{'email': 'private@example.test'}])
         self.assertEqual(payload['replyTo'], {'email': '$@shop.example'})
         self.assertEqual(base64.b64decode(payload['attachment'][0]['content']).decode(), 'Bücher')
+
+    @override_settings(EMAIL_BACKEND='mailroom.backends.ResendEmailBackend', RESEND_API_KEY='test-resend-key')
+    def test_resend_identifies_client_and_preserves_complete_message(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"id":"provider-id"}'
+        with patch('mailroom.backends.urlopen', return_value=response) as provider:
+            self.assertEqual(ResendEmailBackend().send_messages([self.message()]), 1)
+        request = provider.call_args.args[0]
+        self.assertEqual(request.full_url, 'https://api.resend.com/emails')
+        self.assertEqual(request.get_header('User-agent'), 'Django-Mailroom/1.0')
+        self.assertEqual(request.get_header('Authorization'), 'Bearer test-resend-key')
+        self.assertEqual(provider.call_args.kwargs['timeout'], 20)
+        payload = json.loads(request.data)
+        self.assertTrue(email_delivery_ready())
+        self.assertEqual(payload['to'], ['to@example.test'])
+        self.assertEqual(payload['bcc'], ['private@example.test'])
+        self.assertEqual(payload['reply_to'], ['$@shop.example'])
+        self.assertEqual(payload['headers']['In-Reply-To'], '<question@example.test>')
+        self.assertEqual(base64.b64decode(payload['attachments'][0]['content']).decode(), 'Bücher')
+        self.assertEqual(payload['html'], '<p>Receipt</p>')
+
+    @override_settings(RESEND_API_KEY='test-resend-key')
+    def test_resend_rejection_is_not_reported_as_delivery(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"error":"rejected"}'
+        with patch('mailroom.backends.urlopen', return_value=response):
+            with self.assertRaisesRegex(RuntimeError, 'Resend email delivery failed'):
+                ResendEmailBackend().send_messages([self.message()])
+            self.assertEqual(ResendEmailBackend(fail_silently=True).send_messages([self.message()]), 0)
 
     def test_partial_recipient_acceptance_is_not_success(self):
         response = MagicMock()

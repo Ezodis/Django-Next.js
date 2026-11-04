@@ -1,11 +1,12 @@
 from django.db import migrations, models
+import mailroom.configuration
 
 
 class Migration(migrations.Migration):
     dependencies = [("mailroom", "0001_initial")]
     operations = [migrations.CreateModel(name="OutgoingEmail", fields=[
         ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
-        ("from_alias", models.CharField(default="bonn", help_text="Name before @oldbook.ai, e.g. bonn, support or orders.", max_length=64)),
+        ("from_alias", models.CharField(default=mailroom.configuration.default_alias, help_text="Sender alias on this project’s configured mail domain.", max_length=64)),
         ("sender", models.EmailField(editable=False, max_length=320)),
         ("recipient", models.EmailField(max_length=320)),
         ("subject", models.CharField(max_length=255)),

@@ -48,9 +48,9 @@ Development scans new authored text and resolves any missing entries on the serv
 before rendering. Source manifests are written atomically, and dictionary caches
 are keyed by manifest version so newly authored phrases invalidate stale results.
 Clients request a complete internal dictionary when the language or source changes; they keep the previous complete language until it is ready.
-OldBook persists manual choices in a cookie as well as its existing local storage;
-legacy local-storage-only preferences migrate on the first visit. EliteCar retains
-its existing preference cookies and regional settings. EDY stays automatic.
+Projects retain their own preference cookies, regional settings and language
+selectors. Projects without a manual selector use device language automatically.
+Migrate legacy local-storage preferences in the project's provider when needed.
 
 Only authored manifest phrases are eligible for machine translation. Dynamic
 names, passwords, form values, private content and interpolation values never go

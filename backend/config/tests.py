@@ -3,6 +3,7 @@ from django.conf import settings
 from django.urls import reverse, resolve
 import os
 import json
+import plistlib
 import unittest
 import subprocess
 from pathlib import Path
@@ -14,6 +15,69 @@ from .project_config import exposure_check_command, is_shared, mobile_apps, sync
 
 
 class LocalNetworkTests(SimpleTestCase):
+    def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.policy_file = Path(temporary.name) / 'lan-policy.json'
+        self.policy_file.write_text('{"mode":"trusted-lan"}', encoding='utf-8')
+        policy = patch('config.network.lan_policy_path', return_value=self.policy_file)
+        policy.start()
+        self.addCleanup(policy.stop)
+
+    def test_host_policy_fails_closed_and_off_always_revokes(self):
+        from .network import configure, serve, lan_policy, require_lan_permission
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '.env').write_text('DEV_DOMAIN=example.com\n')
+            route_dir = root / 'routes'
+            configure(root, 'on', route_dir)
+            self.policy_file.unlink()
+            self.assertEqual(lan_policy(), 'local-only')
+            with patch('config.network.Relay') as listener:
+                with self.assertRaisesRegex(ValueError, 'computer-only'):
+                    serve(route_dir, '192.168.1.10', '127.0.0.1')
+                listener.assert_not_called()
+            for contents in ('{"mode":"local-only"}', 'bad json', '[]', '{"mode":true}'):
+                self.policy_file.write_text(contents)
+                with self.assertRaises(ValueError):
+                    require_lan_permission()
+                with self.assertRaises(ValueError):
+                    configure(root, 'on', route_dir)
+                self.assertFalse(configure(root, 'off', route_dir)['enabled'])
+            self.assertEqual(list(route_dir.glob('*-lan.*')), [])
+
+    def test_tls_fallback_is_explicit_project_policy_without_importing_integrations(self):
+        from .project_config import development_tls_mode
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'backend').mkdir()
+            missing_token = root / 'host-token'
+            with patch('config.development_dns.host_token_file', return_value=missing_token):
+                self.assertEqual(development_tls_mode(root), 'local')
+                (root / '.env').write_text('DEV_TLS_MODE=public\n')
+                self.assertEqual(development_tls_mode(root), 'public')
+                (root / 'backend/project.py').write_text(
+                    "DEV_TLS_ALLOW_LOCAL_FALLBACK = True\nraise RuntimeError('must not import')\n")
+                with patch('config.project_config.sys.stderr') as warning:
+                    self.assertEqual(development_tls_mode(root, warn=True), 'local')
+                    self.assertTrue(warning.write.called)
+                missing_token.touch()
+                self.assertEqual(development_tls_mode(root), 'public')
+                (root / '.env').write_text('DEV_TLS_MODE=invalid\n')
+                with self.assertRaisesRegex(ValueError, 'DEV_TLS_MODE'):
+                    development_tls_mode(root)
+
+    def test_tls_fallback_does_not_inherit_another_project_or_accept_truthy_strings(self):
+        from .project_config import development_tls_mode
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'backend').mkdir()
+            with patch.dict(os.environ, {'DEV_TLS_MODE': 'public', 'DEV_TLS_ALLOW_LOCAL_FALLBACK': 'true'}):
+                self.assertEqual(development_tls_mode(root), 'local')
+            (root / 'backend/project.py').write_text("DEV_TLS_ALLOW_LOCAL_FALLBACK = 'false'\n")
+            with self.assertRaisesRegex(ValueError, 'literal boolean'):
+                development_tls_mode(root)
+
     def test_lan_uses_the_interface_prefix_instead_of_assuming_a_24_bit_network(self):
         from .network import local_subnet
         interfaces = [{'addr_info': [{'local': '192.168.4.2', 'prefixlen': 22}]}]
@@ -536,6 +600,13 @@ class DevelopmentDnsTests(SimpleTestCase):
 
 class MonitorLanTests(SimpleTestCase):
     def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.policy_file = Path(temporary.name) / 'lan-policy.json'
+        self.policy_file.write_text('{"mode":"trusted-lan"}', encoding='utf-8')
+        policy = patch('config.network.lan_policy_path', return_value=self.policy_file)
+        policy.start()
+        self.addCleanup(policy.stop)
         # Native Windows locks must never touch a user's live monitor session.
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -662,17 +733,20 @@ class MonitorLanTests(SimpleTestCase):
                 monitor_change(directory, routing, 'off', 'one')
             self.assertFalse((routing / 'one-lan.state').exists())
             self.assertTrue((routing / 'two-lan.state').exists())
-            self.assertEqual(lan_preferences(routing), {'default': True, 'projects': {'one': False}})
+            self.assertEqual(lan_preferences(routing), {'default': False, 'projects': {'one': False}})
             self.assertEqual(command.call_count, 1)
             self.assertEqual(command.call_args.kwargs['cwd'], roots['one'])
 
     @patch('config.network.background_lan_ready', return_value=True)
-    def test_default_on_applies_to_new_running_projects_only_and_honors_saved_off(self, _ready):
+    def test_default_off_and_explicit_preferences_apply_only_to_permitted_hosts(self, _ready):
         from .network import monitor_defaults, atomic_json
         with TemporaryDirectory() as directory:
             roots = {name: Path(directory) / name for name in ('one', 'two')}
             attempted = set()
             with patch('config.network.monitor_projects', return_value=roots), patch('config.network.running_projects', return_value=set(roots)), patch('config.network.monitor_change') as change:
+                monitor_defaults(directory, directory, attempted)
+                change.assert_not_called()
+                atomic_json(Path(directory) / '.lan-preferences.json', {'default': True, 'projects': {}})
                 monitor_defaults(directory, directory, attempted)
                 self.assertEqual([call.args[3] for call in change.call_args_list], ['one', 'two'])
                 change.reset_mock()
@@ -690,8 +764,9 @@ class MonitorLanTests(SimpleTestCase):
 
     @patch('config.network.background_lan_ready', return_value=True)
     def test_failed_default_on_is_not_retried_in_the_background(self, _ready):
-        from .network import monitor_defaults
+        from .network import monitor_defaults, atomic_json
         with TemporaryDirectory() as directory, patch('config.network.monitor_projects', return_value={'one': Path(directory)}), patch('config.network.running_projects', return_value={'one'}), patch('config.network.monitor_change', side_effect=ValueError('Public network')) as change:
+            atomic_json(Path(directory) / '.lan-preferences.json', {'default': True, 'projects': {}})
             attempted = set()
             monitor_defaults(directory, directory, attempted)
             monitor_defaults(directory, directory, attempted)
@@ -745,16 +820,32 @@ class MonitorLanTests(SimpleTestCase):
                 monitor_change(directory, directory, 'on', remember=False)
             command.assert_not_called()
 
-    @unittest.skipUnless(os.name == 'nt', 'Windows explicit Public session')
-    def test_explicit_public_toggle_requests_only_a_scoped_session(self):
-        import base64
+    @unittest.skipUnless(os.name == 'nt', 'Windows network category guard')
+    def test_explicit_public_toggle_cannot_override_trust_or_save_preference(self):
         from .network import monitor_change
-        with TemporaryDirectory() as directory, patch('config.network.monitor_projects', return_value={'app': Path(directory)}), patch('config.network.subprocess.check_output', side_effect=['app\n', '']), patch('config.network.subprocess.run', return_value=subprocess.CompletedProcess([], 0, '', '')) as command:
-            message = monitor_change(directory, directory, 'on', 'app')
-            invocation = base64.b64decode(command.call_args.args[0][-1]).decode('utf-16-le')
-            self.assertIn('lan on --allow-public;', invocation)
-            self.assertNotIn('Set-NetConnectionProfile', invocation)
-            self.assertIn('current network only', message)
+        with TemporaryDirectory() as directory, patch('config.network.monitor_projects', return_value={'app': Path(directory)}), patch('config.network.subprocess.check_output', side_effect=['app\n', '']), patch('config.network.subprocess.run') as command:
+            with self.assertRaisesRegex(ValueError, 'Public'):
+                monitor_change(directory, directory, 'on', 'app')
+            command.assert_not_called()
+            self.assertFalse((Path(directory) / '.lan-preferences.json').exists())
+
+    def test_host_policy_blocks_monitor_before_commands_or_preferences(self):
+        from .network import monitor_change, monitor_defaults, monitor_relay, atomic_json
+        self.policy_file.write_text('{"mode":"local-only"}', encoding='utf-8')
+        with TemporaryDirectory() as directory, patch('config.network.monitor_projects', return_value={'app': Path(directory)}), patch('config.network.subprocess.run') as command, patch('config.network.running_projects') as running:
+            for remember in (True, False):
+                with self.assertRaisesRegex(ValueError, 'computer-only'):
+                    monitor_change(directory, directory, 'on', 'app', remember=remember)
+            with self.assertRaisesRegex(ValueError, 'computer-only'):
+                monitor_defaults(directory, directory, set())
+            command.assert_not_called()
+            running.assert_not_called()
+            self.assertFalse((Path(directory) / '.lan-preferences.json').exists())
+            atomic_json(Path(directory) / 'app-lan.state', {'host':'dev.app.test'})
+            (Path(directory) / 'app-lan.yml').write_text('{}')
+            monitor_relay(directory, directory)
+            self.assertFalse((Path(directory) / 'app-lan.state').exists())
+            self.assertFalse((Path(directory) / 'app-lan.yml').exists())
 
     def test_failed_enable_rolls_back_new_opt_ins_and_never_runs_other_workspaces(self):
         from .network import monitor_change
@@ -1119,6 +1210,22 @@ class RestoredSequenceTestCase(TestCase):
 
 
 class ProjectEnvironmentTestCase(unittest.TestCase):
+    def test_native_commands_are_literal_registered_and_do_not_import_the_project(self):
+        from .project_config import native_dev_commands
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'backend').mkdir()
+            project = root / 'backend/project.py'
+            self.assertEqual(native_dev_commands(root), [])
+            project.write_text("DEV_COMMANDS = {'helper': 'run_helper'}\n"
+                               "DEV_WINDOWS_COMMANDS = ['helper']\n"
+                               "raise RuntimeError('must never import during discovery')\n")
+            self.assertEqual(native_dev_commands(root), ['helper'])
+            for invalid in ("'helper'", "['other']", '[True]', "['helper\\n']"):
+                project.write_text("DEV_COMMANDS = {'helper': 'run_helper'}\nDEV_WINDOWS_COMMANDS = " + invalid)
+                with self.assertRaisesRegex(ValueError, 'DEV_WINDOWS_COMMANDS'):
+                    native_dev_commands(root)
+
     def test_project_commands_do_not_inherit_missing_application_secrets(self):
         from .project_config import project_environment
         with TemporaryDirectory() as temporary:

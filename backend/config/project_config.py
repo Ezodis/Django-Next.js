@@ -91,7 +91,7 @@ SHARED_PATHS = (
     'frontend/web/next.config.shared.ts', 'frontend/web/vercel.json',
     'frontend/web/localization/*', 'frontend/web/app/ui-localization/route.ts',
     'frontend/web/package.json', 'frontend/web/eslint.config.mjs',
-    '.github/dependabot.yml', '.github/workflows/dependency-checks.yml',
+    '.github/workflows/dependency-checks.yml',
     '.github/workflows/template-sync.yml', '.github/workflows/dependency-automerge.yml',
     '.github/workflows/vercel-deploy.yml',
     'frontend/mobile/Dockerfile', 'frontend/mobile/.dockerignore',
@@ -99,6 +99,7 @@ SHARED_PATHS = (
     'frontend/mobile/metro.config.base.js',
 )
 RETIRED_SHARED_PATHS = (
+    '.github/dependabot.yml',
     '.github/workflows/production-backup.yml',
     'backend/config/.env.example',
     'backend/config/test_template_config.py',
@@ -137,6 +138,17 @@ def merge_web_package(template, project):
         del scripts['export']
     local.setdefault('engines', {}).update(remote.get('engines', {}))
     return (json.dumps(local, indent=2, ensure_ascii=False) + '\n').encode()
+
+
+def native_dev_commands(root):
+    commands = project_option(root, 'DEV_WINDOWS_COMMANDS', [])
+    registered = project_option(root, 'DEV_COMMANDS', {})
+    if not isinstance(commands, list) or any(
+        not isinstance(command, str) or not command or '\n' in command or '\r' in command
+        or command not in registered for command in commands
+    ):
+        raise ValueError('DEV_WINDOWS_COMMANDS must be a literal list of registered DEV_COMMANDS names')
+    return commands
 
 
 def project_option(root, name, default=None):
@@ -343,6 +355,25 @@ def development_hostname(root):
         if not slug:
             raise ValueError('Choose a project folder with letters or digits, or set DEV_DOMAIN')
         return f'dev.{slug}.localhost'
+
+
+def development_tls_mode(root, warn=False):
+    """Resolve TLS policy from this checkout without importing project code."""
+    mode = environment_values(root).get('DEV_TLS_MODE', 'local').strip().lower()
+    if mode not in ('local', 'public'):
+        raise ValueError('DEV_TLS_MODE must be local or public.')
+    fallback = project_option(root, 'DEV_TLS_ALLOW_LOCAL_FALLBACK', False)
+    if not isinstance(fallback, bool):
+        raise ValueError('DEV_TLS_ALLOW_LOCAL_FALLBACK must be a literal boolean.')
+    if mode == 'public' and fallback:
+        from .development_dns import host_token_file
+        if not host_token_file().is_file():
+            if warn:
+                print('Trusted LAN HTTPS is not set up on this computer (no Cloudflare token); '
+                      'using the project-configured computer-only HTTPS fallback. '
+                      'Run lan setup to enable LAN access.', file=sys.stderr)
+            return 'local'
+    return mode
 
 
 def development_hostname_for_domain(value):
@@ -806,6 +837,8 @@ if __name__ == '__main__':
             raise SystemExit(1)
     elif option == 'has-dev-command':
         raise SystemExit(0 if sys.argv[3] in project_option(root, 'DEV_COMMANDS', {}) else 1)
+    elif option == 'has-native-dev-command':
+        raise SystemExit(0 if sys.argv[3] in native_dev_commands(root) else 1)
     elif option == 'run-dev-command':
         command = project_option(root, 'DEV_COMMANDS', {}).get(sys.argv[3])
         if not command:

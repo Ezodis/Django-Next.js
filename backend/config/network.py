@@ -5,7 +5,6 @@ The LAN entrypoint has routes only for enabled projects; computer-only routes
 use separate loopback listeners. Network changes revoke the sharing session.
 """
 import argparse
-import base64
 from contextlib import contextmanager
 import secrets
 import ipaddress
@@ -34,6 +33,35 @@ def atomic_json(path, data):
     temporary = path.with_suffix('.pending')
     temporary.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
     os.replace(temporary, path)
+
+
+def lan_policy_path():
+    from config.development_dns import host_token_file
+    return host_token_file().with_name('lan-policy.json')
+
+
+def lan_policy():
+    """Host-wide opt-in, separate from project preferences; absent means local only.
+
+    This is an application safeguard, not a replacement for managed OS policy.
+    Only provision trusted-lan on a host where inbound access is permitted.
+    """
+    path = lan_policy_path()
+    try:
+        policy = json.loads(path.read_text(encoding='utf-8-sig'))
+    except FileNotFoundError:
+        return 'local-only'
+    except (OSError, ValueError) as error:
+        raise ValueError('Cannot read host LAN policy; sharing stays off') from error
+    if not isinstance(policy, dict) or policy.get('mode') not in ('local-only', 'trusted-lan'):
+        raise ValueError('Invalid host LAN policy; sharing stays off')
+    return policy['mode']
+
+
+def require_lan_permission():
+    if lan_policy() != 'trusted-lan':
+        raise ValueError('LAN is disabled by this host\'s computer-only policy. '
+                         'Use the local project URL; inbound sharing requires IT approval on a permitted host.')
 
 
 def lan_routes(project, host, relays=('127.0.0.1/32', '::1/128')):
@@ -107,6 +135,8 @@ def remove_lan_file(path):
 
 
 def configure(root, action, directory, relays=('127.0.0.1/32', '::1/128'), discover=False):
+    if action == 'on':
+        require_lan_permission()
     from config.project_config import development_hostname, resource_namespace
     project = resource_namespace(root)
     directory = Path(directory)
@@ -165,16 +195,15 @@ def enabled_hosts(directory):
     return result
 
 
-def network_signature(address, allow_public=False):
+def network_signature(address):
     """Windows Wi-Fi/profile changes revoke the current sharing session."""
     if os.name != 'nt':
         # Unix currently relies on the bound interface/subnet and explicit off;
         # it cannot detect a Wi-Fi change that preserves the same private IP.
         return None
-    # A manual Public session remains pinned to this exact interface/network.
     # Report (not throw) an untrusted network so it is told apart from a
     # transient check failure and revoked immediately.
-    guard = '' if allow_public else "if($p.NetworkCategory -eq 'Public'){'untrusted'; exit 0}; "
+    guard = "if($p.NetworkCategory -notin @('Private','DomainAuthenticated')){'untrusted'; exit 0}; "
     # address has already been validated as an IPv4 literal, never shell input.
     command = (f"$a=Get-NetIPAddress -IPAddress '{address}' -AddressFamily IPv4 -ErrorAction Stop; "
                "$p=Get-NetConnectionProfile -InterfaceIndex $a.InterfaceIndex -ErrorAction Stop; "
@@ -389,11 +418,12 @@ def listener_readiness(path, address):
                 pass
 
 
-def serve(directory, address, upstream, port=443, network=None, allow_public=False, ready_file=None):
+def serve(directory, address, upstream, port=443, network=None, ready_file=None):
+    require_lan_permission()
     ip = ipaddress.ip_address(address)
     if ip.version != 4 or not ip.is_private or ip.is_loopback or ip.is_link_local:
         raise ValueError('Select an IPv4 address on the trusted local network')
-    signature = network_signature(address, allow_public)
+    signature = network_signature(address)
     checked = time.monotonic()
     with Relay((address, port), Forward) as relay:
         relay.network = ipaddress.ip_network(network, strict=False) if network else local_subnet(address)
@@ -408,6 +438,11 @@ def serve(directory, address, upstream, port=443, network=None, allow_public=Fal
         try:
             with listener_readiness(ready_file, address):
                 while True:
+                    try:
+                        require_lan_permission()
+                    except ValueError:
+                        revoke_all(directory)
+                        break
                     # Stop only when sharing was really turned off. A state
                     # read that fails (WSL share briefly unavailable) already
                     # blocks traffic; exiting would leave LAN dead afterwards.
@@ -415,7 +450,7 @@ def serve(directory, address, upstream, port=443, network=None, allow_public=Fal
                         break
                     if time.monotonic() - checked >= 10:
                         try:
-                            current_signature = network_signature(address, allow_public)
+                            current_signature = network_signature(address)
                             failures = 0
                             if current_signature != signature:
                                 print('LAN stopped: network identity changed', file=sys.stderr, flush=True)
@@ -486,7 +521,7 @@ def monitor_projects(root):
 def lan_preferences(directory):
     path = Path(directory) / '.lan-preferences.json'
     if not path.exists():
-        return {'default': True, 'projects': {}}
+        return {'default': False, 'projects': {}}
     value = json.loads(path.read_text(encoding='utf-8'))
     if (not isinstance(value, dict) or not isinstance(value.get('default'), bool) or not isinstance(value.get('projects'), dict)
             or any(not isinstance(item, bool) for item in value['projects'].values())):
@@ -512,6 +547,7 @@ def background_lan_ready():
 
 def monitor_defaults(root, directory, attempted):
     """Try new running projects once per monitor; never undo a deliberate off."""
+    require_lan_permission()
     if not background_lan_ready():
         return
     projects = monitor_projects(root)
@@ -580,6 +616,11 @@ def doctor(root, directory):
         problems += 0 if ok else 1
         print(f'  [{"OK" if ok else "!!"}] {label}' + (f' - {detail}' if detail else ''))
 
+    try:
+        require_lan_permission()
+    except ValueError as error:
+        print(str(error))
+        return 1
     host = development_hostname(root)
     print(f'LAN check for https://{host}')
     try:
@@ -653,6 +694,11 @@ def monitor_relay(root, directory):
     Revoking a failed project keeps the label truthful and stops repeated
     elevation prompts. Turning it on again is an explicit button press.
     """
+    try:
+        require_lan_permission()
+    except ValueError:
+        revoke_all(directory)
+        return
     if not NATIVE_WINDOWS:
         return
     states = lambda: {path.name[:-len('-lan.state')] for path in Path(directory).glob('*-lan.state')}
@@ -682,6 +728,8 @@ def monitor_change(root, directory, action, project=None, remember=True):
     projects = monitor_projects(root)
     if project is not None and project not in projects:
         raise ValueError('Unknown project in this workspace')
+    if action == 'on':
+        require_lan_permission()
     native = os.name == 'nt'
     options = {'creationflags': subprocess.CREATE_NO_WINDOW} if native else {}
     running = running_projects() if action == 'on' else set()
@@ -691,39 +739,37 @@ def monitor_change(root, directory, action, project=None, remember=True):
         if action == 'on' and project not in running:
             raise ValueError('Start this project before enabling LAN')
         selected = [project]
-    if remember:
-        preferences = lan_preferences(directory)
-        if project is None:
-            preferences = {'default': action == 'on', 'projects': {}}
-        else:
-            preferences['projects'][project] = action == 'on'
-        atomic_json(Path(directory) / '.lan-preferences.json', preferences)
-    if not selected:
-        if action == 'off':
-            return 'LAN is already off for this workspace.'
-        raise ValueError('No running projects were found in this workspace')
-    public_session = False
     if action == 'on' and native:
-        # Startup remains private-only. An explicit toggle grants only this
-        # network's bounded project ingress, without reclassifying Windows.
+        # A button press cannot override network trust or endpoint policy.
         trusted = subprocess.check_output([
             'powershell.exe', '-NoProfile', '-Command',
             "Get-NetConnectionProfile | Where-Object {$_.IPv4Connectivity -ne 'Disconnected' -and "
             "$_.NetworkCategory -in @('Private','DomainAuthenticated')} | Select-Object -ExpandProperty InterfaceIndex"
         ], text=True, timeout=15, **options).strip()
         if not trusted:
-            if not remember:
-                raise ValueError('Automatic LAN sharing stays off on Public networks. Use the LAN button to enable a session on this network.')
-            public_session = True
+            raise ValueError('LAN sharing is blocked on Public networks. Use the computer-only project URL.')
+
+    def save_preference():
+        if remember:
+            preferences = lan_preferences(directory)
+            if project is None:
+                preferences = {'default': action == 'on', 'projects': {}}
+            else:
+                preferences['projects'][project] = action == 'on'
+            atomic_json(Path(directory) / '.lan-preferences.json', preferences)
+
+    if action == 'off':
+        save_preference()
+    if not selected:
+        if action == 'off':
+            return 'LAN is already off for this workspace.'
+        raise ValueError('No running projects were found in this workspace')
 
     def apply(namespace, desired):
         checkout = projects[namespace]
         if native:
-            script = str(checkout / 'dev.ps1').replace("'", "''")
-            flag = ' --allow-public' if public_session and desired == 'on' else ''
-            source = f"$ProgressPreference='SilentlyContinue'; & '{script}' lan {desired}{flag}; exit $LASTEXITCODE"
-            encoded = base64.b64encode(source.encode('utf-16-le')).decode('ascii')
-            command = ['powershell.exe', '-NoProfile', '-OutputFormat', 'Text', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded]
+            command = ['powershell.exe', '-NoProfile', '-NonInteractive', '-OutputFormat', 'Text',
+                       '-File', str(checkout / 'dev.ps1'), 'lan', desired]
         else:
             command = ['bash', str(checkout / 'dev.sh'), 'lan', desired]
         child_options = dict(options)
@@ -773,8 +819,9 @@ def monitor_change(root, directory, action, project=None, remember=True):
                 configure(projects[namespace], 'off', directory)
         raise
     names = ', '.join(projects[namespace].name for namespace in selected)
-    scope = ' (current network only)' if public_session else ''
-    return f'LAN {action}{scope}: {names}. Your project URLs stay the same.'
+    if action == 'on':
+        save_preference()
+    return f'LAN {action}: {names}. Your project URLs stay the same.'
 
 
 def readable_powershell_error(text):
@@ -826,6 +873,16 @@ def monitor_controller(root, directory, state):
         attempted = set()
         network = None
         while not stop.is_set():
+            try:
+                require_lan_permission()
+            except ValueError:
+                # Computer-only hosts need no network discovery or enable retries.
+                try:
+                    revoke_all(directory)
+                except OSError:
+                    pass
+                stop.wait(5)
+                continue
             try:
                 # Wi-Fi reconnects and sleep/resume revoke sharing for safety.
                 # Re-apply the remembered preference once on the new network,
@@ -1084,13 +1141,13 @@ def monitor_terminal(frame, state):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['on', 'off', 'status', 'doctor', 'serve', 'monitor', 'monitor-label', 'monitor-frame', 'monitor-terminal'])
+    parser.add_argument('action', choices=['on', 'off', 'status', 'policy', 'doctor', 'serve', 'monitor', 'monitor-label', 'monitor-frame', 'monitor-terminal'])
     parser.add_argument('--root', default='.')
     parser.add_argument('--directory', default='/tmp/traefik-dynamic')
     parser.add_argument('--address')
     parser.add_argument('--upstream', default='127.0.0.1')
     parser.add_argument('--network')
-    parser.add_argument('--allow-public', action='store_true')
+    parser.add_argument('--require-lan', action='store_true', help='Fail unless host policy permits trusted LAN access')
     parser.add_argument('--ready-file', help='Private process readiness marker written after all sockets bind')
     parser.add_argument('--relay-source', action='append', default=[])
     parser.add_argument('--discover', action='store_true')
@@ -1101,7 +1158,14 @@ if __name__ == '__main__':
     parser.add_argument('--output')
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    if args.action == 'monitor':
+    if args.action == 'policy':
+        try:
+            if args.require_lan:
+                require_lan_permission()
+            print(f'LAN policy: {lan_policy()} ({lan_policy_path()})')
+        except ValueError as error:
+            parser.exit(1, f'{error}\n')
+    elif args.action == 'monitor':
         monitor_controller(args.root, args.directory, args.control_state)
     elif args.action == 'monitor-label':
         control = monitor_label(args.root, args.directory, args.control_state, args.project)
@@ -1119,7 +1183,7 @@ if __name__ == '__main__':
     elif args.action == 'doctor':
         sys.exit(doctor(args.root, args.directory))
     elif args.action == 'serve':
-        serve(args.directory, args.address, args.upstream, network=args.network, allow_public=args.allow_public, ready_file=args.ready_file)
+        serve(args.directory, args.address, args.upstream, network=args.network, ready_file=args.ready_file)
     else:
         relays = ['127.0.0.1/32', '::1/128'] + args.relay_source
         for source in relays:

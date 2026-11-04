@@ -17,13 +17,16 @@ Projects opt in with `project_email_settings()` from `mailroom.configuration`
 in their `backend/project.py`. `PROJECT_ACCOUNT_EMAIL` and `DEFAULT_FROM_EMAIL`
 default to `$@<MAILBOX_DOMAIN or DOMAIN>`. Explicit environment overrides win.
 The helper chooses Cloudflare HTTPS when `CLOUDFLARE_EMAIL_API_TOKEN` is set
-(also requires `CLOUDFLARE_ACCOUNT_ID`), Brevo HTTPS when `BREVO_API_KEY` is set,
-or the project's SMTP configuration. `EMAIL_BACKEND` can explicitly select a
+(also requires `CLOUDFLARE_ACCOUNT_ID`), Resend HTTPS when `RESEND_API_KEY` is set,
+Brevo HTTPS when `BREVO_API_KEY` is set, or the project's SMTP configuration.
+`EMAIL_BACKEND` can explicitly select a
 provider. Console, dummy and file backends leave messages queued instead of
 claiming actual delivery. The address identifies the project; it does not create
 provider accounts or supply credentials. Each project needs its own activated
-sending domain and provider credentials. Stripe accounts likewise retain their
-own API keys, webhook secrets, payment-method activation and payout setup.
+sending domain and provider credentials. Deployments that cannot use outbound
+SMTP set `EMAIL_DELIVERY_ALLOW_SMTP = False` in `backend/project.py`; the shared
+readiness check then accepts only configured HTTPS providers. Readiness checks
+configuration, not connectivity or successful delivery.
 
 During a domain move, `MAILBOX_LEGACY_DOMAINS` can contain a comma-separated list
 of previous domains accepted by the signed inbound endpoint. Outgoing messages
@@ -41,12 +44,12 @@ and MX records with the provider while preserving existing mail routes.
 ## Workers
 
 Local development workers are declared in each project’s `COMPOSE_SERVICES`.
-EDY and EliteCar run `mail-worker`; OldBook reuses its existing order worker.
+Use a dedicated mail worker or a project's existing application worker.
 On Railway or another host, use the same
 backend image and project database/email variables with the start command
 `python manage.py process_mail --loop`. Apply `python manage.py migrate mailroom`
-first. The worker needs no public port. OldBook's existing order worker already
-processes mailbox mail, so an extra production mail worker is unnecessary there.
+first. The worker needs no public port. If an existing worker already processes
+mailbox mail, no additional mail worker is needed.
 Database row locks serialize concurrent deliveries; retries use backoff and keep
 safe errors visible in admin. A crash after provider acceptance but before the DB
 commit can duplicate a message; exactly-once delivery requires provider idempotency.

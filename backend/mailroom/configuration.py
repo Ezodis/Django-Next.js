@@ -13,7 +13,7 @@ def project_email_settings(environ=None):
     """Opt in from project.py; read only this process's project environment.
 
     The account email is an identity, not an authentication credential. Provider
-    activation and unique Stripe/email keys still belong to each project's .env.
+    activation and email keys still belong to each project's .env.
     Explicit sender/backend overrides are preserved.
     """
     env = os.environ if environ is None else environ
@@ -23,6 +23,8 @@ def project_email_settings(environ=None):
     if not backend:
         if env.get('CLOUDFLARE_EMAIL_API_TOKEN'):
             backend = 'mailroom.backends.CloudflareEmailBackend'
+        elif env.get('RESEND_API_KEY'):
+            backend = 'mailroom.backends.ResendEmailBackend'
         elif env.get('BREVO_API_KEY'):
             backend = 'mailroom.backends.BrevoEmailBackend'
         elif env.get('EMAIL_HOST_USER') or env.get('DJANGO_DEBUG', '').lower() != 'true':
@@ -38,7 +40,7 @@ def project_email_settings(environ=None):
     }
     if values['EMAIL_USE_SSL']:
         values['EMAIL_USE_TLS'] = False
-    for name in ('CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_EMAIL_API_TOKEN', 'BREVO_API_KEY'):
+    for name in ('CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_EMAIL_API_TOKEN', 'BREVO_API_KEY', 'RESEND_API_KEY'):
         values[name] = env.get(name) or ''
     return values
 

@@ -33,7 +33,7 @@ class MailboxTests(TestCase):
                                 HTTP_X_MAIL_TO=recipient, HTTP_X_MAIL_SIGNATURE=signed)
 
     def test_catch_all_accepts_any_alias_and_deduplicates_retries(self):
-        for alias in ("bonn", "support", "any-name"):
+        for alias in ("person", "support", "any-name"):
             self.assertEqual(self.deliver(alias + "@current.example.test").status_code, 201)
             self.assertEqual(self.deliver(alias + "@current.example.test").status_code, 200)
         self.assertEqual(ReceivedEmail.objects.count(), 3)

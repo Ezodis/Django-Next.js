@@ -136,6 +136,20 @@ if [[ "${1:-}" == "sync" ]]; then
   exec python3 "$ROOT_DIR/backend/config/project_config.py" "$ROOT_DIR" sync "${@:2}"
 fi
 
+# Reject retired overrides before bootstrap or any network changes.
+for _dev_argument in "$@"; do
+  if [[ "$_dev_argument" == --allow-public ]]; then
+    echo '--allow-public has been removed; use computer-only HTTPS.' >&2
+    exit 1
+  fi
+done
+if [[ "${1:-}" == lan && "${2:-status}" == on ]]; then
+  python3 "$ROOT_DIR/backend/config/network.py" policy --require-lan || exit 1
+fi
+if [[ "${1:-}" == lan && "${2:-status}" == policy ]]; then
+  exec python3 "$ROOT_DIR/backend/config/network.py" policy
+fi
+
 if [[ "${1:-}" == lan && "${2:-status}" == setup ]]; then
   command -v python3 >/dev/null 2>&1 || { echo 'Python 3 is required for development HTTPS setup.'; exit 1; }
   if [[ "${3:-}" == --local ]]; then
@@ -376,18 +390,15 @@ _development_host() {
 }
 DEV_HOST="$(_development_host "$ROOT_DIR")" || exit 1
 _development_tls_mode() {
-  python3 - "$1" <<'DEVELOPMENT_TLS_MODE'
+  python3 - "$1" "${2:-}" <<'DEVELOPMENT_TLS_MODE'
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(sys.argv[1]) / 'backend'))
-from config.project_config import environment_values
-mode = environment_values(Path(sys.argv[1])).get('DEV_TLS_MODE', 'local').strip().lower()
-if mode not in ('local', 'public'):
-    raise SystemExit('DEV_TLS_MODE must be local or public.')
-print(mode)
+from config.project_config import development_tls_mode
+print(development_tls_mode(Path(sys.argv[1]), warn=sys.argv[2] == 'warn'))
 DEVELOPMENT_TLS_MODE
 }
-DEV_TLS_MODE="$(_development_tls_mode "$ROOT_DIR")" || exit 1
+DEV_TLS_MODE="$(_development_tls_mode "$ROOT_DIR" warn)" || exit 1
 # An explicit LAN activation first authorizes owned-domain DNS below. Its routes
 # must request public certificates even before the persisted mode is reread.
 if [[ "${1:-}" == lan && "${2:-}" == on ]]; then DEV_TLS_MODE=public; fi
@@ -971,9 +982,9 @@ run_setup() {
         # Retry with elevation if still not registered
         if [[ "$_wsl_has_ubuntu" == "false" ]]; then
           echo "   Retrying with elevated privileges (UAC prompt will appear)..."
-          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \
+          powershell.exe -NoProfile -NonInteractive -Command \
             "Start-Process wsl.exe -ArgumentList '--install -d Ubuntu --no-launch' \
-             -Verb RunAs -Wait -WindowStyle Normal" 2>/dev/null | tr -d '\r' || true
+             -Verb RunAs -Wait -WindowStyle Hidden" 2>/dev/null | tr -d '\r' || true
           _w=0
           while [[ $_w -lt 180 ]]; do
             wsl.exe -l --quiet 2>/dev/null | tr -d '\0\r\n ' | grep -qi "Ubuntu" \
@@ -1006,7 +1017,7 @@ run_setup() {
       if [[ "$_init_ok" == "false" ]]; then
         # Stuck on interactive first-launch prompt — set root as default user
         echo "   Setting Ubuntu default user to root (unattended mode)..."
-        powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \
+        powershell.exe -NoProfile -NonInteractive -Command \
           "ubuntu.exe config --default-user root" 2>/dev/null | tr -d '\r' || true
         wsl.exe --terminate Ubuntu 2>/dev/null || true
         sleep 3

@@ -18,6 +18,8 @@ from django.utils.module_loading import import_string
 def email_delivery_ready():
     backend = getattr(settings, "EMAIL_BACKEND", "")
     backend_class = import_string(backend) if backend else None
+    if backend_class and issubclass(backend_class, ResendEmailBackend):
+        return bool(getattr(settings, "RESEND_API_KEY", ""))
     if backend_class and issubclass(backend_class, BrevoEmailBackend):
         return bool(getattr(settings, "BREVO_API_KEY", ""))
     if backend_class and issubclass(backend_class, CloudflareEmailBackend):
@@ -25,8 +27,10 @@ def email_delivery_ready():
             re.fullmatch(r"[a-fA-F0-9]{32}", getattr(settings, "CLOUDFLARE_ACCOUNT_ID", ""))
             and getattr(settings, "CLOUDFLARE_EMAIL_API_TOKEN", "")
         )
+    # The project owns restrictions imposed by its deployment or business flow.
     return bool(
-        backend == "django.core.mail.backends.smtp.EmailBackend"
+        getattr(settings, "EMAIL_DELIVERY_ALLOW_SMTP", True)
+        and backend == "django.core.mail.backends.smtp.EmailBackend"
         and getattr(settings, "EMAIL_HOST_USER", "")
         and getattr(settings, "EMAIL_HOST_PASSWORD", "")
     )
@@ -99,6 +103,64 @@ class CloudflareEmailBackend(BaseEmailBackend):
                 if not self.fail_silently:
                     # Provider errors can include message data; retain a safe retry error.
                     raise RuntimeError("Cloudflare email delivery failed; check domain verification and sending credentials.") from None
+        return sent
+
+
+class ResendEmailBackend(BaseEmailBackend):
+    """Send transactional mail through Resend's HTTPS API."""
+
+    def send_messages(self, email_messages):
+        sent = 0
+        for message in email_messages or []:
+            if not message.recipients():
+                continue
+            try:
+                if not getattr(settings, "RESEND_API_KEY", ""):
+                    raise RuntimeError("Resend email API key is required.")
+                message.message()
+                payload = {
+                    "from": message.from_email,
+                    "to": [address for _, address in getaddresses(message.to)],
+                    "subject": message.subject,
+                    "text": message.body,
+                }
+                for field in ("cc", "bcc"):
+                    addresses = getattr(message, field, [])
+                    if addresses:
+                        payload[field] = [address for _, address in getaddresses(addresses)]
+                if message.reply_to:
+                    payload["reply_to"] = message.reply_to
+                if message.extra_headers:
+                    payload["headers"] = message.extra_headers
+                if message.attachments:
+                    payload["attachments"] = attachments(message)
+                for content, mime_type in getattr(message, "alternatives", []):
+                    if mime_type == "text/html":
+                        payload["html"] = content
+                if message.content_subtype == "html":
+                    payload["html"] = message.body
+                    payload.pop("text", None)
+                request = Request(
+                    "https://api.resend.com/emails",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Authorization": "Bearer " + settings.RESEND_API_KEY,
+                        "Content-Type": "application/json",
+                        # Resend rejects unidentified/default urllib clients with 403/1010.
+                        "User-Agent": "Django-Mailroom/1.0",
+                    },
+                    method="POST",
+                )
+                with urlopen(request, timeout=getattr(settings, "EMAIL_TIMEOUT", 20)) as response:
+                    result = json.load(response)
+                if not result.get("id"):
+                    raise RuntimeError("Resend did not accept this message.")
+                sent += 1
+            except Exception:
+                if not self.fail_silently:
+                    raise RuntimeError(
+                        "Resend email delivery failed; check domain verification and sending quota."
+                    ) from None
         return sent
 
 

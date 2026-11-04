@@ -66,6 +66,8 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   in `backend/project.py` (command name to function name). Implement those
   functions there; shared launchers discover the mapping without importing the
   project and execute a handler only when that command is explicitly requested.
+  List native Windows-only handlers in literal DEV_WINDOWS_COMMANDS; the Windows
+  entrypoint runs them directly without WSL bootstrap or sign-in registration.
 - Keep business logic, models, views, migrations, and management commands in
   their existing Django apps. Use app management commands for app startup hooks.
 - Declare optional application workers and drive mounts only in the project's
@@ -94,9 +96,10 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
 - `./dev.sh sync --dry-run` previews pulling shared architecture from the template.
   `./dev.sh sync push --dry-run` previews copying shared changes back to the local
   template checkout. Review the preview before applying a sync operation.
-- `Django-Next.js` is the template for the projects maintained in this workspace.
-  Sync configuration belongs in `backend/project.py` or the root `.env`, rather
-  than a hardcoded repository name in shared dev scripts.
+- The template repository is selected by `SYNC_TEMPLATE_REPO` in
+  `backend/project.py` or the root `.env`; shared files must not name a particular
+  checkout, owner, project, domain or account. Keep project policy in that
+  project's configuration and reusable mechanisms in the template.
 - Do not claim a structural update has reached other projects or GitHub unless
   it was actually synchronized or published. Report any remaining propagation
   or runtime verification work.
@@ -108,19 +111,27 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   Keep the computer hosts override at loopback and publish DNS-only A records
   to the selected LAN IPv4. Do not expose production traffic through development.
 - `dev.sh lan on|off|status` and `dev.ps1 lan on|off|status` control only this
-  project's ingress. LAN defaults on for running projects on trusted networks;
-  remember explicit global/per-project off choices. Tunnel state is independent. Revoking access
+  project's ingress. LAN defaults off. A host-wide policy defaults to computer-only
+  access, including when the policy file is absent or invalid. Terminal buttons,
+  remembered choices and direct commands cannot override it. Tunnel state is
+  independent; do not activate tunnels to work around endpoint restrictions. Revoking access
   must also close existing relay connections. Never share application ports.
 - The monitor's Infrastructure LAN button controls running checkouts in its workspace;
   each project's LAN button controls only that project. Red/green reflects actual
   sharing, not the saved preference. Startup defaults never bypass network trust
-  checks or repeatedly request elevation after a failure. An explicit Windows
-  LAN toggle may start a Public-network session using --allow-public: retain
-  the Public profile, bind only the selected interface/address, scope firewall
-  rules to that interface's exact subnet and the Python listener, and expose
-  only project HTTPS. Never change the Windows network category or
-  enable Public sharing from remembered/startup preferences. Pin the session
-  to interface, profile, prefix and gateway; revoke on network change.
+  checks or repeatedly request elevation after a failure. Public-network sharing
+  and --allow-public are prohibited, including explicit terminal toggles. Never
+  change the network category or disable existing firewall block rules. On a
+  permitted host, bind only the selected trusted interface/address and scope
+  HTTPS firewall rules to its exact subnet, Python listener, and Private/Domain
+  profiles. Pin the session to interface, profile, prefix and gateway; revoke on
+  network change. Host policy lives beside the private DNS credential as
+  lan-policy.json: {"mode":"local-only"} is the default. Only after the device's
+  owner/IT permits inbound sharing may it be provisioned as {"mode":"trusted-lan"}.
+  Windows and WSL each enforce their own policy; both must permit LAN to share.
+  Keep this company laptop local-only. Use `dev.ps1 lan policy` or
+  `dev.sh lan policy` to inspect the effective mode. This application safeguard
+  is not an OS security boundary or evidence of company approval.
   Controls are handled inside the terminal: Tab/arrows select, Space/Enter toggle,
   Ctrl+C exits, and VT mouse clicks activate the displayed hit regions. The
   Infrastructure button is the master control; do not bind letter keys L or Q. Keep
@@ -141,6 +152,9 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   `DEV_TLS_MODE=public` uses public DNS and ACME DNS-01. Local mode never claims
   profile-free phone access. Never require phone profiles, mDNS, certificate
   warning bypasses, or silently substitute a local certificate in public mode.
+  A project may explicitly opt into computer-only fallback when the host token
+  is absent with literal `DEV_TLS_ALLOW_LOCAL_FALLBACK = True` in `project.py`.
+  Announce that fallback; it must never claim trusted LAN access is ready.
   Keep the Cloudflare DNS credential outside Git in the private host credential
   file. Scope Zone Read and DNS Edit to authorized domains; new domains require
   matching authorization. Only update exact owned dev A records, never production
@@ -162,11 +176,22 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   blocks traffic but does not stop the relay; only a readable, empty state does.
   Tolerate several failed network checks before revoking, but revoke a Public
   network at once. Follow the WSL address when it changes. Write the firewall
-  rule for the real interpreter image (Store Python runs from WindowsApps), clear
-  only Windows "Query User" block rules for that image, and elevate only when the
+  rule for the real interpreter image (Store Python runs from WindowsApps), preserve
+  all existing block rules, and elevate only when the
   rule fingerprint changes. After a network change the monitor re-applies saved
-  preferences once. `dev.ps1 lan doctor` checks state, relay, public DNS, WSL
+  preferences once only where host policy permits sharing. `dev.ps1 lan doctor` checks state, relay, public DNS, WSL
   upstream, firewall and end-to-end HTTPS through the LAN address.
+
+## Windows on-demand helpers
+
+- Never register hidden PowerShell logon entries, startup tasks or services for
+  development helpers. Do not use ExecutionPolicy Bypass or disable monitoring.
+- Android starts only through its explicit project command or native launcher.
+  On-demand helpers may run without a terminal window, with a named process,
+  diagnostic logs and a stop command. Preserve the in-app terminal features.
+- Respect configured script policy. A publisher requires an approved code-signing
+  certificate and review; do not create a self-trusted certificate or claim that
+  signing grants permission for inbound access or automatic startup.
 
 ## Backup and recovery
 
@@ -259,9 +284,16 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   retaining project packages, identity, routes, environment files and custom
   commands. Regenerate the project's web lockfile with `npm install` after a
   manual sync; lockfiles are never copied across different projects.
-- Dependabot checks npm, Python, container images and Actions weekly. Major
-  upgrades are separate pull requests. Prefer the latest compatible patched
-  versions and supported runtimes; do not override peer dependency conflicts.
+- Dependency maintenance is manual. Do not add Dependabot schedules, automatic
+  update PRs, startup upgrades or automatic update/merge workflow triggers.
+  When requested, check current releases from the official registries, update
+  the template's shared pins to the latest compatible stable versions, refresh
+  each project's lockfile and validate before syncing. Use `npm outdated` in
+  `frontend/web` and `python -m pip list --outdated` in the project's Python
+  environment to audit installed packages. Review runtime, container and Actions
+  releases too. Keep reproducible pins; never replace them with floating
+  `latest` tags or override peer dependency conflicts. Major upgrades require
+  application regression checks, including Python/ML compatibility.
 - Shared maintenance workflows are manual-only: no schedules, push/PR triggers,
   or chained workflow triggers that consume hosted runner time automatically.
   Use local checks and `dev.sh sync` by default. Vercel and Railway retain native
@@ -288,7 +320,7 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   dependency consistency, Django system checks and shared dependency-sync tests.
   Run each project's application regression suite before major framework updates;
   shared checks do not establish full application coverage.
-- To enable checked automatic merging, set repository variable
+- To enable the manually dispatched checked-merge workflow, set repository variable
   `DEPENDENCY_AUTO_MERGE=true` and enable squash merging. The workflow enforces
   successful `frontend` and `backend` jobs on the current PR commit and requires
   the current default branch to be included before merging. This also works on
