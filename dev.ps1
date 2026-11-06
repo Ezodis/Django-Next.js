@@ -1260,7 +1260,7 @@ sync_workspace() {
     --exclude '.cxx/' --exclude 'Pods/' --exclude 'build/' --exclude 'dist/' \
     --exclude '.venv/' --exclude 'venv/' --exclude '__pycache__/' --exclude '*.pyc' \
     --exclude 'backend/media/' --exclude 'backend/config/staticfiles/' \
-    --exclude 'backend/backup/snapshot_*' --exclude 'backend/backup/backup_*' \
+    --exclude 'backend/backup/snapshot_*' --exclude 'backend/backup/backup_*.sql*' --exclude 'backend/backup/backup_*.tar*' \
     --exclude 'backend/backup/.backup-*' --exclude 'backend/backup/*.log' \
     --exclude '/.env' --exclude '/.dev-sync.lock' --exclude '/.dev-sync.pid' \
     "`$SOURCE_DIR/" "`$WORKSPACE_DIR/"

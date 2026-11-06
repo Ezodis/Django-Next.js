@@ -1,6 +1,7 @@
 # Runtime archives are private. Publication uses the encrypted backup branch.
 /snapshot_*
-/backup_*
+/backup_*.sql*
+/backup_*.tar*
 /.backup-*
 /*.log
 /.db_restored
