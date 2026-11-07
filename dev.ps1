@@ -392,6 +392,17 @@ $ROOT_DIR = $PSScriptRoot
 if (-not $ROOT_DIR -or $ROOT_DIR -eq '') {
     $ROOT_DIR = Split-Path -Parent (Resolve-Path $MyInvocation.MyCommand.Path)
 }
+# dev.yml bind-mounts frontend/mobile/shared; keep it present in checkouts
+# without mobile apps so mirrors carry it and the web container can start.
+New-Item -ItemType Directory -Force -Path (Join-Path $ROOT_DIR 'frontend\mobile\shared') | Out-Null
+
+# EAS cloud builds and store checks run natively against the original checkout.
+if ($DevArgs.Count -gt 0 -and $DevArgs[0] -eq 'store') {
+    $releasePython = Get-Command python.exe -ErrorAction Stop
+    $releaseArgs = @($DevArgs | Select-Object -Skip 1)
+    & $releasePython.Source (Join-Path $ROOT_DIR 'backend\config\mobile_release.py') $ROOT_DIR @releaseArgs
+    exit $LASTEXITCODE
+}
 
 # Switching ingress reuses the running workspace. It must not restart the
 # source copier, certificate setup or dependency bootstrap inside a monitor action.

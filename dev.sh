@@ -25,7 +25,9 @@
 # ║      watchos requires local builds on macOS; no Metro runtime or EAS
 # ║    ./dev.sh build-all [android|ios] [development|production] [testflight]   ║
 # ║                                    Build all mobile apps in parallel        ║
-# ║                                    Add 'testflight' to auto-submit to TF    ║
+# ║                                    Add 'testflight' for standalone iOS      ║
+#   ./dev.sh store list|prepare|check|build|status|submit [APP] [ios|android]
+#   ./dev.sh store submit APP ios --id EAS_BUILD_ID   Upload verified archive
 # ║    ./dev.sh release [android|ios] setup     Generate keystores/credentials  ║
 # ║    ./dev.sh release [android|ios] <local>   Build AABs/IPAs (EAS default)   ║
 # ║                                                                             ║
@@ -89,6 +91,11 @@
 set -eo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Store operations use the source checkout and never start local infrastructure.
+if [[ "${1:-}" == "store" ]]; then
+  exec python3 "$ROOT_DIR/backend/config/mobile_release.py" "$ROOT_DIR" "${@:2}"
+fi
 
 # Keep the detached Windows-to-WSL mirror worker in the launcher itself.
 if [[ "${1:-}" == "_workspace-sync" ]]; then
@@ -227,6 +234,9 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 COMPOSE_FILE="$ROOT_DIR/dev.yml"
 MOBILE_DIR="$ROOT_DIR/frontend/mobile"
+# dev.yml bind-mounts frontend/mobile/shared; projects without mobile apps
+# still need the directory or the web container cannot start.
+mkdir -p "$MOBILE_DIR/shared"
 
 # Always declare MOBILE_APPS so it exists as an array
 MOBILE_APPS=()
@@ -7734,6 +7744,23 @@ _do_eas_build() {
   local eas_profile="development"
   local is_simulator=false
 
+  # Store releases share validation, production environment and artifact selection.
+  local release_profile release_platform
+  for release_profile in "${@:3}"; do
+    case "$release_profile" in
+      production|testflight|playstore|development-testflight)
+        [[ "$release_profile" == development-testflight ]] && release_profile=testflight
+        for release_platform in ios android; do
+          if [[ "$build_platform" == all || "$build_platform" == "$release_platform" ]]; then
+            python3 "$ROOT_DIR/backend/config/mobile_release.py" "$ROOT_DIR" build "${build_app##*/}" "$release_platform" --profile "$release_profile" || return $?
+          fi
+        done
+        [[ "$build_platform" == all || "$build_platform" == ios || "$build_platform" == android ]] || { echo 'Store platform must be ios or android.' >&2; return 1; }
+        return 0
+        ;;
+    esac
+  done
+
   # Strip optional "project/" prefix from app name (e.g. "myproject/myapp" → "myapp")
   if [[ "$build_app" == */* ]]; then
     build_app="${build_app##*/}"
@@ -8242,9 +8269,9 @@ _do_build() {
       local)
         build_local=true
         ;;
-      production)
+      production|testflight|playstore|development-testflight)
         build_production=true
-        _extra_args+=("production")
+        _extra_args+=("$_arg")
         ;;
       android)
         build_platform="android"
@@ -8258,6 +8285,13 @@ _do_build() {
         ;;
     esac
   done
+
+  if [[ -n "$build_app" && "$build_production" == true && "$build_local" == true ]]; then
+    local store_profile="${_extra_args[0]}"
+    [[ "$store_profile" == development-testflight ]] && store_profile=testflight
+    python3 "$ROOT_DIR/backend/config/mobile_release.py" "$ROOT_DIR" build "$build_app" "$build_platform" --profile "$store_profile" --local
+    return $?
+  fi
 
   if [[ -n "$build_app" && "$build_local" == true ]]; then
     # ── Native local build ────────────────────────────────────────────────
@@ -8724,21 +8758,11 @@ case "$CMD" in
     BUILD_PROFILE="${3:-development}"
     TESTFLIGHT_FLAG="${4:-}"
 
-    # If testflight flag is provided, use development-testflight profile
+    # TestFlight uses the same standalone production app as the App Store.
     if [[ "$TESTFLIGHT_FLAG" == "testflight" ]]; then
-      if [[ "$BUILD_PROFILE" == "development" ]]; then
-        BUILD_PROFILE="development-testflight"
-        echo ""
-        echo "📱 TestFlight mode enabled: using development-testflight profile"
-        echo "   • Development client with Metro hot reload"
-        echo "   • Auto-submit to TestFlight after build"
-        echo ""
-      else
-        echo ""
-        echo "⚠️  TestFlight flag only works with development profile"
-        echo "   Using $BUILD_PROFILE profile instead"
-        echo ""
-      fi
+      [[ "$BUILD_PLATFORM" == ios ]] || { echo 'TestFlight requires ios.' >&2; exit 1; }
+      BUILD_PROFILE="testflight"
+      echo 'Building standalone TestFlight archives. Upload each verified build with store submit --id.'
     fi
 
     echo ""
@@ -9392,251 +9416,22 @@ try {
     ;;
 
   release)
-    RELEASE_PLATFORM="${2:-android}"  # Default to android
-    RELEASE_SETUP="false"
-    RELEASE_LOCAL="false"
-
-    # Check for 'setup' and 'local' flags
-    for arg in "$@"; do
-      if [[ "$arg" == "setup" ]]; then
-        RELEASE_SETUP="true"
-      elif [[ "$arg" == "local" ]]; then
-        RELEASE_LOCAL="true"
-      fi
+    RELEASE_PLATFORM="${2:-ios}"
+    [[ "$RELEASE_PLATFORM" == ios || "$RELEASE_PLATFORM" == android ]] || { echo 'Release platform must be ios or android.' >&2; exit 1; }
+    RELEASE_ACTION=build
+    RELEASE_ARGS=()
+    for arg in "${@:3}"; do
+      case "$arg" in
+        setup) RELEASE_ACTION=credentials ;;
+        local) RELEASE_ARGS+=(--local) ;;
+        *) echo "Unknown release option: $arg" >&2; exit 1 ;;
+      esac
     done
-
-    # Handle setup mode for iOS (interactive credential setup)
-    if [[ "$RELEASE_SETUP" == "true" && "$RELEASE_PLATFORM" == "ios" ]]; then
-      echo ""
-      echo "🔐 iOS Credential Setup (Interactive)"
-      echo "   This will configure iOS certificates and provisioning profiles"
-      echo ""
-
-      discover_apps
-      for folder in "${MOBILE_APPS[@]}"; do
-        slug=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-        app_dir="$MOBILE_DIR/$folder"
-
-        echo "========================================="
-        echo "📱 Setting up iOS credentials: $folder"
-        echo "========================================="
-        echo ""
-
-        cd "$app_dir" || exit 1
-        eas build --platform ios --profile production
-        echo ""
-      done
-
-      echo "✅ iOS credential setup complete!"
-      exit 0
-    fi
-
-    # Handle setup mode for Android (keystore generation)
-    if [[ "$RELEASE_SETUP" == "true" && "$RELEASE_PLATFORM" == "android" ]]; then
-      SETUP_APP="${3:-}"
-
-      # Setup Java environment
-      _setup_java_env || exit 1
-
-      # Load keystore passwords from .env
-      if [[ -f "$ROOT_DIR/.env" ]]; then
-        KEYSTORE_PASS=$(grep "^ANDROID_KEYSTORE_PASSWORD=" "$ROOT_DIR/.env" | cut -d'=' -f2 || echo "android")
-        KEY_PASS=$(grep "^ANDROID_KEY_PASSWORD=" "$ROOT_DIR/.env" | cut -d'=' -f2 || echo "android")
-      else
-        echo "⚠️  .env file not found. Using default passwords."
-        KEYSTORE_PASS="android"
-        KEY_PASS="android"
-      fi
-
-      discover_apps
-      for folder in "${MOBILE_APPS[@]}"; do
-        if [[ -z "$SETUP_APP" ]] || echo "$folder" | grep -qi "$SETUP_APP"; then
-          slug=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-
-          # Read package name from app.config.js or app.json
-          app_config_js="$MOBILE_DIR/$folder/app.config.js"
-          app_json="$MOBILE_DIR/$folder/app.json"
-          package_name=""
-
-          if [[ -f "$app_config_js" ]]; then
-            # Extract package name from app.config.js
-            package_name=$(node -e "
-              const config = require('$app_config_js');
-              const pkg = config.expo?.android?.package || config.android?.package || '';
-              console.log(pkg);
-            " 2>/dev/null || echo "")
-          fi
-
-          if [[ -z "$package_name" && -f "$app_json" ]]; then
-            # Extract package name from app.json
-            package_name=$(node -e "
-              const config = require('$app_json');
-              const pkg = config.expo?.android?.package || config.android?.package || '';
-              console.log(pkg);
-            " 2>/dev/null || echo "")
-          fi
-
-          # Fallback to slug-based package name
-          if [[ -z "$package_name" ]]; then
-            package_name="com.${slug//-/}"
-          fi
-
-          keystore_path="$MOBILE_DIR/$folder/android/app/${slug}-release.keystore"
-          props_file="$MOBILE_DIR/$folder/android/gradle.properties"
-
-          if [[ -f "$keystore_path" ]]; then
-            echo "⚠️  Keystore already exists for '$folder'"
-            echo "   Package: $package_name"
-            echo "   Keystore: $keystore_path"
-            echo ""
-            echo "   To regenerate, delete the keystore first:"
-            echo "   rm \"$keystore_path\""
-            continue
-          fi
-
-          echo "🔑 Generating release keystore for '$folder'..."
-          echo "   Package: $package_name"
-          echo "   Keystore: ${slug}-release.keystore"
-          echo ""
-
-          keytool -genkey -v \
-            -storetype PKCS12 \
-            -keystore "$keystore_path" \
-            -alias "${slug}-release" \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass "$KEYSTORE_PASS" \
-            -keypass "$KEY_PASS" \
-            -dname "CN=$folder, OU=Mobile, O=$PROJECT_DISPLAY_NAME, L=Unknown, ST=Unknown, C=US"
-
-          echo ""
-          echo "✅ Keystore created for '$folder'"
-          echo ""
-          echo "📋 Certificate Fingerprints:"
-          echo ""
-
-          # Get SHA-1 fingerprint
-          SHA1=$(keytool -list -v -keystore "$keystore_path" -alias "${slug}-release" -storepass "$KEYSTORE_PASS" 2>/dev/null | grep "SHA1:" | sed 's/.*SHA1: //' || echo "")
-
-          # Get SHA-256 fingerprint
-          SHA256=$(keytool -list -v -keystore "$keystore_path" -alias "${slug}-release" -storepass "$KEYSTORE_PASS" 2>/dev/null | grep "SHA256:" | sed 's/.*SHA256: //' || echo "")
-
-          if [[ -n "$SHA1" ]]; then
-            echo "   SHA-1:   $SHA1"
-          fi
-          if [[ -n "$SHA256" ]]; then
-            echo "   SHA-256: $SHA256"
-          fi
-
-          echo ""
-          echo "   Location: $keystore_path"
-          echo ""
-
-          # Update gradle.properties
-          { echo ""; echo "# Release signing"
-            echo "RELEASE_STORE_FILE=${slug}-release.keystore"
-            echo "RELEASE_KEY_ALIAS=${slug}-release"
-            echo "RELEASE_STORE_PASSWORD=$KEYSTORE_PASS"
-            echo "RELEASE_KEY_PASSWORD=$KEY_PASS"
-          } >> "$props_file"
-        fi
-      done
-      exit 0
-    fi
-
-    # Cloud build (default) - uses EAS with production profile
-    if [[ "$RELEASE_LOCAL" == "false" ]]; then
-      discover_apps
-      [[ ${#MOBILE_APPS[@]} -eq 0 ]] && echo "⚠️  No mobile apps found." && exit 1
-
-      echo ""
-      echo "☁️  Building release for $RELEASE_PLATFORM in the cloud (EAS)..."
-      echo "   Use 'local' flag to build locally instead"
-      echo ""
-
-      for folder in "${MOBILE_APPS[@]}"; do
-        slug=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-
-        # Reuse _do_eas_build so project linking is handled automatically
-        _do_eas_build "$slug" "$RELEASE_PLATFORM" "production"
-      done
-
-      echo ""
-      echo "✅ Cloud builds submitted!"
-      echo "   Download from: https://expo.dev"
-      exit 0
-    fi
-
-    # Local build - uses Gradle (Android only)
-    if [[ "$RELEASE_PLATFORM" != "android" ]]; then
-      echo "❌ Local builds are only supported for Android."
-      echo "   For iOS, use cloud builds: ./dev.sh release ios"
-      exit 1
-    fi
-
     discover_apps
-    [[ ${#MOBILE_APPS[@]} -eq 0 ]] && echo "⚠️  No mobile apps found." && exit 1
-
-    # Setup Java environment for Gradle
-    _setup_java_env || exit 1
-
-    ANDROID_HOME="${ANDROID_HOME:-$(_default_android_sdk)}"
-    OUTPUT_DIR="$ROOT_DIR/frontend/mobile/builds"
-    mkdir -p "$OUTPUT_DIR"
-    failed=()
-
-    echo ""
-    echo "🖥️  Building release AAB locally (Gradle)..."
-    echo ""
-
+    [[ ${#MOBILE_APPS[@]} -gt 0 ]] || { echo 'No mobile apps found.' >&2; exit 1; }
     for folder in "${MOBILE_APPS[@]}"; do
-      android_dir="$MOBILE_DIR/$folder/android"
-      slug=$(echo "$folder" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-
-      # Ensure android directory exists and is properly configured
-      if [[ ! -d "$android_dir" ]] || [[ ! -f "$android_dir/gradlew" ]]; then
-        echo "📦 Preparing android directory for '$folder'..."
-        _ensure_android_dir "$folder" "$android_dir"
-      fi
-
-      # Verify android directory was created successfully
-      if [[ ! -f "$android_dir/gradlew" ]]; then
-        echo "❌ Failed to prepare android directory for '$folder'"
-        failed+=("$folder")
-        continue
-      fi
-
-      echo ""
-      echo "========================================="
-      echo "📦 Building release AAB: $folder"
-      echo "========================================="
-      echo "sdk.dir=$ANDROID_HOME" > "$android_dir/local.properties"
-
-      # Load every public project variable and apply *_PRODUCTION overrides.
-      # Project integrations require no names or credentials in this template.
-      if ! ANDROID_HOME="$ANDROID_HOME" python3 "$ROOT_DIR/backend/config/project_config.py" \
-          "$ROOT_DIR" run-build production "$android_dir/gradlew" -p "$android_dir" bundleRelease 2>&1; then
-        echo "❌ Build failed for '$folder'"
-        failed+=("$folder")
-        continue
-      fi
-      aab="$android_dir/app/build/outputs/bundle/release/app-release.aab"
-      if [[ -f "$aab" ]]; then
-        cp "$aab" "$OUTPUT_DIR/${slug}-release.aab"
-        echo "✅ $folder → frontend/mobile/builds/${slug}-release.aab"
-      else
-        echo "❌ Build failed for '$folder'"
-        failed+=("$folder")
-      fi
+      python3 "$ROOT_DIR/backend/config/mobile_release.py" "$ROOT_DIR" "$RELEASE_ACTION" "$folder" "$RELEASE_PLATFORM" "${RELEASE_ARGS[@]}" || exit $?
     done
-
-    echo ""
-    if [[ ${#failed[@]} -eq 0 ]]; then
-      echo "🎉 All builds complete! AABs in: frontend/mobile/builds/"
-      ls -lh "$OUTPUT_DIR"/*.aab 2>/dev/null
-    else
-      echo "❌ Failed: ${failed[*]}"
-      exit 1
-    fi
     ;;
 
   run)
