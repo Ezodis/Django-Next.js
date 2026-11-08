@@ -104,6 +104,45 @@ otherwise. Preserve unrelated local changes and work within the requested scope.
   it was actually synchronized or published. Report any remaining propagation
   or runtime verification work.
 
+## Mobile store releases
+
+- `dev.sh store` / `dev.ps1 store` runs directly from the source checkout without
+  starting Metro, containers, tunnels or LAN sharing. `store list` discovers apps.
+- `store prepare APP --dry-run` previews production-profile preparation; then
+  `store prepare APP` updates only that app's `eas.json`, preserving the development
+  profiles and moving an old internal production profile to `preview`.
+- Public production overrides come from root `.env` keys ending `_PRODUCTION`.
+  Preparation snapshots these public values into app-owned EAS build profiles so
+  cloud workers receive the same settings. Never copy secrets into `EXPO_PUBLIC_*`.
+  Existing explicit production URLs are retained; development URLs are never used.
+- `store check APP` validates resolved production config. Run each app's production
+  Expo export for both platforms, then test a signed build on actual devices.
+  A successful config check/export is not proof of signing or store approval.
+- `store build APP ios --profile testflight` creates a standalone App Store archive;
+  `store build APP android --profile playstore` creates a signed AAB. Cloud builds
+  return an exact build ID; `store status APP ios --id ID` checks its progress.
+  Build numbers use EAS remote auto-increment. Existing apps should initialize
+  remote versions above their last uploaded build via `eas build:version:set`.
+- Configure each app's own real `submit.production.ios.ascAppId` in `eas.json` and
+  Apple signing/submit credentials with `store credentials APP ios` in an
+  interactive terminal signed into that app's Expo account. Configure its own Google Play app,
+  signing key and service account in EAS. Never reuse a different project's IDs,
+  credentials or test groups. Store private keys outside the repository.
+- `store submit APP ios --id ID` verifies the finished build's identity before
+  uploading to App Store Connect/TestFlight. Apple processing, internal groups
+  and external beta review are managed in App Store Connect. The same production
+  build can later be selected for App Review with metadata, screenshots, privacy
+  disclosures and review access; an upload does not publish an App Store release.
+- `store submit APP android --id ID` uploads an internal-testing draft. Complete
+  Play Console setup/review and roll out to testers there. Use the same build ID
+  with `--submit-profile android-production` for a production draft, or promote
+  the tested release in Play Console; public rollout remains an explicit step.
+- Store tooling uses a pinned EAS CLI. Keep app manifests, native integrations,
+  store identity and EAS profiles project-owned. Template sync distributes the
+  release mechanism, not another app's configuration. Default Git ignore rules
+  must exclude local native folders, credentials and development artifacts from
+  the cloud archive; an `.easignore` override must preserve those exclusions.
+
 ## Local network access
 
 - Configured owned domains use `dev.<project-domain>` and publicly trusted TLS. The same

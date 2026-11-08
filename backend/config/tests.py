@@ -1298,6 +1298,153 @@ class ProjectEnvironmentTestCase(unittest.TestCase):
         self.assertFalse(is_shared('backend/project.py'))
 
 
+class MobileStoreReleaseTestCase(unittest.TestCase):
+    def setUp(self):
+        from . import mobile_release
+        self.release = mobile_release
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.app = self.root / 'frontend/mobile/Example'
+        self.app.mkdir(parents=True)
+        (self.app / 'package.json').write_text('{}')
+        self.path = self.app / 'eas.json'
+        self.path.write_text(json.dumps({
+            'build': {
+                'development': {'developmentClient': True, 'distribution': 'internal'},
+                'production': {'distribution': 'internal', 'env': {'EXPO_PUBLIC_API_URL': 'https://api.example.com'},
+                               'ios': {'enterpriseProvisioning': 'adhoc'}, 'android': {'buildType': 'apk'}},
+                'development-testflight': {'developmentClient': True},
+            },
+            'submit': {'production': {'ios': {'ascAppId': '12345', 'appleTeamId': 'TEAM123456'}}},
+        }))
+        self.config = {'version': '1.0.0', 'ios': {'bundleIdentifier': 'com.example.app'},
+                       'android': {'package': 'com.example.app'},
+                       'extra': {'env': 'production', 'apiUrl': 'https://api.example.com',
+                                 'eas': {'projectId': '11111111-1111-1111-1111-111111111111'}}}
+
+    def test_preparation_keeps_development_and_identity_and_is_idempotent(self):
+        before = self.path.read_bytes()
+        self.release.prepare(self.root, self.app, dry_run=True)
+        self.assertEqual(self.path.read_bytes(), before)
+        data = self.release.prepare(self.root, self.app)
+        self.assertTrue(data['build']['development']['developmentClient'])
+        self.assertEqual(data['build']['preview']['distribution'], 'internal')
+        self.assertEqual(data['submit']['production']['ios']['ascAppId'], '12345')
+        for name in ('production', 'testflight', 'playstore', 'development-testflight'):
+            built = self.release.profile(data, name)
+            self.assertFalse(built['developmentClient'])
+            self.assertEqual(built['android']['buildType'], 'app-bundle')
+            self.assertNotIn('enterpriseProvisioning', built['ios'])
+        before = self.path.read_bytes()
+        self.release.prepare(self.root, self.app)
+        self.assertEqual(before, self.path.read_bytes())
+
+    def test_only_production_urls_can_replace_release_endpoints(self):
+        (self.root / '.env').write_text('EXPO_PUBLIC_API_URL=http://localhost:8000/api\nPRIVATE_KEY=secret\n')
+        public = self.release.public_environment(self.root, {'EXPO_PUBLIC_API_URL': 'https://api.example.com'})
+        self.assertEqual(public['EXPO_PUBLIC_API_URL'], 'https://api.example.com')
+        self.assertNotIn('PRIVATE_KEY', public)
+        for url in ('http://example.com', 'https://localhost', 'https://192.168.1.2',
+                    'https://dev.example.com', 'https://host.local', 'https://user:pass@example.com'):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                self.release.validate_url(url, 'https')
+        (self.root / '.env').write_text('EXPO_PUBLIC_API_URL_PRODUCTION=https://new.example.com\n')
+        public = self.release.public_environment(self.root, public)
+        self.assertEqual(public['EXPO_PUBLIC_API_URL'], 'https://new.example.com')
+
+    def test_resolved_config_and_environment_are_checked_before_build(self):
+        self.release.prepare(self.root, self.app)
+        with patch.object(self.release, 'expo_config', return_value=self.config):
+            self.release.check(self.root, self.app)
+            self.config['extra']['env'] = 'development'
+            with self.assertRaisesRegex(ValueError, 'development environment'):
+                self.release.check(self.root, self.app)
+            self.config['extra']['env'] = 'production'
+            (self.root / '.env').write_text('EXPO_PUBLIC_API_URL_PRODUCTION=https://new.example.com\n')
+            with self.assertRaisesRegex(ValueError, 'Root production environment changed'):
+                self.release.check(self.root, self.app)
+
+    def test_platform_overrides_cannot_reenable_metro_or_apk(self):
+        data = self.release.prepare(self.root, self.app)
+        for key, value in [('developmentClient', True), ('gradleCommand', ':app:assembleDebug'),
+                           ('buildType', 'apk'), ('withoutCredentials', True),
+                           ('env', {'EXPO_PUBLIC_ENV': 'development'}), ('autoIncrement', False)]:
+            import copy
+            bad = copy.deepcopy(data)
+            bad['build']['production']['android'][key] = value
+            self.path.write_text(json.dumps(bad))
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.release.check(self.root, self.app)
+
+    def test_wrong_or_unfinished_build_is_never_submitted(self):
+        build_id = '22222222-2222-2222-2222-222222222222'
+        record = {'id': build_id, 'status': 'FINISHED', 'platform': 'IOS', 'distribution': 'STORE',
+                  'appIdentifier': 'com.example.app', 'app': {'id': self.config['extra']['eas']['projectId']},
+                  'buildProfile': 'production', 'appBuildVersion': '12', 'isForIosSimulator': False}
+        self.release.validate_build(record, self.config, 'ios', build_id)
+        for key, value in [('status', 'IN_PROGRESS'), ('platform', 'ANDROID'), ('distribution', 'INTERNAL'),
+                           ('appIdentifier', 'com.other.app'), ('app', {'id': 'different'}),
+                           ('buildProfile', 'development'), ('isForIosSimulator', True), ('appBuildVersion', None)]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.release.validate_build({**record, key: value}, self.config, 'ios', build_id)
+
+    def test_submit_requires_exact_build_and_real_apple_app_and_draft_play_track(self):
+        with patch.object(self.release, 'eas') as cli:
+            with self.assertRaisesRegex(ValueError, 'explicit --id'):
+                self.release.main([str(self.root), 'submit', 'Example', 'ios'])
+            cli.assert_not_called()
+        data = self.release.prepare(self.root, self.app)
+        self.release.validate_submission(data, 'ios', 'testflight')
+        self.release.validate_submission(data, 'android', 'playstore')
+        self.release.validate_submission(data, 'android', 'android-production')
+        data['submit']['production']['ios']['ascAppId'] = 'placeholder'
+        with self.assertRaisesRegex(ValueError, 'ascAppId'):
+            self.release.validate_submission(data, 'ios', 'production')
+        data['submit']['production']['android']['releaseStatus'] = 'completed'
+        with self.assertRaisesRegex(ValueError, 'draft'):
+            self.release.validate_submission(data, 'android', 'playstore')
+
+    def test_profile_cycles_and_ambiguous_app_selection_fail(self):
+        with self.assertRaisesRegex(ValueError, 'Cyclic'):
+            self.release.profile({'build': {'a': {'extends': 'b'}, 'b': {'extends': 'a'}}}, 'a')
+        with self.assertRaisesRegex(ValueError, 'exact app'):
+            self.release.main([str(self.root), 'check', 'Exam'])
+
+    def test_build_keeps_signing_prompts_visible_and_never_auto_submits(self):
+        self.release.prepare(self.root, self.app)
+        for interactive in (True, False):
+            with self.subTest(interactive=interactive), patch.object(self.release, 'expo_config', return_value=self.config), \
+                    patch.object(self.release.sys.stdin, 'isatty', return_value=interactive), \
+                    patch.object(self.release, 'eas', return_value=None) as cli:
+                self.release.main([str(self.root), 'build', 'Example', 'ios', '--profile', 'testflight'])
+                command = cli.call_args.args[2]
+                self.assertEqual(command[:5], ['build', '--platform', 'ios', '--profile', 'testflight'])
+                self.assertEqual('--json' in command, not interactive)
+                self.assertEqual(cli.call_args.kwargs['capture'], not interactive)
+                self.assertFalse(any('auto-submit' in value for value in command))
+                self.assertEqual(cli.call_count, 1)
+
+    def test_submit_fetches_and_verifies_requested_build_before_upload(self):
+        self.release.prepare(self.root, self.app)
+        build_id = '22222222-2222-2222-2222-222222222222'
+        record = {'id': build_id, 'status': 'FINISHED', 'platform': 'ANDROID', 'distribution': 'STORE',
+                  'appIdentifier': 'com.example.app', 'app': {'id': self.config['extra']['eas']['projectId']},
+                  'buildProfile': 'playstore', 'appBuildVersion': '12'}
+        with patch.object(self.release, 'expo_config', return_value=self.config), \
+                patch.object(self.release, 'eas', side_effect=[record, None]) as cli:
+            self.release.main([str(self.root), 'submit', 'Example', 'android', '--id', build_id])
+            self.assertEqual(cli.call_args_list[0].args[2], ['build:view', build_id, '--json'])
+            self.assertEqual(cli.call_args_list[1].args[2], [
+                'submit', '--platform', 'android', '--profile', 'production', '--id', build_id, '--non-interactive', '--wait'])
+        record['appIdentifier'] = 'com.other.app'
+        with patch.object(self.release, 'expo_config', return_value=self.config), \
+                patch.object(self.release, 'eas', return_value=record) as cli:
+            with self.assertRaises(ValueError):
+                self.release.main([str(self.root), 'submit', 'Example', 'android', '--id', build_id])
+            self.assertEqual(cli.call_count, 1)
+
+
 class WatchOSLauncherTestCase(unittest.TestCase):
     def test_exposure_allows_automatic_quick_tunnel_and_validates_named_origin(self):
         from . import project_config
